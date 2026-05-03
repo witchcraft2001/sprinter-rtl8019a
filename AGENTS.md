@@ -87,21 +87,84 @@ listed in `tools/artifacts.sh` are skipped with a warning until their
 useful when debugging a single source file:
 
 ```sh
-sjasmplus src/apps/nicinfo.asm
-sjasmplus src/apps/nicram.asm
+sjasmplus -I src/include -I src/lib --raw=build/HELLO.EXE src/apps/hello.asm
+sjasmplus -I src/include -I src/lib --raw=build/NICINFO.EXE src/apps/nicinfo.asm
 ```
 
-Match the assembler choice to the existing Sprinter DSS toolchain. Confirm
-the format and entry-point convention against the reference utilities under
-`/Users/dmitry/dev/zx/sprinter/Estex-DSS`,
-`/Users/dmitry/dev/zx/sprinter/utils`, and the Sprinter Wi-Fi network package
-before introducing a new build path.
+Assembler is locked to **sjasmplus** for this project (matches
+`sprinter_wifi/network` and the bootstrap scripts under `tools/`). Other
+assemblers in the reference tree (TASM, etc.) may be useful for reading
+existing utilities but must not be introduced into the build path.
 
 ## Distribution Artifacts
 
 `tools/artifacts.sh` is the single manifest used by `tools/build.sh`,
 `tools/package.sh`, and `tools/image.sh`. When adding anything that must ship
 with the network package, update this manifest in the same change.
+
+### Filesystem & 8.3 naming constraints (mandatory)
+
+The deployment target on real Sprinter hardware is **FAT16** (hard disk) and
+the test floppy image is **FAT12** — both use classic DOS 8.3 short
+filenames with no LFN support. **Every file shipped in `distr/` (both the
+zip and the floppy image) must conform to 8.3, with no exceptions.** The
+zip is unpacked directly onto the target FAT volume, so any non-8.3 name
+in the zip will be silently truncated/mangled by the DSS file system or
+refused outright. There is no "host-facing" loophole.
+
+Concrete rules:
+
+- **Base name** ≤ 8 ASCII characters; **extension** ≤ 3 ASCII characters;
+  exactly one `.` separator. No spaces.
+- **Charset:** uppercase A–Z, digits 0–9, and the conservative set
+  `! # $ & ( ) - @ ^ _ \` { } ~`. Do not use lowercase, spaces, `+ , ; = [ ]`,
+  or any non-ASCII characters in shipped names.
+- **Single canonical name across zip and image.** A given artifact has
+  exactly one 8.3 name; both `package.sh` and `image.sh` ship it under
+  that name. Do not maintain a "long" name in the zip and a separate
+  "short" name in the image — pick the 8.3 form once and use it
+  everywhere shipped.
+- **Utility EXE names:** the lowercase entry-point name in `BUILD_APPS` plus
+  the auto-uppercased `.EXE` extension must fit 8.3 (`HELLO.EXE`,
+  `NICINFO.EXE`, `UDPTEST.EXE`, ...). New entries must be ≤ 8 characters.
+- **Documentation files:** `tools/image.sh` and `tools/package.sh` remap
+  `*.md` to `*.TXT` for both the image and the zip. The remapped 8.3 form
+  must be unique and fit the limits — `docs/USAGE.md` → `USAGE.TXT`,
+  `docs/NETPROBE.md` → `NETPROBE.TXT`. `docs/MAME_NETWORK.md` is over the
+  8-character base limit on purpose: it is developer-only and stays out
+  of `DIST_DOC_FILES`.
+- **Config templates** ship as 8.3 too. The active config is `NET.CFG`;
+  the sample template ships as `NETSMPL.CFG`, and the user installs it
+  with `REN NETSMPL.CFG NET.CFG`. The source-tree file at
+  `config/NETSMPL.CFG` keeps the same 8.3 name for consistency, even
+  though source-tree files are not strictly bound by 8.3.
+- **Examples and extras:** `examples/CONNECT.BAT`, `examples/UDPECHO.PY`,
+  etc. — base name ≤ 8 chars, uppercase, extension ≤ 3 chars (`.BAT`,
+  `.PY`, `.TXT`, ...). Long descriptive names belong in comments inside
+  the file, not in the file name.
+- **Subdirectories on the image** also follow 8.3 (≤ 8 chars, uppercase).
+  Prefer keeping the image flat; add a subdirectory only when it is
+  genuinely needed.
+- **Verification:** after changing any shipped name, run `make package`
+  and `make image`, then `unzip -l distr/<name>.zip` and
+  `mdir -i distr/<name>.img ::` to confirm the actual names match in
+  both artifacts.
+- **Line endings.** Files on the FAT volume that are text by nature
+  (`*.TXT`, `*.CFG`, `*.BAT`, `*.INI`, `*.INF`, and any `*.md` remapped
+  to `*.TXT`) must use DOS **CRLF** line endings. Without CR the DSS
+  text viewers render a stray glyph or run lines together. Source-tree
+  files keep native LF for editing convenience; `tools/package.sh` and
+  `tools/image.sh` perform LF→CRLF conversion at packaging time
+  (idempotent for files that already use CRLF). Binaries (`*.EXE`,
+  `*.COM`, `*.BIN`, `*.IMG`, ...) are copied byte-for-byte without
+  conversion.
+
+Files that live only in the source tree and are not in any `DIST_*`
+array (the spec, `AGENTS.md`/`CLAUDE.md`, `docs/MAME_NETWORK.md`,
+`tools/dev/*`, `Makefile`, `*.asm`, `*.inc`) are free of 8.3 constraints.
+As a rule of thumb: if a path appears in any `DIST_*` list, it is
+8.3-bound — either by its source-tree name, or by an explicit remap in
+both `tools/package.sh` and `tools/image.sh`.
 
 Rules for future additions:
 
@@ -112,8 +175,11 @@ Rules for future additions:
   is copied unchanged to the zip and renamed to an 8.3 `.TXT` name in the
   floppy image.
 - New sample configuration: add the relative path to `DIST_CONFIG_FILES`.
-  Never commit a real environment-bearing `NET.CFG`; ship only templates such
-  as `config/NET.CFG.sample` (static `IP`, `NETMASK`, `GW`, `DNS`, `MAC`).
+  Never commit a real environment-bearing `NET.CFG`; ship only templates
+  such as `config/NET.CFG.sample`. Locked schema for this project:
+  `RTL_IOBASE`, `RTL_IRQ`, `RTL_MAC` (optional override of PROM MAC),
+  `IP`, `NETMASK`, `GATEWAY`, `DNS1`, `DNS2`, `TZ`, `NTP`. Lines starting
+  with `#` are comments; unknown keys are ignored.
 - New small required runtime asset: add it to `DIST_EXTRA_FILES`.
 - If an artifact needs a subdirectory or a special 8.3 name inside the floppy
   image, update `tools/image.sh` together with `tools/artifacts.sh`.
@@ -136,13 +202,50 @@ label. Clear that runtime area at program start only when the code depends
 on zeroed memory. Small state variables and required initialized data may
 remain in the file.
 
-Utilities that accept long command lines, including `WGET`, `UDPTEST`,
-`TFTP`, `FTP`, and similar future tools, must use the full 512-byte DSS EXE
-header with code file offset `0x0200`, load address `0x8100`, and entry
-point `0x8100`. This keeps DSS command-line storage at `0x8080` from
-overlapping the program entry code. The required header padding is allowed
-and is not a runtime buffer; large runtime buffers still must live outside
-the `.EXE` image.
+DSS EXE header conventions used in this project (locked, taken from the
+`sprinter_wifi/network` toolchain):
+
+- **Small utilities (≤ 16 KB code+data, header inside command-line area).**
+  `ORG 0x8080`. The first 128 bytes are the DSS EXE header (`"EXE"`, version
+  byte, flags, entry, entry, stack-top, padding to 0x80). Entry point is
+  placed at `0x8100`. Stack top label is also at `0x8100`. Header layout
+  matches `sprinter_wifi/network/src/apps/ping.asm:21-33`.
+
+- **Large utilities (> 16 KB code+data).** `ORG 0x4100` for the header,
+  entry point at `0x4200`, stack pointer at `0xBFFF`. This moves the image
+  out of the `0x8000..0xBFFF` window and gives ~32 KB linear room before
+  the `0xC000` banking window kicks in. Required for `WGET`, `TFTP`, `FTP`
+  and any future utility that pulls in large library code.
+
+**Choosing between the two variants is driven by command-line needs first,
+size only as a tie-breaker.** The small variant occupies `0x8080..0x80FF`,
+which is the same region DSS uses for the program command line. The header
+therefore competes with command-line storage and only short / no-argument
+utilities can use it safely. The large variant places the header at
+`0x4100..0x41FF`, leaving `0x8080` fully available for command-line parsing.
+
+Mandatory rule:
+
+- Use the small variant (`ORG 0x8080`) ONLY for utilities that do not
+  expect a long command-line argument list. Acceptable for: `HELLO`,
+  `NICINFO`, `NICRAM`, `NICLB`, `NICTX`, `NICRX`, `NETCFG` show/set with
+  short args, `ARP` show, `NICDUMP` and similar diagnostics that take no
+  arguments or only one short flag/value.
+- Use the large variant (`ORG 0x4100`, entry `0x4200`, SP `0xBFFF`) for
+  any utility that parses URLs, host names, file paths, multi-token
+  arguments or otherwise relies on the full DSS command-line buffer at
+  `0x8080`. Required for: `WGET`, `TFTP`, `FTP`, `NTP` (with server arg),
+  `PING` (with host arg), `UDPTEST` (host/port/payload), and any future
+  tool of the same shape.
+
+If a utility starts as a no-arg diagnostic (small variant) and later grows
+command-line arguments, migrate it to the large variant in the same change
+that adds the arguments — do not try to keep the small header by squeezing
+arguments into a shorter buffer.
+
+The required header padding is allowed and is not a runtime buffer; large
+runtime buffers still must live outside the `.EXE` image (BSS-style labels
+after the loaded image, see paragraph above).
 
 Keep runtime memory maps explicit. When a utility needs command, URL,
 packet, TCP/UDP receive, or configuration buffers, define them with `EQU` in
@@ -248,20 +351,69 @@ ready for real hardware. For real-hardware bring-up the spec calls out:
 - IRQ line verification;
 - 5V level and bus timing checks.
 
+### MAME Network Setup
+
+Stages 0..3 (`HELLO`, `NICINFO`, `NICRAM`, `NICLB`) do not require a host
+network backend and can be run with `-networkprovider none`. Stages 4+
+(`NICTX`, `NICRX`, `PING`, `UDPTEST`, `TFTP`, `NTP`, `WGET`, `FTP`)
+require a working pcap-based backend on macOS.
+
+The full developer workflow — provider selection, `/dev/bpf` permissions on
+macOS, host-interface guidance, per-stage verification recipes (tcpdump
+filter for `NICTX`, scapy generator for `NICRX`, IP plan for `PING/UDP/TCP`),
+and acceptance criteria for the network environment — lives in
+[`docs/MAME_NETWORK.md`](docs/MAME_NETWORK.md). That document is
+developer-only and must NOT be added to `DIST_DOC_FILES`.
+
+`slirp` is not available in the current MAME build for macOS; do not write
+scripts that assume it. TAP/bridge helpers are an explicit non-baseline:
+add only if pcap proves unstable.
+
 ## Driver / Stack Constraints
 
 These constraints are non-negotiable until the spec is updated:
 
-- 8-bit data path only: `DCR.WTS = 0`, recommended `DCR = 0x48`. Never enable
-  16-bit word transfer mode on this ISA8 card.
+- 8-bit data path only: `DCR.WTS = 0`, mandatory `DCR = 0x48` after
+  `device_reset`. Never enable 16-bit word transfer mode on this ISA8 card.
+  Note that MAME's `device_reset` sets `DCR = 0x04`; the driver must
+  rewrite `DCR` to `0x48` as part of its init sequence and never rely on
+  the post-reset default.
 - Default I/O base `0x300`; a probe path must be allowed for alternative
-  bases later, but stage-1 utilities may hardcode `0x300`.
+  bases later (`0x320/0x340/0x360`), but stage-1 utilities may hardcode
+  `0x300`.
 - Polling driver first; do not depend on IRQ until early stages succeed.
-- Page select via `CR` bits 6..7 with explicit constants from the spec
-  (`0x21`, `0x22`, `0x61`, `0xa1`, `0xe1`, ...).
+- Page select via `CR` bits 6..7. Useful explicit constants: `0x21` (page 0,
+  stop, abort DMA), `0x22` (page 0, start), `0x61` (page 1, stop), `0x62`
+  (page 1, start), `0xA1` (page 2, stop). Page 3 is not required for any
+  current stage — RTL8019AS ID `Pp` is on **page 0** registers `0x0A` /
+  `0x0B` (8019ID0 / 8019ID1 = `0x50` / `0x70`), confirmed against the
+  Realtek datasheet and the MAME `dp8390.cpp` implementation.
+- Remote DMA command bytes (low 6 bits of CR; OR with the page bits as
+  needed): `0x0A` = remote read + STA, `0x12` = remote write + STA,
+  `0x1A` = send packet + STA, `0x22` = abort/complete remote DMA + STA.
 - NE2000-style packet RAM layout: `TPSR=0x40`, `PSTART=0x46`, `PSTOP=0x80`,
-  `BNRY=0x46`, `CURR=0x47`, page size 256 bytes.
+  `BNRY=0x46`, `CURR=0x47`, page size 256 bytes. PROM (MAC + signature)
+  is read by remote DMA from `RSAR=0x0000` with `RBCR=32` and `CR=0x0A`.
+- Reset is full NE2000-style, never a single write:
+  ```
+  tmp = IN  BASE+0x1F
+  OUT BASE+0x1F, tmp
+  delay 2 ms
+  tmp = IN  BASE+0x1F
+  wait ISR.RST == 1, timeout 100 ms
+  OUT BASE+0x07, 0xFF      ; clear ISR
+  ```
+  Truncated reset is allowed only as a fallback and must emit
+  `[W01] RESET.RST timeout, continuing soft init`.
+- PROM signature is a NE2000-like sanity check, not a hard gate. `NICINFO`
+  reads 32 bytes of PROM and prints `PROM[0E..0F]=...`,
+  `PROM_LAYOUT=direct|doubled|unknown`, `MAC=...`. `RESULT FAIL` only when
+  the 8019ID is not `Pp` AND a valid MAC cannot be extracted; mismatched
+  `0x57 0x57` signature is a `WARN`, not a fatal error.
 - Pad TX frames shorter than 60 bytes (without FCS) up to 60 bytes.
+- ARP cache holds 1..4 entries. Eviction policy: update existing entry on
+  hit; otherwise use the first free slot; otherwise replace the oldest
+  entry. No timestamps required beyond an insertion order counter.
 - All waits (reset, RDC, TX complete, RX, ARP, UDP reply, TCP retransmit)
   must have explicit timeouts and emit diagnostic output on expiry.
 
@@ -297,8 +449,12 @@ The early driver is considered ready when:
   PROM MAC;
 - `NICRAM.EXE` confirms remote DMA round-trips at 16, 64, 256, and 1536
   bytes;
-- `NICLB.EXE` confirms the TX path (and, when MAME supports it, the
-  loopback RX path);
+- `NICLB.EXE` confirms both `PTX OK` and `LOOP RX OK` with payload match.
+  The current MAME branch implements internal MAC loopback in DP8390 TX
+  path (`dp8390.cpp:82`), so RX-side verification is mandatory. Skipping
+  the RX check is allowed only on an older MAME build that lacks the
+  loopback patch, and must print `LOOP RX SKIP OLD MAME` and finish with
+  `RESULT PARTIAL`, not `RESULT OK`.
 - `PING.EXE` receives ICMP echo replies from a local host or router;
 - every error path prints stage code and NIC registers;
 - there are no infinite waits without diagnostic output.

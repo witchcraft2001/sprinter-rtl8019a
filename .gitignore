@@ -1,0 +1,12 @@
+sprinter_rtl8019_soft.md
+
+build/
+distr/
+*.lst
+*.o
+*.bin
+.DS_Store
+
+# Local-only config; ship only NET.CFG.sample.
+NET.CFG
+config/NET.CFG
