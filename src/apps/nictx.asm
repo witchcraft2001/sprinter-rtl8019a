@@ -1,0 +1,332 @@
+; ======================================================
+; NICTX.EXE - stage 4 of the Sprinter RTL8019AS network kit.
+; Transmits one 60-byte broadcast Ethernet frame to the host
+; network. Does NOT require an RX answer: the test passes when
+; ISR.PTX fires. Verification on the host side is via tcpdump
+; (see docs/MAME_NETWORK.md), or via the MAME verbose log line
+; "rtl8019as: tx len=60".
+; ======================================================
+
+EXE_VERSION		EQU 1
+
+	DEVICE NOSLOT64K
+
+	INCLUDE "macro.inc"
+	INCLUDE "dss.inc"
+	INCLUDE "rtl8019.inc"
+
+PTX_LOOPS	EQU 16000
+
+FRAME_LEN	EQU 60
+ETH_TYPE	EQU 0x88B5
+
+	MODULE MAIN
+
+	ORG 0x8080
+
+EXE_HEADER
+	DB "EXE"
+	DB EXE_VERSION
+	DW 0x0080
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW START
+	DW START
+	DW STACK_TOP
+	DS 106, 0
+
+	ORG 0x8100
+@STACK_TOP
+
+START
+	PRINTLN MSG_BANNER
+
+	LD	A,1
+	LD	(@ISA.ISA_SLOT),A
+	CALL	@ISA.ISA_OPEN
+
+	; [T0] INIT
+	PRINT MSG_T0
+	CALL	@RTL.RESET
+	JP	C,RESET_FAIL
+	CALL	CONFIG_NORMAL
+	PRINTLN MSG_OK
+
+	; Build broadcast frame in TX_BUF.
+	CALL	BUILD_FRAME
+
+	; [T1] DST=FF:FF:FF:FF:FF:FF TYPE=88B5 LEN=003C
+	PRINT MSG_T1_DST
+	LD	HL,TX_BUF
+	CALL	@UTIL.PRINT_MAC
+	PRINT MSG_TYPE_EQ
+	LD	HL,ETH_TYPE
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT MSG_LEN_EQ
+	LD	HL,FRAME_LEN
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT LINE_END
+
+	; [T2] WRITE TX
+	PRINT MSG_T2
+	LD	HL,TX_BUF
+	LD	BC,FRAME_LEN
+	LD	DE,0x4000
+	CALL	@RTL.DMA_WRITE
+	JP	C,WRITE_FAIL
+	PRINTLN MSG_OK
+
+	; TBCR = FRAME_LEN
+	LD	A,LOW FRAME_LEN
+	LD	(RTL_TBCR0_A),A
+	LD	A,HIGH FRAME_LEN
+	LD	(RTL_TBCR1_A),A
+
+	; Trigger TX
+	LD	A,CR_PAGE0_START | CR_TXP
+	LD	(RTL_CR_A),A
+
+	; [T3] PTX
+	PRINT MSG_T3
+	CALL	WAIT_PTX
+	JP	C,PTX_FAIL
+	PRINTLN MSG_OK
+
+	PRINTLN MSG_RESULT_OK
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_OK
+
+
+RESET_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_RESET
+	JP	FAIL_NIC
+
+WRITE_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_WRITE
+	JP	FAIL_NIC
+
+PTX_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_PTX
+	JP	FAIL_NIC
+
+FAIL_NIC
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	PRINT_REG_DUMP
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NIC_ERR
+
+
+; ------------------------------------------------------
+; Normal-mode chip configuration.
+; ------------------------------------------------------
+CONFIG_NORMAL
+	LD	A,CR_PAGE0_STOP
+	LD	(RTL_CR_A),A
+	LD	A,DCR_INIT			; 0x48 -- normal operation
+	LD	(RTL_DCR_A),A
+	XOR	A
+	LD	(RTL_RBCR0_A),A
+	LD	(RTL_RBCR1_A),A
+	LD	A,RCR_AB			; 0x04 -- broadcast accept
+	LD	(RTL_RCR_A),A
+	LD	A,TCR_NORMAL			; 0x00 -- normal TX
+	LD	(RTL_TCR_A),A
+	LD	A,RTL_TPSR_INIT
+	LD	(RTL_TPSR_A),A
+	LD	A,RTL_PSTART_INIT
+	LD	(RTL_PSTART_A),A
+	LD	A,RTL_PSTOP_INIT
+	LD	(RTL_PSTOP_A),A
+	LD	A,RTL_BNRY_INIT
+	LD	(RTL_BNRY_A),A
+	LD	A,0xFF
+	LD	(RTL_ISR_A),A
+	XOR	A
+	LD	(RTL_IMR_A),A
+
+	LD	A,CR_PAGE1_STOP
+	LD	(RTL_CR_A),A
+	LD	A,(SRC_MAC + 0)
+	LD	(RTL_PAR0_A),A
+	LD	A,(SRC_MAC + 1)
+	LD	(RTL_PAR1_A),A
+	LD	A,(SRC_MAC + 2)
+	LD	(RTL_PAR2_A),A
+	LD	A,(SRC_MAC + 3)
+	LD	(RTL_PAR3_A),A
+	LD	A,(SRC_MAC + 4)
+	LD	(RTL_PAR4_A),A
+	LD	A,(SRC_MAC + 5)
+	LD	(RTL_PAR5_A),A
+	LD	A,RTL_CURR_INIT
+	LD	(RTL_CURR_A),A
+	XOR	A
+	LD	(RTL_MAR0_A + 0),A
+	LD	(RTL_MAR0_A + 1),A
+	LD	(RTL_MAR0_A + 2),A
+	LD	(RTL_MAR0_A + 3),A
+	LD	(RTL_MAR0_A + 4),A
+	LD	(RTL_MAR0_A + 5),A
+	LD	(RTL_MAR0_A + 6),A
+	LD	(RTL_MAR0_A + 7),A
+
+	LD	A,CR_PAGE0_START
+	LD	(RTL_CR_A),A
+	RET
+
+
+; ------------------------------------------------------
+; BUILD_FRAME: 60-byte broadcast frame in TX_BUF.
+;   [0..5]   DST = FF*6
+;   [6..11]  SRC = SRC_MAC
+;   [12..13] EtherType (BE)
+;   [14..]   payload, zero-padded to 60.
+; ------------------------------------------------------
+BUILD_FRAME
+	LD	HL,TX_BUF
+	LD	B,6
+.DST
+	LD	(HL),0xFF
+	INC	HL
+	DJNZ	.DST
+	LD	DE,SRC_MAC
+	LD	BC,6
+	LDIR
+	LD	(HL),HIGH ETH_TYPE
+	INC	HL
+	LD	(HL),LOW ETH_TYPE
+	INC	HL
+	LD	DE,PAYLOAD
+	LD	BC,PAYLOAD_LEN
+	LDIR
+	LD	BC,FRAME_LEN - 14 - PAYLOAD_LEN
+	LD	A,B
+	OR	C
+	RET	Z
+.PAD
+	XOR	A
+	LD	(HL),A
+	INC	HL
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.PAD
+	RET
+
+
+WAIT_PTX
+	LD	BC,PTX_LOOPS
+.LP
+	LD	A,(RTL_ISR_A)
+	AND	ISR_PTX
+	JR	NZ,.OK
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.LP
+	SCF
+	RET
+.OK
+	LD	A,ISR_PTX
+	LD	(RTL_ISR_A),A
+	OR	A
+	RET
+
+
+PUTCHAR
+	PUSH	AF,BC
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC,AF
+	RET
+
+
+PRINT_REG_DUMP
+	PRINT MSG_REGS
+	LD	HL,REG_NAMES
+	LD	DE,@RTL.REG_SNAPSHOT
+	LD	B,@RTL.REG_SNAPSHOT_LEN
+.LP
+	PUSH	BC,DE
+.NCHR
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	Z,.NDONE
+	CALL	PUTCHAR
+	JR	.NCHR
+.NDONE
+	LD	A,'='
+	CALL	PUTCHAR
+	POP	DE,BC
+	LD	A,(DE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	DE
+	DJNZ	.LP
+	PRINT LINE_END
+	RET
+
+REG_NAMES
+	DB "CR",0
+	DB "ISR",0
+	DB "DCR",0
+	DB "RCR",0
+	DB "TCR",0
+	DB "IMR",0
+	DB "PSTART",0
+	DB "PSTOP",0
+	DB "BNRY",0
+	DB "CURR",0
+
+
+; ------- in-EXE data -------
+SRC_MAC		DB 0x02, 0x80, 0x19, 0x11, 0x22, 0x33
+
+PAYLOAD		DB "SPRINTER NICTX TEST"
+PAYLOAD_LEN	EQU $ - PAYLOAD
+
+
+; ------- messages -------
+MSG_BANNER	DB "RTL8019AS NICTX v0.1",0
+MSG_T0		DB "[T0] INIT ",0
+MSG_OK		DB "OK",0
+MSG_T1_DST	DB "[T1] DST=",0
+MSG_TYPE_EQ	DB " TYPE=",0
+MSG_LEN_EQ	DB " LEN=",0
+MSG_T2		DB "[T2] WRITE TX ",0
+MSG_T3		DB "[T3] PTX ",0
+MSG_REGS	DB "REGS ",0
+MSG_RESULT_OK	DB "RESULT OK",0
+MSG_RESULT_FAIL	DB "RESULT FAIL",0
+MSG_E_RESET	DB "[E30] RESET timeout",0
+MSG_E_WRITE	DB "[E31] DMA write timeout",0
+MSG_E_PTX	DB "[E32] PTX timeout",0
+LINE_END	DB 13,10,0
+
+	ENDMODULE
+
+
+	INCLUDE "isa.asm"
+	INCLUDE "util.asm"
+	INCLUDE "rtl8019.asm"
+
+
+NICTX_IMAGE_END
+
+	MODULE MAIN
+
+TX_BUF		EQU NICTX_IMAGE_END
+NICTX_BSS_END	EQU TX_BUF + FRAME_LEN
+
+	ENDMODULE
+
+	END MAIN.START

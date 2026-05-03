@@ -14,6 +14,10 @@ DIST_DIR_NAME="SPRTL"
 #   ping -> udptest -> tftp -> ntp -> wget -> ftp
 BUILD_APPS=(
   hello
+  nicinfo
+  nicram
+  niclb
+  nictx
 )
 
 # Text/documentation files copied to the distribution root.

@@ -158,6 +158,14 @@ Concrete rules:
   (idempotent for files that already use CRLF). Binaries (`*.EXE`,
   `*.COM`, `*.BIN`, `*.IMG`, ...) are copied byte-for-byte without
   conversion.
+- **Character encoding.** Shipped text files (every text artifact in
+  `DIST_*` arrays) must be **7-bit ASCII**. The DSS text viewer renders
+  through CP866; UTF-8 multi-byte characters appear as mojibake (e.g.
+  the em-dash `—` shows up as `тАФ`). `tools/package.sh` and
+  `tools/image.sh` fail the build with a clear error if a shipped text
+  file contains any byte ≥ 0x80. Use ASCII equivalents (`--` for em-dash,
+  `...` for ellipsis, etc.) or add an explicit UTF-8 → CP866 transcoding
+  step (and document it) before introducing localized text.
 
 Files that live only in the source tree and are not in any `DIST_*`
 array (the spec, `AGENTS.md`/`CLAUDE.md`, `docs/MAME_NETWORK.md`,
@@ -374,10 +382,14 @@ add only if pcap proves unstable.
 These constraints are non-negotiable until the spec is updated:
 
 - 8-bit data path only: `DCR.WTS = 0`, mandatory `DCR = 0x48` after
-  `device_reset`. Never enable 16-bit word transfer mode on this ISA8 card.
-  Note that MAME's `device_reset` sets `DCR = 0x04`; the driver must
-  rewrite `DCR` to `0x48` as part of its init sequence and never rely on
-  the post-reset default.
+  `device_reset` for normal operation. Never enable 16-bit word transfer
+  mode on this ISA8 card. MAME's `device_reset` sets `DCR = 0x04`; the
+  driver must rewrite `DCR` to `0x48` as part of its init sequence and
+  never rely on the post-reset default. **Exception: loopback testing
+  (NICLB / TCR-LB modes) requires `DCR.LS = 0`, so use `DCR = 0x40`
+  (the same as `0x48` minus the LS bit) only inside the loopback
+  configuration. MAME's `LOOPBACK` macro = `!(DCR.LS) && TCR.LB`, so
+  with `DCR=0x48` loopback never activates.**
 - Default I/O base `0x300`; a probe path must be allowed for alternative
   bases later (`0x320/0x340/0x360`), but stage-1 utilities may hardcode
   `0x300`.

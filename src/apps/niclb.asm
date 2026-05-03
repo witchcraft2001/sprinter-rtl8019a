@@ -1,0 +1,506 @@
+; ======================================================
+; NICLB.EXE - stage 3 of the Sprinter RTL8019AS network kit.
+; Internal MAC loopback test (TCR=0x02, DCR.LS=0). Builds a
+; 60-byte broadcast Ethernet frame, transmits it, waits for
+; both ISR.PTX and ISR.PRX, then reads the looped frame back
+; from the RX ring and compares it byte-for-byte against the
+; original TX buffer.
+;
+; Acceptance: PTX OK, PRX OK, RX header STS/LEN as expected,
+; body bytes match. Requires the patched MAME (dp8390.cpp:85)
+; that injects loopback TX into recv().
+; ======================================================
+
+EXE_VERSION		EQU 1
+
+	DEVICE NOSLOT64K
+
+	INCLUDE "macro.inc"
+	INCLUDE "dss.inc"
+	INCLUDE "rtl8019.inc"
+
+; -- timeouts --
+PTX_LOOPS	EQU 8000
+PRX_LOOPS	EQU 8000
+
+; -- frame layout in TX_BUF --
+FRAME_LEN	EQU 60			; min Ethernet frame, no FCS
+ETH_TYPE	EQU 0x88B5		; experimental EtherType per spec stage 4
+
+	MODULE MAIN
+
+	ORG 0x8080
+
+EXE_HEADER
+	DB "EXE"
+	DB EXE_VERSION
+	DW 0x0080
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW START
+	DW START
+	DW STACK_TOP
+	DS 106, 0
+
+	ORG 0x8100
+@STACK_TOP
+
+START
+	PRINTLN MSG_BANNER
+
+	LD	A,1
+	LD	(@ISA.ISA_SLOT),A
+	CALL	@ISA.ISA_OPEN
+
+	; [L0] INIT
+	PRINT MSG_L0
+	CALL	@RTL.RESET
+	JP	C,RESET_FAIL
+	PRINTLN MSG_OK
+
+	; [L1] CFG -- internal loopback configuration
+	PRINT MSG_L1
+	CALL	CONFIG_LOOPBACK
+	PRINTLN MSG_OK
+
+	; [L2] FRAME -- build 60-byte broadcast frame in TX_BUF
+	CALL	BUILD_FRAME
+	PRINT MSG_L2
+	LD	HL,FRAME_LEN
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT MSG_TYPE_EQ
+	LD	HL,ETH_TYPE
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT LINE_END
+
+	; [L3] WRITE TX
+	PRINT MSG_L3
+	LD	HL,TX_BUF
+	LD	BC,FRAME_LEN
+	LD	DE,0x4000		; TPSR<<8
+	CALL	@RTL.DMA_WRITE
+	JP	C,WRITE_FAIL
+	PRINTLN MSG_OK
+
+	; Set TBCR = FRAME_LEN
+	LD	A,LOW FRAME_LEN
+	LD	(RTL_TBCR0_A),A
+	LD	A,HIGH FRAME_LEN
+	LD	(RTL_TBCR1_A),A
+
+	; Trigger TX: CR = page 0, abort, STA, TXP = 0x26
+	LD	A,CR_PAGE0_START | CR_TXP
+	LD	(RTL_CR_A),A
+
+	; [L4] PTX
+	PRINT MSG_L4
+	CALL	WAIT_PTX
+	JP	C,PTX_FAIL
+	PRINTLN MSG_OK
+
+	; [L5] PRX (loopback frame should already be in RX ring)
+	PRINT MSG_L5
+	CALL	WAIT_PRX
+	JP	C,PRX_FAIL
+	PRINTLN MSG_OK
+
+	; [L6] RX HDR -- read 4-byte header from 0x4700 (initial CURR<<8)
+	LD	HL,RX_HDR
+	LD	BC,4
+	LD	DE,0x4700
+	CALL	@RTL.DMA_READ
+	JP	C,READ_FAIL
+
+	PRINT MSG_L6
+	PRINT MSG_STS_EQ
+	LD	A,(RX_HDR + 0)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT MSG_NEXT_EQ
+	LD	A,(RX_HDR + 1)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT MSG_LEN_EQ
+	LD	A,(RX_HDR + 3)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RX_HDR + 2)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+
+	; Verify status byte: expect 0x21 (PRX | PHY for broadcast match)
+	LD	A,(RX_HDR + 0)
+	CP	0x21
+	JP	NZ,STS_BAD
+
+	; Verify length: expect 64 (= FRAME_LEN + 4 header bytes)
+	LD	A,(RX_HDR + 2)
+	CP	LOW (FRAME_LEN + 4)
+	JP	NZ,LEN_BAD
+	LD	A,(RX_HDR + 3)
+	CP	HIGH (FRAME_LEN + 4)
+	JP	NZ,LEN_BAD
+
+	; [L7] READ RX body from 0x4704
+	PRINT MSG_L7
+	LD	HL,RX_BUF
+	LD	BC,FRAME_LEN
+	LD	DE,0x4704
+	CALL	@RTL.DMA_READ
+	JP	C,READ_FAIL
+	PRINTLN MSG_OK
+
+	; [L8] CMP body byte-for-byte vs TX_BUF
+	PRINT MSG_L8
+	LD	HL,TX_BUF
+	LD	DE,RX_BUF
+	LD	BC,FRAME_LEN
+	CALL	CMP_BUF
+	JP	C,BODY_BAD
+	PRINTLN MSG_OK
+
+	PRINTLN MSG_RESULT_OK
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_OK
+
+; ------- error exits -------
+RESET_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_RESET
+	JP	FAIL_NIC
+
+WRITE_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_WRITE
+	JP	FAIL_NIC
+
+PTX_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_PTX
+	JP	FAIL_NIC
+
+PRX_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_PRX
+	JP	FAIL_NIC
+
+READ_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_READ
+	JP	FAIL_NIC
+
+STS_BAD
+	PRINT LINE_END
+	PRINT MSG_E_STS
+	LD	A,(RX_HDR + 0)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+	JP	FAIL_NIC
+
+LEN_BAD
+	PRINT LINE_END
+	PRINT MSG_E_LEN
+	LD	A,(RX_HDR + 3)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RX_HDR + 2)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+	JP	FAIL_NIC
+
+BODY_BAD
+	PRINT LINE_END
+	PRINTLN MSG_E_BODY
+	; HL=mismatch addr in TX_BUF, DE=corresponding addr in RX_BUF, B=expected, A=actual
+	; (CMP_BUF leaves these on mismatch; show offset and bytes)
+	; fall through to FAIL_NIC
+
+FAIL_NIC
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	PRINT_REG_DUMP
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NIC_ERR
+
+
+; ------------------------------------------------------
+; CONFIG_LOOPBACK: complete chip init for internal loopback.
+; Trashes A.
+; ------------------------------------------------------
+CONFIG_LOOPBACK
+	; Page 0, stop, abort
+	LD	A,CR_PAGE0_STOP			; 0x21
+	LD	(RTL_CR_A),A
+	LD	A,DCR_LOOPBACK			; 0x40 -- LS=0 enables loopback
+	LD	(RTL_DCR_A),A
+	XOR	A
+	LD	(RTL_RBCR0_A),A
+	LD	(RTL_RBCR1_A),A
+	LD	A,RCR_AB			; 0x04 -- accept broadcast
+	LD	(RTL_RCR_A),A
+	LD	A,TCR_LB_INTERNAL		; 0x02 -- internal MAC loopback
+	LD	(RTL_TCR_A),A
+	LD	A,RTL_TPSR_INIT			; 0x40
+	LD	(RTL_TPSR_A),A
+	LD	A,RTL_PSTART_INIT		; 0x46
+	LD	(RTL_PSTART_A),A
+	LD	A,RTL_PSTOP_INIT		; 0x80
+	LD	(RTL_PSTOP_A),A
+	LD	A,RTL_BNRY_INIT			; 0x46
+	LD	(RTL_BNRY_A),A
+	LD	A,0xFF
+	LD	(RTL_ISR_A),A			; clear ISR
+	XOR	A
+	LD	(RTL_IMR_A),A			; mask all IRQs
+
+	; Page 1: PAR0..5, CURR, MAR0..7
+	LD	A,CR_PAGE1_STOP			; 0x61
+	LD	(RTL_CR_A),A
+
+	LD	A,(TEST_MAC + 0)
+	LD	(RTL_PAR0_A),A
+	LD	A,(TEST_MAC + 1)
+	LD	(RTL_PAR1_A),A
+	LD	A,(TEST_MAC + 2)
+	LD	(RTL_PAR2_A),A
+	LD	A,(TEST_MAC + 3)
+	LD	(RTL_PAR3_A),A
+	LD	A,(TEST_MAC + 4)
+	LD	(RTL_PAR4_A),A
+	LD	A,(TEST_MAC + 5)
+	LD	(RTL_PAR5_A),A
+
+	LD	A,RTL_CURR_INIT			; 0x47
+	LD	(RTL_CURR_A),A
+
+	; MAR0..7 = 0
+	XOR	A
+	LD	(RTL_MAR0_A + 0),A
+	LD	(RTL_MAR0_A + 1),A
+	LD	(RTL_MAR0_A + 2),A
+	LD	(RTL_MAR0_A + 3),A
+	LD	(RTL_MAR0_A + 4),A
+	LD	(RTL_MAR0_A + 5),A
+	LD	(RTL_MAR0_A + 6),A
+	LD	(RTL_MAR0_A + 7),A
+
+	; Back to page 0, START
+	LD	A,CR_PAGE0_START		; 0x22
+	LD	(RTL_CR_A),A
+	RET
+
+
+; ------------------------------------------------------
+; BUILD_FRAME: assemble a 60-byte broadcast frame in TX_BUF.
+;   [0..5]   DST = FF:FF:FF:FF:FF:FF
+;   [6..11]  SRC = TEST_MAC
+;   [12..13] EtherType = ETH_TYPE (BE)
+;   [14..]   payload "SPRINTER NICLB TEST", zero-padded to 60.
+; ------------------------------------------------------
+BUILD_FRAME
+	LD	HL,TX_BUF
+	; DST = FF*6
+	LD	B,6
+.DST
+	LD	(HL),0xFF
+	INC	HL
+	DJNZ	.DST
+	; SRC = TEST_MAC
+	LD	DE,TEST_MAC
+	LD	BC,6
+	LDIR
+	; EtherType (big endian)
+	LD	(HL),HIGH ETH_TYPE
+	INC	HL
+	LD	(HL),LOW ETH_TYPE
+	INC	HL
+	; Payload
+	LD	DE,PAYLOAD
+	LD	BC,PAYLOAD_LEN
+	LDIR
+	; Zero-pad up to FRAME_LEN
+	LD	BC,FRAME_LEN - 14 - PAYLOAD_LEN
+	LD	A,B
+	OR	C
+	RET	Z
+.PAD
+	XOR	A
+	LD	(HL),A
+	INC	HL
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.PAD
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_PTX / WAIT_PRX: poll ISR for the given bit.
+; CF=0 OK, CF=1 timeout. Trashes A,BC.
+; ------------------------------------------------------
+WAIT_PTX
+	LD	BC,PTX_LOOPS
+.LP
+	LD	A,(RTL_ISR_A)
+	AND	ISR_PTX
+	JR	NZ,.OK
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.LP
+	SCF
+	RET
+.OK
+	; Clear PTX
+	LD	A,ISR_PTX
+	LD	(RTL_ISR_A),A
+	OR	A
+	RET
+
+WAIT_PRX
+	LD	BC,PRX_LOOPS
+.LP
+	LD	A,(RTL_ISR_A)
+	AND	ISR_PRX
+	JR	NZ,.OK
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.LP
+	SCF
+	RET
+.OK
+	LD	A,ISR_PRX
+	LD	(RTL_ISR_A),A
+	OR	A
+	RET
+
+
+; ------------------------------------------------------
+; CMP_BUF: compare BC bytes at (HL) vs (DE).
+; Out: CF=0 match, CF=1 mismatch.
+; Preserved on mismatch: HL=expected addr, DE=actual addr.
+; ------------------------------------------------------
+CMP_BUF
+.LP
+	LD	A,B
+	OR	C
+	JR	Z,.OK
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.MISS
+	INC	HL
+	INC	DE
+	DEC	BC
+	JR	.LP
+.OK
+	OR	A
+	RET
+.MISS
+	SCF
+	RET
+
+
+PUTCHAR
+	PUSH	AF,BC
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC,AF
+	RET
+
+
+PRINT_REG_DUMP
+	PRINT MSG_REGS
+	LD	HL,REG_NAMES
+	LD	DE,@RTL.REG_SNAPSHOT
+	LD	B,@RTL.REG_SNAPSHOT_LEN
+.LP
+	PUSH	BC,DE
+.NCHR
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	Z,.NDONE
+	CALL	PUTCHAR
+	JR	.NCHR
+.NDONE
+	LD	A,'='
+	CALL	PUTCHAR
+	POP	DE,BC
+	LD	A,(DE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	DE
+	DJNZ	.LP
+	PRINT LINE_END
+	RET
+
+REG_NAMES
+	DB "CR",0
+	DB "ISR",0
+	DB "DCR",0
+	DB "RCR",0
+	DB "TCR",0
+	DB "IMR",0
+	DB "PSTART",0
+	DB "PSTOP",0
+	DB "BNRY",0
+	DB "CURR",0
+
+
+; ------- in-EXE data -------
+TEST_MAC	DB 0x02, 0x80, 0x19, 0x11, 0x22, 0x33
+
+PAYLOAD		DB "SPRINTER NICLB TEST"
+PAYLOAD_LEN	EQU $ - PAYLOAD
+
+
+; ------- messages -------
+MSG_BANNER	DB "RTL8019AS NICLB v0.1",0
+MSG_L0		DB "[L0] INIT ",0
+MSG_OK		DB "OK",0
+MSG_L1		DB "[L1] CFG (DCR=40 RCR=04 TCR=02 PSTART=46 PSTOP=80 BNRY=46 CURR=47) ",0
+MSG_L2		DB "[L2] FRAME LEN=",0
+MSG_TYPE_EQ	DB " TYPE=",0
+MSG_L3		DB "[L3] WRITE TX ",0
+MSG_L4		DB "[L4] PTX ",0
+MSG_L5		DB "[L5] PRX ",0
+MSG_L6		DB "[L6] RX HDR",0
+MSG_STS_EQ	DB " STS=",0
+MSG_NEXT_EQ	DB " NEXT=",0
+MSG_LEN_EQ	DB " LEN=",0
+MSG_L7		DB "[L7] READ RX ",0
+MSG_L8		DB "[L8] CMP ",0
+MSG_REGS	DB "REGS ",0
+MSG_RESULT_OK	DB "RESULT OK",0
+MSG_RESULT_FAIL	DB "RESULT FAIL",0
+MSG_E_RESET	DB "[E20] RESET timeout",0
+MSG_E_WRITE	DB "[E21] DMA write timeout",0
+MSG_E_PTX	DB "[E22] PTX timeout",0
+MSG_E_PRX	DB "[E23] PRX timeout (loopback frame did not appear in RX ring)",0
+MSG_E_READ	DB "[E24] DMA read timeout",0
+MSG_E_STS	DB "[E25] RX status mismatch, got STS=",0
+MSG_E_LEN	DB "[E26] RX len mismatch, got LEN=",0
+MSG_E_BODY	DB "[E27] RX body mismatch",0
+LINE_END	DB 13,10,0
+
+	ENDMODULE
+
+
+	INCLUDE "isa.asm"
+	INCLUDE "util.asm"
+	INCLUDE "rtl8019.asm"
+
+
+NICLB_IMAGE_END
+
+	MODULE MAIN
+
+TX_BUF		EQU NICLB_IMAGE_END
+RX_HDR		EQU TX_BUF + FRAME_LEN
+RX_BUF		EQU RX_HDR + 4
+NICLB_BSS_END	EQU RX_BUF + FRAME_LEN
+
+	ENDMODULE
+
+	END MAIN.START

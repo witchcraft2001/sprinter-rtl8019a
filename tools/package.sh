@@ -26,6 +26,14 @@ copy_with_crlf() {
   upper_ext="${dest##*.}"
   upper_ext="$(printf '%s' "$upper_ext" | tr '[:lower:]' '[:upper:]')"
   if is_text_ext "$upper_ext"; then
+    # The DSS text viewer renders bytes through CP866; UTF-8 multi-byte
+    # sequences come out as mojibake. Until an explicit transcoding step
+    # is added, shipped text files must be 7-bit ASCII.
+    if LC_ALL=C grep -lP '[^\x00-\x7F]' "$src" >/dev/null 2>&1; then
+      echo "Error: $src contains non-ASCII bytes; convert to ASCII (or add CP866 transcoding) before shipping." >&2
+      LC_ALL=C grep -nP '[^\x00-\x7F]' "$src" >&2 || true
+      exit 1
+    fi
     awk 'BEGIN{ORS="\r\n"} {sub(/\r$/, ""); print}' "$src" > "$dest"
   else
     cp "$src" "$dest"

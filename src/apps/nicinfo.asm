@@ -1,0 +1,407 @@
+; ======================================================
+; NICINFO.EXE - stage 1 of the Sprinter RTL8019AS network kit.
+; Detects the card on ISA1, performs an NE2000-style reset,
+; reads the page-0 8019ID0/ID1 ('P','p'), reads 32 bytes of
+; PROM via remote DMA, prints MAC, signature bytes, detected
+; PROM layout, and a register snapshot.
+;
+; Acceptance (per AGENTS.md and sprinter_rtl8019_soft.md):
+;   FAIL only if neither ID nor a plausible MAC can be read,
+;   or RESET times out, or PROM remote DMA times out.
+;   Signature mismatch is WARN, not FAIL.
+; ======================================================
+
+EXE_VERSION		EQU 1
+
+	DEVICE NOSLOT64K
+
+	INCLUDE "macro.inc"
+	INCLUDE "dss.inc"
+	INCLUDE "rtl8019.inc"		; pure EQUs (also pulls isa.inc)
+
+	MODULE MAIN
+
+	ORG 0x8080
+
+EXE_HEADER
+	DB "EXE"
+	DB EXE_VERSION
+	DW 0x0080
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW START
+	DW START
+	DW STACK_TOP
+	DS 106, 0
+
+	ORG 0x8100
+@STACK_TOP
+
+START
+	PRINTLN MSG_BANNER
+
+	; [N0] BASE=0300
+	PRINT MSG_N0
+	LD	HL,RTL_BASE
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT LINE_END
+
+	; ISA slot 1 (matches MAME -isa1 rtl8019as).
+	LD	A,1
+	LD	(@ISA.ISA_SLOT),A
+
+	CALL	@ISA.ISA_OPEN
+
+	; [N1] RESET
+	PRINT MSG_N1
+	CALL	@RTL.RESET
+	JP	C,RESET_FAIL
+	PRINTLN MSG_OK
+
+	; Mandatory: DCR=0x48 (8-bit, FIFO threshold 8). MAME's
+	; device_reset leaves DCR=0x04 which is unsafe for packet
+	; RAM access; PROM read at address 0 happens to work either
+	; way, but follow the rule from AGENTS.md unconditionally.
+	LD	A,DCR_INIT
+	LD	(RTL_DCR_A),A
+
+	; [N2] CR=xx ISR=xx
+	PRINT MSG_N2
+	LD	A,(RTL_CR_A)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT MSG_ISR_EQ
+	LD	A,(RTL_ISR_A)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+
+	; [N3] RTL ID
+	CALL	@RTL.PROBE_ID
+	PRINT MSG_N3
+	LD	A,(@RTL.ID0_RAW)
+	CALL	PRINT_PRINTABLE
+	LD	A,(@RTL.ID1_RAW)
+	CALL	PRINT_PRINTABLE
+	PRINT MSG_PAREN_OPEN
+	LD	A,(@RTL.ID0_RAW)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	LD	A,(@RTL.ID1_RAW)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT MSG_PAREN_CLOSE
+	PRINT LINE_END
+
+	; PROM read (32 bytes from address 0x0000)
+	LD	HL,PROM_BUF
+	CALL	@RTL.READ_PROM
+	JP	C,PROM_FAIL
+
+	CALL	DETECT_LAYOUT
+	LD	(LAYOUT),A
+
+	LD	A,(LAYOUT)
+	CP	1
+	CALL	Z,BUILD_DOUBLED_MAC
+
+	; [N4] PROM MAC=xx:xx:xx:xx:xx:xx
+	PRINT MSG_N4
+	LD	A,(LAYOUT)
+	CP	1
+	JR	NZ,.MAC_DIRECT
+	LD	HL,MAC_BUF
+	JR	.MAC_PRINT
+.MAC_DIRECT
+	LD	HL,PROM_BUF
+.MAC_PRINT
+	CALL	@UTIL.PRINT_MAC
+	PRINT LINE_END
+
+	; PROM[0E..0F]=xx yy
+	PRINT MSG_PROM_SIG
+	LD	A,(PROM_BUF + 0x0E)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	LD	A,(PROM_BUF + 0x0F)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+
+	; PROM_LAYOUT=...
+	PRINT MSG_LAYOUT
+	LD	A,(LAYOUT)
+	OR	A
+	JR	NZ,.LY1
+	PRINT MSG_DIRECT
+	JR	.LY_DONE
+.LY1
+	CP	1
+	JR	NZ,.LY2
+	PRINT MSG_DOUBLED
+	JR	.LY_DONE
+.LY2
+	PRINT MSG_UNKNOWN
+.LY_DONE
+	PRINT LINE_END
+
+	; [N5] register snapshot
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	PRINT_REG_DUMP
+
+	; -- determine RESULT --
+	LD	A,(@RTL.ID0_RAW)
+	CP	RTL_ID0_VAL
+	JR	NZ,ID_BAD
+	LD	A,(@RTL.ID1_RAW)
+	CP	RTL_ID1_VAL
+	JR	NZ,ID_BAD
+
+	; ID OK -- check signature
+	LD	A,(PROM_BUF + 0x0E)
+	CP	0x57
+	JR	NZ,SIG_WARN
+	LD	A,(PROM_BUF + 0x0F)
+	CP	0x57
+	JR	NZ,SIG_WARN
+
+	PRINTLN MSG_RESULT_OK
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_OK
+
+SIG_WARN
+	PRINTLN MSG_W_SIG
+	PRINTLN MSG_RESULT_OK
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_OK
+
+ID_BAD
+	PRINTLN MSG_E_ID
+	CALL	VALIDATE_MAC
+	JR	C,NO_HW
+	PRINTLN MSG_W_NO_ID
+	PRINTLN MSG_RESULT_OK
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_OK
+
+NO_HW
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NO_HW
+
+RESET_FAIL
+	PRINTLN MSG_E_RESET
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NIC_ERR
+
+PROM_FAIL
+	PRINTLN MSG_E_PROM
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NIC_ERR
+
+
+; ------------------------------------------------------
+; Print one byte (in A) as printable ASCII or '.'
+; ------------------------------------------------------
+PRINT_PRINTABLE
+	PUSH	AF,BC
+	CP	32
+	JR	C,.DOT
+	CP	127
+	JR	NC,.DOT
+	JR	.OK
+.DOT
+	LD	A,'.'
+.OK
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC,AF
+	RET
+
+PUTCHAR
+	PUSH	AF,BC
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC,AF
+	RET
+
+; ------------------------------------------------------
+; DETECT_LAYOUT: A = 0 direct, 1 doubled, 2 unknown.
+; ------------------------------------------------------
+DETECT_LAYOUT
+	LD	HL,PROM_BUF
+	LD	A,(HL)
+	INC	HL
+	CP	(HL)
+	JR	NZ,.NOT_DOUBLED
+	INC	HL
+	LD	A,(HL)
+	INC	HL
+	CP	(HL)
+	JR	NZ,.NOT_DOUBLED
+	INC	HL
+	LD	A,(HL)
+	INC	HL
+	CP	(HL)
+	JR	NZ,.NOT_DOUBLED
+	LD	A,1
+	RET
+.NOT_DOUBLED
+	LD	A,(PROM_BUF + 0x0E)
+	CP	0x57
+	JR	NZ,.UNK
+	LD	A,(PROM_BUF + 0x0F)
+	CP	0x57
+	JR	NZ,.UNK
+	XOR	A
+	RET
+.UNK
+	LD	A,2
+	RET
+
+BUILD_DOUBLED_MAC
+	LD	HL,PROM_BUF
+	LD	DE,MAC_BUF
+	LD	B,6
+.LP
+	LD	A,(HL)
+	LD	(DE),A
+	INC	DE
+	INC	HL
+	INC	HL
+	DJNZ	.LP
+	RET
+
+VALIDATE_MAC
+	PUSH	BC,DE,HL
+	LD	A,(LAYOUT)
+	CP	1
+	JR	NZ,.SRC_DIRECT
+	LD	HL,MAC_BUF
+	JR	.HAVE_SRC
+.SRC_DIRECT
+	LD	HL,PROM_BUF
+.HAVE_SRC
+	LD	A,(HL)
+	AND	0x01
+	JR	NZ,.BAD
+	PUSH	HL
+	LD	B,6
+	XOR	A
+.OR
+	OR	(HL)
+	INC	HL
+	DJNZ	.OR
+	POP	HL
+	JR	Z,.BAD
+	PUSH	HL
+	LD	B,6
+	LD	A,0xFF
+.AN
+	AND	(HL)
+	INC	HL
+	DJNZ	.AN
+	POP	HL
+	CP	0xFF
+	JR	Z,.BAD
+	OR	A
+	POP	HL,DE,BC
+	RET
+.BAD
+	POP	HL,DE,BC
+	SCF
+	RET
+
+PRINT_REG_DUMP
+	PRINT MSG_N5
+	LD	HL,REG_NAMES
+	LD	DE,@RTL.REG_SNAPSHOT
+	LD	B,@RTL.REG_SNAPSHOT_LEN
+.LP
+	PUSH	BC,DE
+.NCHR
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	Z,.NDONE
+	CALL	PUTCHAR
+	JR	.NCHR
+.NDONE
+	LD	A,'='
+	CALL	PUTCHAR
+	POP	DE,BC
+	LD	A,(DE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	DE
+	DJNZ	.LP
+	PRINT LINE_END
+	RET
+
+REG_NAMES
+	DB "CR",0
+	DB "ISR",0
+	DB "DCR",0
+	DB "RCR",0
+	DB "TCR",0
+	DB "IMR",0
+	DB "PSTART",0
+	DB "PSTOP",0
+	DB "BNRY",0
+	DB "CURR",0
+
+
+; ------- messages -------
+MSG_BANNER	DB "RTL8019AS NICINFO v0.1",0
+MSG_N0		DB "[N0] BASE=",0
+MSG_N1		DB "[N1] RESET ",0
+MSG_OK		DB "OK",0
+MSG_N2		DB "[N2] CR=",0
+MSG_ISR_EQ	DB " ISR=",0
+MSG_N3		DB "[N3] RTL ID=",0
+MSG_PAREN_OPEN	DB " (",0
+MSG_PAREN_CLOSE	DB ")",0
+MSG_N4		DB "[N4] PROM MAC=",0
+MSG_PROM_SIG	DB "PROM[0E..0F]=",0
+MSG_LAYOUT	DB "PROM_LAYOUT=",0
+MSG_DIRECT	DB "direct",0
+MSG_DOUBLED	DB "doubled",0
+MSG_UNKNOWN	DB "unknown",0
+MSG_N5		DB "[N5] REG ",0
+MSG_RESULT_OK	DB "RESULT OK",0
+MSG_RESULT_FAIL	DB "RESULT FAIL",0
+MSG_E_ID	DB "[E02] RTL ID mismatch",0
+MSG_E_RESET	DB "[E01] RESET timeout",0
+MSG_E_PROM	DB "[E03] PROM read failed",0
+MSG_W_SIG	DB "[W01] PROM[0E..0F] != 57 57 (NE2000 signature mismatch)",0
+MSG_W_NO_ID	DB "[W02] ID mismatch but MAC plausible -- continuing",0
+LINE_END	DB 13,10,0
+
+	ENDMODULE
+
+
+; -------- libraries (placed after MAIN code/data) --------
+	INCLUDE "isa.asm"
+	INCLUDE "util.asm"
+	INCLUDE "rtl8019.asm"
+
+
+; Root-scope marker at end of emitted image. BSS labels live past
+; this point so they never overlap with lib code or data.
+NICINFO_IMAGE_END
+
+; -------- runtime BSS (no bytes emitted) --------
+	MODULE MAIN
+
+PROM_BUF	EQU NICINFO_IMAGE_END
+MAC_BUF		EQU PROM_BUF + 32
+LAYOUT		EQU MAC_BUF + 6
+NICINFO_BSS_END	EQU LAYOUT + 1
+
+	ENDMODULE
+
+	END MAIN.START
