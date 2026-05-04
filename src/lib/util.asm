@@ -121,5 +121,42 @@ DELAY_MS
 	POP	HL,AF
 	RET
 
+; ------------------------------------------------------
+; Internet checksum (RFC 1071): one's-complement sum of
+; 16-bit BE words, complemented.
+;
+; In:  IX = buffer pointer, BC = byte count (must be even).
+;      The buffer is read in BIG-ENDIAN order: (IX+0) is high,
+;      (IX+1) is low of the first 16-bit word.
+; Out: HL = ~accumulator. Store as `H, L` to get the 16-bit
+;      checksum in BIG-ENDIAN bytes.
+; Trashes: A, BC, DE, IX.
+; ------------------------------------------------------
+CHECKSUM
+	LD	HL,0
+.LP
+	LD	A,B
+	OR	C
+	JR	Z,.DONE
+	LD	D,(IX+0)
+	LD	E,(IX+1)
+	INC	IX
+	INC	IX
+	ADD	HL,DE
+	JR	NC,.NC
+	INC	HL			; carry-fold (rare second wrap is impossible after one INC)
+.NC
+	DEC	BC
+	DEC	BC
+	JR	.LP
+.DONE
+	LD	A,H
+	CPL
+	LD	H,A
+	LD	A,L
+	CPL
+	LD	L,A
+	RET
+
 	ENDMODULE
 	ENDIF

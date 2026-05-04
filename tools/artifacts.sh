@@ -19,6 +19,8 @@ BUILD_APPS=(
   niclb
   nictx
   nicrx
+  arp
+  ping
 )
 
 # Text/documentation files copied to the distribution root.
