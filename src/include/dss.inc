@@ -32,7 +32,14 @@ DSS_SETMEM			EQU 0x38
 DSS_GETMEM			EQU 0x3D
 DSS_FREEMEM			EQU	0x3E
 DSS_EXIT            EQU 0x41
+DSS_ENVIRON         EQU 0x46							; environment variables (PAGE 2 @ 0xE400)
 DSS_WAITKEY			EQU 0x48
+
+; ENVIRON sub-functions (selected by B):
+ENV_INIT			EQU 0xFF							; reset env table
+ENV_READ_ALL		EQU 0x00							; copy whole block to (DE)
+ENV_GET				EQU 0x01							; HL=name, DE=value buffer; A=0xFF found, 0 not
+ENV_SET				EQU 0x02							; HL="NAME=VALUE",0  ("NAME=",0 deletes)
 DSS_SETVMOD			EQU 0x50
 DSS_GETVMOD			EQU 0x51
 DSS_CLEAR			EQU 0x56

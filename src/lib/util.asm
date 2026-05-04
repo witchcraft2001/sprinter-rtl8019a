@@ -300,5 +300,35 @@ CHECKSUM
 	LD	L,A
 	RET
 
+; ------------------------------------------------------
+; EXIT helpers: standardized RESULT line + DSS_EXIT.
+; All CLI utilities use these to ensure consistent exit
+; codes (per CLAUDE.md: 0 ok, 1 usage, 2 no NIC, 3 net,
+; 4 config) and a final RESULT line for batch scripts.
+;
+;   EXIT       In: B = exit code. No print, just exit.
+;   EXIT_OK    Print "RESULT OK", exit B=0.
+;   EXIT_FAIL  In: B = exit code. Print "RESULT FAIL", exit.
+; ------------------------------------------------------
+	IFDEF USE_UTIL_EXIT
+EXIT
+	DSS_EXEC DSS_EXIT
+EXIT_OK
+	LD	HL,_EXIT_S_OK
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	B,0
+	DSS_EXEC DSS_EXIT
+EXIT_FAIL
+	PUSH	BC
+	LD	HL,_EXIT_S_FAIL
+	LD	C,DSS_PCHARS
+	RST	DSS
+	POP	BC
+	DSS_EXEC DSS_EXIT
+_EXIT_S_OK	DB "RESULT OK",13,10,0
+_EXIT_S_FAIL	DB "RESULT FAIL",13,10,0
+	ENDIF
+
 	ENDMODULE
 	ENDIF

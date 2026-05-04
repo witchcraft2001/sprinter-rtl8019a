@@ -95,6 +95,145 @@ TAP-вариант можно рассматривать отдельно, но 
 RTL8019AS_VERBOSE=1 ./run_sprinter_rtl8019as.sh -networkprovider pcap
 ```
 
+## Сеть на feth-паре (рекомендуемая baseline на macOS)
+
+Для разработки на одной машине без зависимости от внешней сети, Wi-Fi
+или второго хоста удобнее всего поднять виртуальную L2-пару на встроенных
+интерфейсах `feth(4)` (доступны на macOS 10.15+, без kext'ов и сторонних
+драйверов). Один peer привязывается к MAME через pcap, второй — к хост-стороне
+(IP-адрес, tcpdump, скрипты `tools/dev/*`, локальные сервисы для PING/UDP/TFTP/HTTP/FTP).
+
+Топология:
+
+```text
++----------------------------+        +-------------------------------+
+| MAME (rtl8019as ISA card)  |  feth0 |  host stack                   |
+| MAC: 02:80:19:11:22:33     | <----> |  feth1 inet 192.168.7.1/24    |
+| IP : 192.168.7.2 (NET.CFG) |        |  tcpdump / scapy / tftpd / ... |
++----------------------------+        +-------------------------------+
+```
+
+`feth0`/`feth1` — это внутренняя crossover-пара: всё, что записывается в
+один peer, отдаётся в другой как принятый L2-кадр. `pcap` на каждом из них
+видит трафик нормально. Self-traffic в этой схеме доставляется без проблем
+(в отличие от `en0`, см. ниже).
+
+### Однократная настройка
+
+```sh
+sudo ifconfig feth0 create
+sudo ifconfig feth1 create
+sudo ifconfig feth0 peer feth1
+sudo ifconfig feth0 up
+sudo ifconfig feth1 up
+
+# Назначить host-стороне IP в той же подсети, что NET.CFG.
+sudo ifconfig feth1 inet 192.168.7.1 netmask 255.255.255.0
+```
+
+После этого `192.168.7.1` отвечает на ARP/ICMP за хост-стек macOS — этого
+достаточно, чтобы `PING.EXE` из DSS получал echo reply без отдельного
+маршрутизатора. UDP/TFTP/HTTP/FTP-сервисы тоже привязываются к
+`192.168.7.1` обычным способом.
+
+Проверить, что пара поднялась:
+
+```sh
+ifconfig feth0
+ifconfig feth1
+# state=up, оба peer'а ссылаются друг на друга в строке "peer: fethN"
+```
+
+Проверить, что pcap их видит:
+
+```sh
+/Users/dmitry/dev/zx/sprinter/mame/mame -listnetwork | grep feth
+```
+
+Должны быть две строки `feth0` и `feth1`.
+
+### Привязка MAME к feth0
+
+В MAME `-networkprovider pcap` сам интерфейс выбирается уже после старта,
+через UI (Tab → Network Devices → rtl8019as → feth0) и сохраняется в
+`cfg/sprinter.cfg`. Один раз выбрать `feth0` и больше не возвращаться к
+этому диалогу:
+
+```sh
+/Users/dmitry/dev/zx/sprinter/mame/mame sprinter \
+    -isa1 rtl8019as \
+    -networkprovider pcap \
+    -verbose
+# Tab -> Network Devices -> rtl8019as -> feth0
+# выйти из MAME, чтобы cfg/sprinter.cfg записался
+```
+
+Дальше тот же запуск (или `run_sprinter_rtl8019as.sh -networkprovider pcap`)
+поднимает MAME уже на `feth0`.
+
+`hostside`-скрипты передают `--iface feth1`:
+
+```sh
+sudo python3 tools/dev/send_frame.py --iface feth1
+sudo tcpdump -i feth1 -e -nn -vv
+```
+
+### Соответствие NET.CFG
+
+`NET.CFG` на DSS-стороне:
+
+```text
+IP=192.168.7.2
+NETMASK=255.255.255.0
+GATEWAY=192.168.7.1
+RTL_MAC=02:80:19:11:22:33
+```
+
+`192.168.7.2` — Sprinter в MAME, `192.168.7.1` — host-стек macOS на `feth1`.
+MAC можно зафиксировать тем же значением, что MAME печатает при старте, либо
+любым валидным локально-административным MAC (`02:xx:xx:xx:xx:xx`).
+
+### Persistence
+
+`feth`-интерфейсы существуют только в текущей сессии ядра macOS и пропадают
+после reboot. Удобно завернуть однократную настройку в скрипт и держать его
+рядом с проектом. Минимальный вариант:
+
+```sh
+# tools/dev/feth-up.sh
+#!/usr/bin/env bash
+set -e
+sudo ifconfig feth0 create 2>/dev/null || true
+sudo ifconfig feth1 create 2>/dev/null || true
+sudo ifconfig feth0 peer feth1
+sudo ifconfig feth0 up
+sudo ifconfig feth1 up
+sudo ifconfig feth1 inet 192.168.7.1 netmask 255.255.255.0
+```
+
+Запускать после reboot перед сессией разработки. Для постоянного решения
+можно оформить LaunchDaemon, но для baseline это не требуется.
+
+### Cleanup
+
+Удалить интерфейсы и связанные маршруты:
+
+```sh
+sudo ifconfig feth0 destroy
+sudo ifconfig feth1 destroy
+```
+
+Маршрут `192.168.7.0/24` исчезнет автоматически вместе с `feth1`.
+
+### Когда feth-пара не подходит
+
+- На реальном железе (Sprinter с физической ISA-картой). Там сеть строится
+  обычным проводным/Wi-Fi подключением.
+- Когда нужно протестировать DHCP против реального DHCP-сервера в локалке —
+  тогда вместо `feth1` использовать проводной `enX` с реальным DHCP в подсети.
+- Когда параллельно в той же сессии пробуется второй хост (другая машина,
+  RPi и т.п.). Тогда удобнее включать MAME напрямую в физический сегмент.
+
 ## Права macOS на /dev/bpf
 
 `pcap`-провайдер MAME открывает `/dev/bpfN` и требует прав на чтение/запись
@@ -251,7 +390,10 @@ Workarounds (в порядке практичности):
    `send_frame.py` на другом хосте, MAME с NICRX — на основном. AP
    доставит unicast обоим. Чистое решение, ничего не настраивать.
 
-2. **`feth`-пара на macOS** (macOS 10.15+, без kext'ов):
+2. **`feth`-пара на macOS** — рекомендуемая baseline для single-machine
+   разработки. Полная процедура (создание пары, IP на host-стороне,
+   привязка MAME, persistence, cleanup) описана в разделе
+   "Сеть на feth-паре (рекомендуемая baseline на macOS)" выше. Коротко:
 
    ```sh
    sudo ifconfig feth0 create
@@ -261,10 +403,9 @@ Workarounds (в порядке практичности):
    sudo ifconfig feth1 up
    ```
 
-   `feth0` <-> `feth1` — внутренняя L2-пара, всё что идёт в один peer
-   приходит в другой. Привязать MAME к `feth0` (Tab → Network Devices →
-   rtl8019as → feth0), а `send_frame.py --iface feth1`. Кадр уйдёт в
-   feth1 → попадёт во feth0 → MAME получит.
+   Привязать MAME к `feth0` (Tab → Network Devices → rtl8019as → feth0),
+   а `send_frame.py --iface feth1`. Кадр уйдёт в feth1 → попадёт во
+   feth0 → MAME получит.
 
 3. **Отдельная USB-Ethernet карта в шлейфе с другим устройством.**
    Если есть свободный port + второй девайс (ноутбук, RPi) — кабель

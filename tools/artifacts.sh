@@ -23,6 +23,7 @@ BUILD_APPS=(
   ping
   udptest
   tftp
+  netcfg
 )
 
 # Text/documentation files copied to the distribution root.
