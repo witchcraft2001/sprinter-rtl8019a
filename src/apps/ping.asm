@@ -37,12 +37,13 @@ EXE_VERSION		EQU 1
 	INCLUDE "dss.inc"
 	INCLUDE "rtl8019.inc"
 
-; Pull in the high-level RTL helpers we need (and only those).
+; Pull in the high-level RTL + ARP helpers we need.
 	DEFINE USE_RTL_INIT_NORMAL
 	DEFINE USE_RTL_SEND_FRAME
 	DEFINE USE_RTL_WAIT_PTX
 	DEFINE USE_RTL_RING_HAS_PACKET
 	DEFINE USE_RTL_READ_PACKET
+	DEFINE USE_ARP_BUILD_REQUEST
 
 ARP_OUTER	EQU 32			; ~15s ARP budget (arbitrary tick units)
 ICMP_OUTER	EQU 32			; ~15s ICMP reply budget
@@ -103,6 +104,11 @@ START
 	LD	HL,OUR_MAC
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
+	; ARP module setup.
+	LD	HL,OUR_MAC
+	LD	(@ARP.OUR_MAC_PTR),HL
+	LD	HL,OUR_IP
+	LD	(@ARP.OUR_IP_PTR),HL
 	PRINTLN MSG_OK
 
 	PRINT MSG_PING_HDR
@@ -119,7 +125,9 @@ START
 	CALL	PRINT_IPV4
 	PRINT LINE_END
 
-	CALL	BUILD_ARP_REQUEST
+	LD	DE,TX_BUF
+	LD	HL,TARGET_IP
+	CALL	@ARP.BUILD_REQUEST
 	LD	HL,TX_BUF
 	LD	BC,ARP_FRAME_LEN
 	CALL	@RTL.SEND_FRAME
@@ -197,74 +205,6 @@ FAIL_NIC
 	PRINTLN MSG_RESULT_FAIL
 	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NIC_ERR
-
-
-; ------------------------------------------------------
-; BUILD_ARP_REQUEST: 60-byte broadcast ARP "who-has" in TX_BUF.
-; ------------------------------------------------------
-BUILD_ARP_REQUEST
-	LD	DE,TX_BUF
-	LD	A,0xFF
-	LD	B,6
-.DST
-	LD	(DE),A
-	INC	DE
-	DJNZ	.DST
-	LD	HL,OUR_MAC
-	LD	BC,6
-	LDIR
-	LD	A,HIGH ETH_TYPE_ARP
-	LD	(DE),A
-	INC	DE
-	LD	A,LOW ETH_TYPE_ARP
-	LD	(DE),A
-	INC	DE
-	XOR	A
-	LD	(DE),A
-	INC	DE
-	LD	A,1
-	LD	(DE),A
-	INC	DE
-	LD	A,0x08
-	LD	(DE),A
-	INC	DE
-	XOR	A
-	LD	(DE),A
-	INC	DE
-	LD	A,6
-	LD	(DE),A
-	INC	DE
-	LD	A,4
-	LD	(DE),A
-	INC	DE
-	XOR	A
-	LD	(DE),A
-	INC	DE
-	LD	A,ARP_OP_REQUEST
-	LD	(DE),A
-	INC	DE
-	LD	HL,OUR_MAC
-	LD	BC,6
-	LDIR
-	LD	HL,OUR_IP
-	LD	BC,4
-	LDIR
-	XOR	A
-	LD	B,6
-.TGT_MAC
-	LD	(DE),A
-	INC	DE
-	DJNZ	.TGT_MAC
-	LD	HL,TARGET_IP
-	LD	BC,4
-	LDIR
-	XOR	A
-	LD	B,ARP_FRAME_LEN - 14 - 28
-.PAD
-	LD	(DE),A
-	INC	DE
-	DJNZ	.PAD
-	RET
 
 
 ; ------------------------------------------------------
@@ -666,6 +606,7 @@ LINE_END	DB 13,10,0
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
+	INCLUDE "arp_lib.asm"
 
 
 PING_IMAGE_END

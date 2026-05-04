@@ -39,6 +39,7 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_WAIT_PTX
 	DEFINE USE_RTL_RING_HAS_PACKET
 	DEFINE USE_RTL_READ_PACKET
+	DEFINE USE_ARP_BUILD_REQUEST
 
 PRX_OUTER	EQU 32			; ~15s budget for ARP reply
 
@@ -85,6 +86,11 @@ START
 	LD	HL,OUR_MAC
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
+	; Configure ARP module pointers (once).
+	LD	HL,OUR_MAC
+	LD	(@ARP.OUR_MAC_PTR),HL
+	LD	HL,OUR_IP
+	LD	(@ARP.OUR_IP_PTR),HL
 	PRINTLN MSG_OK
 
 	; [A1] info banner
@@ -100,8 +106,10 @@ START
 	CALL	PRINT_IPV4
 	PRINT LINE_END
 
-	; [A2] BUILD
-	CALL	BUILD_ARP_REQUEST
+	; [A2] BUILD via @ARP.BUILD_REQUEST.
+	LD	DE,TX_BUF
+	LD	HL,TARGET_IP
+	CALL	@ARP.BUILD_REQUEST
 	PRINTLN MSG_A2
 
 	; [A3] SEND (DMA + TBCR + CR.TXP + wait PTX)
@@ -158,87 +166,6 @@ FAIL_NIC
 ;                 target_ip=TARGET_IP
 ;   pad to 60   : zero bytes
 ; ------------------------------------------------------
-BUILD_ARP_REQUEST
-	LD	DE,TX_BUF
-	; DST = FF*6
-	LD	A,0xFF
-	LD	B,6
-.DST
-	LD	(DE),A
-	INC	DE
-	DJNZ	.DST
-	; SRC = OUR_MAC
-	LD	HL,OUR_MAC
-	LD	BC,6
-	LDIR
-	; EtherType = 0x0806
-	LD	A,HIGH ETH_TYPE_ARP
-	LD	(DE),A
-	INC	DE
-	LD	A,LOW ETH_TYPE_ARP
-	LD	(DE),A
-	INC	DE
-
-	; -- ARP body --
-	; HW type = 0x0001 (Ethernet)
-	XOR	A
-	LD	(DE),A
-	INC	DE
-	LD	A,1
-	LD	(DE),A
-	INC	DE
-	; Proto type = 0x0800 (IPv4)
-	LD	A,0x08
-	LD	(DE),A
-	INC	DE
-	XOR	A
-	LD	(DE),A
-	INC	DE
-	; HW size = 6
-	LD	A,6
-	LD	(DE),A
-	INC	DE
-	; Proto size = 4
-	LD	A,4
-	LD	(DE),A
-	INC	DE
-	; Op = 0x0001 (request)
-	XOR	A
-	LD	(DE),A
-	INC	DE
-	LD	A,ARP_OP_REQUEST
-	LD	(DE),A
-	INC	DE
-	; Sender MAC
-	LD	HL,OUR_MAC
-	LD	BC,6
-	LDIR
-	; Sender IP
-	LD	HL,OUR_IP
-	LD	BC,4
-	LDIR
-	; Target MAC = 0*6
-	XOR	A
-	LD	B,6
-.TGT_MAC
-	LD	(DE),A
-	INC	DE
-	DJNZ	.TGT_MAC
-	; Target IP
-	LD	HL,TARGET_IP
-	LD	BC,4
-	LDIR
-
-	; Pad to 60 bytes (current = 14 + 28 = 42; need 18 zero bytes)
-	XOR	A
-	LD	B,FRAME_LEN - 14 - ARP_BODY_LEN
-.PAD
-	LD	(DE),A
-	INC	DE
-	DJNZ	.PAD
-	RET
-
-
 ; ------------------------------------------------------
 ; WAIT_FOR_ARP_REPLY: spin on RTL.RING_HAS_PACKET +
 ; RTL.READ_PACKET, drop anything that isn't a matching ARP
@@ -445,6 +372,7 @@ LINE_END	DB 13,10,0
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
+	INCLUDE "arp_lib.asm"
 
 
 ARP_IMAGE_END
