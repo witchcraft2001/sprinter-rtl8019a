@@ -21,6 +21,7 @@ BUILD_APPS=(
   nicrx
   arp
   ping
+  udptest
 )
 
 # Text/documentation files copied to the distribution root.

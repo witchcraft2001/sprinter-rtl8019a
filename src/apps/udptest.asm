@@ -1,0 +1,721 @@
+; ======================================================
+; UDPTEST.EXE - stage 7 of the Sprinter RTL8019AS network kit.
+; ARP-resolves a hardcoded target IP, sends one UDP datagram
+; with a fixed payload, waits for a matching echo reply from
+; tools/dev/udp_echo.py running on the host.
+;
+; v0.1: hardcoded OUR_IP=192.168.7.2, TARGET_IP=192.168.7.1,
+;       TARGET_PORT=7777, OUR_PORT=0xC000, payload="SPRINTER UDP".
+;       NET.CFG / cmdline target arrive in v0.2.
+;
+; Host setup (single-machine via feth pair):
+;   sudo ifconfig feth0 create
+;   sudo ifconfig feth1 create
+;   sudo ifconfig feth0 peer feth1
+;   sudo ifconfig feth0 up
+;   sudo ifconfig feth1 inet 192.168.7.1/24 up
+;   sudo python3 tools/dev/udp_echo.py
+;
+; Stage codes:
+;   [U0] INIT
+;   [U1] ARP WHO-HAS <target>
+;   [U2] ARP REPLY MAC=...
+;   [U3] BUILD UDP
+;   [U4] SEND
+;   [U5] WAIT REPLY
+;   [U6] REPLY len=xxxx data=...
+; ======================================================
+
+EXE_VERSION		EQU 1
+
+	DEVICE NOSLOT64K
+
+	INCLUDE "macro.inc"
+	INCLUDE "dss.inc"
+	INCLUDE "rtl8019.inc"
+
+	DEFINE USE_RTL_INIT_NORMAL
+	DEFINE USE_RTL_SEND_FRAME
+	DEFINE USE_RTL_WAIT_PTX
+	DEFINE USE_RTL_RING_HAS_PACKET
+	DEFINE USE_RTL_READ_PACKET
+
+ARP_OUTER	EQU 32
+UDP_OUTER	EQU 32
+
+ETH_TYPE_ARP	EQU 0x0806
+ETH_TYPE_IPV4	EQU 0x0800
+IP_PROTO_UDP	EQU 17
+
+ARP_OP_REQUEST	EQU 1
+ARP_OP_REPLY	EQU 2
+
+ARP_FRAME_LEN	EQU 60
+IP_HDR_LEN	EQU 20
+UDP_HDR_LEN	EQU 8
+UDP_PAYLOAD_LEN	EQU 16
+UDP_FRAME_LEN	EQU 14 + IP_HDR_LEN + UDP_HDR_LEN + UDP_PAYLOAD_LEN	; 58
+
+OUR_PORT_HI	EQU 0xC0
+OUR_PORT_LO	EQU 0x00
+TARGET_PORT_HI	EQU HIGH 7777
+TARGET_PORT_LO	EQU LOW 7777
+
+	MODULE MAIN
+
+	ORG 0x8080
+
+EXE_HEADER
+	DB "EXE"
+	DB EXE_VERSION
+	DW 0x0080
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW START
+	DW START
+	DW STACK_TOP
+	DS 106, 0
+
+	ORG 0x8100
+@STACK_TOP
+
+START
+	PRINTLN MSG_BANNER
+
+	LD	A,1
+	LD	(@ISA.ISA_SLOT),A
+	CALL	@ISA.ISA_OPEN
+
+	; [U0] INIT
+	PRINT MSG_U0
+	CALL	@RTL.RESET
+	JP	C,RESET_FAIL
+	LD	HL,OUR_MAC
+	LD	A,RCR_AB
+	CALL	@RTL.INIT_NORMAL
+	PRINTLN MSG_OK
+
+	PRINT MSG_HDR
+	LD	HL,TARGET_IP
+	CALL	PRINT_IPV4
+	PRINT MSG_PORT_FROM
+	LD	HL,OUR_IP
+	CALL	PRINT_IPV4
+	PRINT LINE_END
+
+	; [U1] ARP WHO-HAS
+	PRINT MSG_U1
+	LD	HL,TARGET_IP
+	CALL	PRINT_IPV4
+	PRINT LINE_END
+
+	CALL	BUILD_ARP_REQUEST
+	LD	HL,TX_BUF
+	LD	BC,ARP_FRAME_LEN
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+
+	LD	HL,ARP_OUTER
+	LD	(OUTER_LEFT),HL
+	CALL	WAIT_FOR_ARP_REPLY
+	JP	C,ARP_TIMEOUT
+
+	; [U2] ARP REPLY
+	PRINT MSG_U2
+	LD	HL,TARGET_MAC
+	CALL	@UTIL.PRINT_MAC
+	PRINT LINE_END
+
+	; [U3] BUILD UDP
+	CALL	BUILD_UDP_DATAGRAM
+	PRINTLN MSG_U3
+
+	; [U4] SEND
+	PRINT MSG_U4
+	LD	HL,TX_BUF
+	LD	BC,UDP_FRAME_LEN
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+	PRINTLN MSG_OK
+
+	; [U5] WAIT REPLY
+	PRINTLN MSG_U5
+	LD	HL,UDP_OUTER
+	LD	(OUTER_LEFT),HL
+	CALL	WAIT_FOR_UDP_REPLY
+	JP	C,UDP_TIMEOUT
+
+	; [U6] REPLY len=xxxx data="..."
+	PRINT MSG_U6_LEN
+	LD	HL,(REPLY_LEN)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT MSG_DATA_EQ
+	LD	HL,REPLY_BUF
+	LD	BC,(REPLY_LEN)
+	CALL	PRINT_TEXT
+	PRINT LINE_END
+
+	PRINTLN MSG_RESULT_OK
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_OK
+
+
+RESET_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_RESET
+	JP	FAIL_NIC
+
+SEND_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_SEND
+	JP	FAIL_NIC
+
+ARP_TIMEOUT
+	PRINTLN MSG_E_ARP
+	JP	FAIL_NIC
+
+UDP_TIMEOUT
+	PRINTLN MSG_E_UDP
+	JP	FAIL_NIC
+
+FAIL_NIC
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	PRINT_REG_DUMP
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NIC_ERR
+
+
+; ------------------------------------------------------
+; BUILD_ARP_REQUEST: same shape as in ARP/PING utilities.
+; ------------------------------------------------------
+BUILD_ARP_REQUEST
+	LD	DE,TX_BUF
+	LD	A,0xFF
+	LD	B,6
+.DST
+	LD	(DE),A
+	INC	DE
+	DJNZ	.DST
+	LD	HL,OUR_MAC
+	LD	BC,6
+	LDIR
+	LD	A,HIGH ETH_TYPE_ARP
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW ETH_TYPE_ARP
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,1
+	LD	(DE),A
+	INC	DE
+	LD	A,0x08
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,6
+	LD	(DE),A
+	INC	DE
+	LD	A,4
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,ARP_OP_REQUEST
+	LD	(DE),A
+	INC	DE
+	LD	HL,OUR_MAC
+	LD	BC,6
+	LDIR
+	LD	HL,OUR_IP
+	LD	BC,4
+	LDIR
+	XOR	A
+	LD	B,6
+.TGT_MAC
+	LD	(DE),A
+	INC	DE
+	DJNZ	.TGT_MAC
+	LD	HL,TARGET_IP
+	LD	BC,4
+	LDIR
+	XOR	A
+	LD	B,ARP_FRAME_LEN - 14 - 28
+.PAD
+	LD	(DE),A
+	INC	DE
+	DJNZ	.PAD
+	RET
+
+
+; ------------------------------------------------------
+; BUILD_UDP_DATAGRAM: 58-byte UDP-over-IPv4 frame in TX_BUF.
+;   ETH (14) + IPv4 (20) + UDP (8) + payload (16).
+;   IP checksum is computed; UDP checksum is left as 0
+;   (allowed in IPv4 to skip).
+; ------------------------------------------------------
+BUILD_UDP_DATAGRAM
+	; Ethernet
+	LD	DE,TX_BUF
+	LD	HL,TARGET_MAC
+	LD	BC,6
+	LDIR
+	LD	HL,OUR_MAC
+	LD	BC,6
+	LDIR
+	LD	A,HIGH ETH_TYPE_IPV4
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW ETH_TYPE_IPV4
+	LD	(DE),A
+	INC	DE
+
+	; IPv4 header
+	LD	A,0x45
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,HIGH (IP_HDR_LEN + UDP_HDR_LEN + UDP_PAYLOAD_LEN)
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW (IP_HDR_LEN + UDP_HDR_LEN + UDP_PAYLOAD_LEN)
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,1
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	(DE),A
+	INC	DE
+	LD	A,64
+	LD	(DE),A
+	INC	DE
+	LD	A,IP_PROTO_UDP
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A			; csum placeholder
+	INC	DE
+	LD	(DE),A
+	INC	DE
+	LD	HL,OUR_IP
+	LD	BC,4
+	LDIR
+	LD	HL,TARGET_IP
+	LD	BC,4
+	LDIR
+
+	; UDP header
+	LD	A,OUR_PORT_HI
+	LD	(DE),A
+	INC	DE
+	LD	A,OUR_PORT_LO
+	LD	(DE),A
+	INC	DE
+	LD	A,TARGET_PORT_HI
+	LD	(DE),A
+	INC	DE
+	LD	A,TARGET_PORT_LO
+	LD	(DE),A
+	INC	DE
+	; UDP length = UDP header + payload (BE)
+	LD	A,HIGH (UDP_HDR_LEN + UDP_PAYLOAD_LEN)
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW (UDP_HDR_LEN + UDP_PAYLOAD_LEN)
+	LD	(DE),A
+	INC	DE
+	; UDP checksum = 0 (disabled, allowed in IPv4)
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	(DE),A
+	INC	DE
+
+	; Payload (16 bytes, copy from PAYLOAD)
+	LD	HL,PAYLOAD
+	LD	BC,UDP_PAYLOAD_LEN
+	LDIR
+
+	; Compute IP checksum over TX_BUF+14, length 20.
+	PUSH	IX
+	LD	IX,TX_BUF + 14
+	LD	BC,IP_HDR_LEN
+	CALL	@UTIL.CHECKSUM
+	POP	IX
+	LD	A,H
+	LD	(TX_BUF + 14 + 10),A
+	LD	A,L
+	LD	(TX_BUF + 14 + 11),A
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_FOR_ARP_REPLY: identical pattern to PING / ARP.
+; ------------------------------------------------------
+WAIT_FOR_ARP_REPLY
+.MAIN
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	LD	BC,0
+.WAIT
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.WAIT
+	LD	HL,(OUTER_LEFT)
+	DEC	HL
+	LD	(OUTER_LEFT),HL
+	LD	A,H
+	OR	L
+	JR	Z,.TIMEOUT
+	JR	.MAIN
+.HAVE
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JR	C,.MAIN
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_ARP
+	JR	NZ,.MAIN
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_ARP
+	JR	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + 6)
+	OR	A
+	JR	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + 7)
+	CP	ARP_OP_REPLY
+	JR	NZ,.MAIN
+	LD	HL,RX_BUF + 14 + 14
+	LD	DE,TARGET_IP
+	LD	B,4
+.CMPIP
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.MAIN
+	INC	HL
+	INC	DE
+	DJNZ	.CMPIP
+	LD	HL,RX_BUF + 14 + 8
+	LD	DE,TARGET_MAC
+	LD	BC,6
+	LDIR
+	OR	A
+	RET
+.TIMEOUT
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_FOR_UDP_REPLY: filter for UDP echo on our port.
+; Captures payload bytes into REPLY_BUF and length into REPLY_LEN.
+; ------------------------------------------------------
+WAIT_FOR_UDP_REPLY
+.MAIN
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	LD	BC,0
+.WAIT
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.WAIT
+	LD	HL,(OUTER_LEFT)
+	DEC	HL
+	LD	(OUTER_LEFT),HL
+	LD	A,H
+	OR	L
+	JP	Z,.TIMEOUT
+	JR	.MAIN
+.HAVE
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JP	C,.MAIN
+	; EtherType IPv4
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_IPV4
+	JP	NZ,.MAIN
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_IPV4
+	JP	NZ,.MAIN
+	; IP version+IHL = 0x45
+	LD	A,(RX_BUF + 14)
+	CP	0x45
+	JP	NZ,.MAIN
+	; protocol = UDP
+	LD	A,(RX_BUF + 14 + 9)
+	CP	IP_PROTO_UDP
+	JP	NZ,.MAIN
+	; src IP == TARGET_IP
+	LD	HL,RX_BUF + 14 + 12
+	LD	DE,TARGET_IP
+	LD	B,4
+.CMPSRC
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,.MAIN
+	INC	HL
+	INC	DE
+	DJNZ	.CMPSRC
+	; UDP src_port == TARGET_PORT
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
+	CP	TARGET_PORT_HI
+	JP	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 1)
+	CP	TARGET_PORT_LO
+	JP	NZ,.MAIN
+	; UDP dst_port == OUR_PORT
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 2)
+	CP	OUR_PORT_HI
+	JP	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 3)
+	CP	OUR_PORT_LO
+	JP	NZ,.MAIN
+	; UDP length = bytes 4..5 BE; payload length = UDP_LEN - 8
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
+	LD	L,A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
+	LD	H,A
+	LD	BC,8
+	OR	A
+	SBC	HL,BC
+	; cap at REPLY_BUF_SIZE
+	LD	BC,REPLY_BUF_SIZE
+	LD	A,H
+	CP	B
+	JR	C,.LEN_OK
+	JR	NZ,.LEN_CAP
+	LD	A,L
+	CP	C
+	JR	C,.LEN_OK
+.LEN_CAP
+	LD	HL,REPLY_BUF_SIZE
+.LEN_OK
+	LD	(REPLY_LEN),HL
+	; copy payload from RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN
+	LD	HL,RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN
+	LD	DE,REPLY_BUF
+	LD	BC,(REPLY_LEN)
+	LD	A,B
+	OR	C
+	JR	Z,.NOCOPY
+	LDIR
+.NOCOPY
+	OR	A
+	RET
+.TIMEOUT
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; PRINT_TEXT: print BC bytes from (HL) as printable chars,
+; substituting '.' for control bytes.
+; ------------------------------------------------------
+PRINT_TEXT
+	PUSH	BC,HL
+.LP
+	LD	A,B
+	OR	C
+	JR	Z,.DONE
+	LD	A,(HL)
+	CP	32
+	JR	C,.DOT
+	CP	127
+	JR	NC,.DOT
+	JR	.OUT
+.DOT
+	LD	A,'.'
+.OUT
+	PUSH	BC,HL
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	HL,BC
+	INC	HL
+	DEC	BC
+	JR	.LP
+.DONE
+	POP	HL,BC
+	RET
+
+
+PRINT_IPV4
+	PUSH	HL,BC
+	LD	B,4
+.LP
+	LD	A,(HL)
+	CALL	PRINT_DEC_A
+	INC	HL
+	DEC	B
+	JR	Z,.DONE
+	PUSH	BC
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC
+	JR	.LP
+.DONE
+	POP	BC,HL
+	RET
+
+
+PRINT_DEC_A
+	PUSH	AF,BC,DE,HL
+	LD	C,A
+	LD	HL,DEC_BUF + 5
+	LD	(HL),0
+.LP
+	LD	A,C
+	LD	B,0
+.SUB
+	CP	10
+	JR	C,.GOT
+	SUB	10
+	INC	B
+	JR	.SUB
+.GOT
+	ADD	A,'0'
+	DEC	HL
+	LD	(HL),A
+	LD	C,B
+	LD	A,B
+	OR	A
+	JR	NZ,.LP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	POP	HL,DE,BC,AF
+	RET
+
+DEC_BUF		DS 6,0
+
+
+PUTCHAR
+	PUSH	AF,BC
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC,AF
+	RET
+
+
+PRINT_REG_DUMP
+	PRINT MSG_REGS
+	LD	HL,REG_NAMES
+	LD	DE,@RTL.REG_SNAPSHOT
+	LD	B,@RTL.REG_SNAPSHOT_LEN
+.LP
+	PUSH	BC,DE
+.NCHR
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	Z,.NDONE
+	CALL	PUTCHAR
+	JR	.NCHR
+.NDONE
+	LD	A,'='
+	CALL	PUTCHAR
+	POP	DE,BC
+	LD	A,(DE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	DE
+	DJNZ	.LP
+	PRINT LINE_END
+	RET
+
+REG_NAMES
+	DB "CR",0
+	DB "ISR",0
+	DB "DCR",0
+	DB "RCR",0
+	DB "TCR",0
+	DB "IMR",0
+	DB "PSTART",0
+	DB "PSTOP",0
+	DB "BNRY",0
+	DB "CURR",0
+
+
+; ------- in-EXE data -------
+OUR_MAC		DB 0x02, 0x80, 0x19, 0x11, 0x22, 0x33
+OUR_IP		DB 192, 168, 7, 2
+TARGET_IP	DB 192, 168, 7, 1
+TARGET_MAC	DB 0,0,0,0,0,0
+OUTER_LEFT	DW 0
+REPLY_LEN	DW 0
+
+PAYLOAD		DB "SPRINTER UDPTEST"
+
+
+; ------- messages -------
+MSG_BANNER	DB "RTL8019AS UDPTEST v0.1",0
+MSG_HDR		DB "UDPTEST ",0
+MSG_PORT_FROM	DB ":7777 from ",0
+MSG_U0		DB "[U0] INIT ",0
+MSG_OK		DB "OK",0
+MSG_U1		DB "[U1] ARP WHO-HAS ",0
+MSG_U2		DB "[U2] ARP REPLY MAC=",0
+MSG_U3		DB "[U3] BUILD UDP OK",0
+MSG_U4		DB "[U4] SEND ",0
+MSG_U5		DB "[U5] WAIT REPLY",0
+MSG_U6_LEN	DB "[U6] REPLY len=",0
+MSG_DATA_EQ	DB " data=",0
+MSG_REGS	DB "REGS ",0
+MSG_RESULT_OK	DB "RESULT OK",0
+MSG_RESULT_FAIL	DB "RESULT FAIL",0
+MSG_E_RESET	DB "[E70] RESET timeout",0
+MSG_E_SEND	DB "[E71] DMA write or PTX timeout",0
+MSG_E_ARP	DB "[E72] ARP reply timeout",0
+MSG_E_UDP	DB "[E73] UDP echo reply timeout",0
+LINE_END	DB 13,10,0
+
+	ENDMODULE
+
+
+	INCLUDE "isa.asm"
+	INCLUDE "util.asm"
+	INCLUDE "rtl8019.asm"
+
+
+UDPTEST_IMAGE_END
+
+RX_BUF_SIZE	EQU 1518
+REPLY_BUF_SIZE	EQU 256
+
+	MODULE MAIN
+
+TX_BUF		EQU UDPTEST_IMAGE_END
+RX_HDR		EQU TX_BUF + UDP_FRAME_LEN
+RX_BUF		EQU RX_HDR + 4
+REPLY_BUF	EQU RX_BUF + RX_BUF_SIZE
+UDPTEST_BSS_END	EQU REPLY_BUF + REPLY_BUF_SIZE
+
+	ENDMODULE
+
+	END MAIN.START
