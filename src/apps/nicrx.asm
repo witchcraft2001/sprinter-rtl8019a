@@ -27,6 +27,8 @@ EXE_VERSION		EQU 1
 	INCLUDE "dss.inc"
 	INCLUDE "rtl8019.inc"
 
+	DEFINE USE_RTL_INIT_NORMAL
+
 PRX_OUTER	EQU 64			; ~30s with ISA wait states
 RDC_LOOPS	EQU 8000
 
@@ -62,7 +64,9 @@ START
 	PRINT MSG_X0
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
-	CALL	CONFIG_NORMAL
+	LD	HL,OUR_MAC
+	XOR	A			; RCR = 0: physical match only.
+	CALL	@RTL.INIT_NORMAL
 	PRINTLN MSG_OK
 
 	; [X1] WAIT RX -- prompt user to send a frame from the host.
@@ -219,68 +223,6 @@ FAIL_NIC
 	PRINTLN MSG_RESULT_FAIL
 	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NIC_ERR
-
-
-; ------------------------------------------------------
-; Init for normal RX/TX (broadcast accept; promiscuous off).
-; ------------------------------------------------------
-CONFIG_NORMAL
-	LD	A,CR_PAGE0_STOP
-	LD	(RTL_CR_A),A
-	LD	A,DCR_INIT
-	LD	(RTL_DCR_A),A
-	XOR	A
-	LD	(RTL_RBCR0_A),A
-	LD	(RTL_RBCR1_A),A
-	; RCR = 0: physical match only. Reject broadcast and multicast
-	; at the hardware level so real-network noise (DHCP, mDNS,
-	; NetBIOS, ARP gratuitous, ...) does not flood the RX ring.
-	XOR	A
-	LD	(RTL_RCR_A),A
-	LD	A,TCR_NORMAL
-	LD	(RTL_TCR_A),A
-	LD	A,RTL_TPSR_INIT
-	LD	(RTL_TPSR_A),A
-	LD	A,RTL_PSTART_INIT
-	LD	(RTL_PSTART_A),A
-	LD	A,RTL_PSTOP_INIT
-	LD	(RTL_PSTOP_A),A
-	LD	A,RTL_BNRY_INIT
-	LD	(RTL_BNRY_A),A
-	LD	A,0xFF
-	LD	(RTL_ISR_A),A
-	XOR	A
-	LD	(RTL_IMR_A),A
-
-	LD	A,CR_PAGE1_STOP
-	LD	(RTL_CR_A),A
-	LD	A,(OUR_MAC + 0)
-	LD	(RTL_PAR0_A),A
-	LD	A,(OUR_MAC + 1)
-	LD	(RTL_PAR1_A),A
-	LD	A,(OUR_MAC + 2)
-	LD	(RTL_PAR2_A),A
-	LD	A,(OUR_MAC + 3)
-	LD	(RTL_PAR3_A),A
-	LD	A,(OUR_MAC + 4)
-	LD	(RTL_PAR4_A),A
-	LD	A,(OUR_MAC + 5)
-	LD	(RTL_PAR5_A),A
-	LD	A,RTL_CURR_INIT
-	LD	(RTL_CURR_A),A
-	XOR	A
-	LD	(RTL_MAR0_A + 0),A
-	LD	(RTL_MAR0_A + 1),A
-	LD	(RTL_MAR0_A + 2),A
-	LD	(RTL_MAR0_A + 3),A
-	LD	(RTL_MAR0_A + 4),A
-	LD	(RTL_MAR0_A + 5),A
-	LD	(RTL_MAR0_A + 6),A
-	LD	(RTL_MAR0_A + 7),A
-
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
-	RET
 
 
 ; ------------------------------------------------------

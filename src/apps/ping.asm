@@ -23,6 +23,10 @@
 ;   [P4] SEND
 ;   [P5] WAIT REPLY
 ;   [P6] REPLY id=... seq=...
+;
+; This version uses the RTL.INIT_NORMAL / RTL.SEND_FRAME /
+; RTL.RING_HAS_PACKET / RTL.READ_PACKET helpers from the
+; refactored library.
 ; ======================================================
 
 EXE_VERSION		EQU 1
@@ -33,8 +37,14 @@ EXE_VERSION		EQU 1
 	INCLUDE "dss.inc"
 	INCLUDE "rtl8019.inc"
 
-PTX_LOOPS	EQU 16000
-ARP_OUTER	EQU 32			; ~15s ARP budget
+; Pull in the high-level RTL helpers we need (and only those).
+	DEFINE USE_RTL_INIT_NORMAL
+	DEFINE USE_RTL_SEND_FRAME
+	DEFINE USE_RTL_WAIT_PTX
+	DEFINE USE_RTL_RING_HAS_PACKET
+	DEFINE USE_RTL_READ_PACKET
+
+ARP_OUTER	EQU 32			; ~15s ARP budget (arbitrary tick units)
 ICMP_OUTER	EQU 32			; ~15s ICMP reply budget
 
 ETH_TYPE_ARP	EQU 0x0806
@@ -53,7 +63,6 @@ ICMP_HDR_LEN	EQU 8
 ICMP_PAYLOAD_LEN EQU 32
 ICMP_FRAME_LEN	EQU 14 + IP_HDR_LEN + ICMP_HDR_LEN + ICMP_PAYLOAD_LEN	; 74
 
-; -- echo identifiers --
 ECHO_ID_HI	EQU 0x12
 ECHO_ID_LO	EQU 0x34
 ECHO_SEQ_HI	EQU 0x00
@@ -91,7 +100,9 @@ START
 	PRINT MSG_P0
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
-	CALL	CONFIG_NORMAL
+	LD	HL,OUR_MAC
+	LD	A,RCR_AB
+	CALL	@RTL.INIT_NORMAL
 	PRINTLN MSG_OK
 
 	PRINT MSG_PING_HDR
@@ -109,8 +120,9 @@ START
 	PRINT LINE_END
 
 	CALL	BUILD_ARP_REQUEST
+	LD	HL,TX_BUF
 	LD	BC,ARP_FRAME_LEN
-	CALL	SEND_FRAME
+	CALL	@RTL.SEND_FRAME
 	JP	C,SEND_FAIL
 
 	LD	HL,ARP_OUTER
@@ -130,8 +142,9 @@ START
 
 	; [P4] SEND
 	PRINT MSG_P4
+	LD	HL,TX_BUF
 	LD	BC,ICMP_FRAME_LEN
-	CALL	SEND_FRAME
+	CALL	@RTL.SEND_FRAME
 	JP	C,SEND_FAIL
 	PRINTLN MSG_OK
 
@@ -187,128 +200,25 @@ FAIL_NIC
 
 
 ; ------------------------------------------------------
-; CONFIG_NORMAL: standard chip init.
-; ------------------------------------------------------
-CONFIG_NORMAL
-	LD	A,CR_PAGE0_STOP
-	LD	(RTL_CR_A),A
-	LD	A,DCR_INIT
-	LD	(RTL_DCR_A),A
-	XOR	A
-	LD	(RTL_RBCR0_A),A
-	LD	(RTL_RBCR1_A),A
-	LD	A,RCR_AB
-	LD	(RTL_RCR_A),A
-	LD	A,TCR_NORMAL
-	LD	(RTL_TCR_A),A
-	LD	A,RTL_TPSR_INIT
-	LD	(RTL_TPSR_A),A
-	LD	A,RTL_PSTART_INIT
-	LD	(RTL_PSTART_A),A
-	LD	A,RTL_PSTOP_INIT
-	LD	(RTL_PSTOP_A),A
-	LD	A,RTL_BNRY_INIT
-	LD	(RTL_BNRY_A),A
-	LD	A,0xFF
-	LD	(RTL_ISR_A),A
-	XOR	A
-	LD	(RTL_IMR_A),A
-
-	LD	A,CR_PAGE1_STOP
-	LD	(RTL_CR_A),A
-	LD	A,(OUR_MAC + 0)
-	LD	(RTL_PAR0_A),A
-	LD	A,(OUR_MAC + 1)
-	LD	(RTL_PAR1_A),A
-	LD	A,(OUR_MAC + 2)
-	LD	(RTL_PAR2_A),A
-	LD	A,(OUR_MAC + 3)
-	LD	(RTL_PAR3_A),A
-	LD	A,(OUR_MAC + 4)
-	LD	(RTL_PAR4_A),A
-	LD	A,(OUR_MAC + 5)
-	LD	(RTL_PAR5_A),A
-	LD	A,RTL_CURR_INIT
-	LD	(RTL_CURR_A),A
-	XOR	A
-	LD	(RTL_MAR0_A + 0),A
-	LD	(RTL_MAR0_A + 1),A
-	LD	(RTL_MAR0_A + 2),A
-	LD	(RTL_MAR0_A + 3),A
-	LD	(RTL_MAR0_A + 4),A
-	LD	(RTL_MAR0_A + 5),A
-	LD	(RTL_MAR0_A + 6),A
-	LD	(RTL_MAR0_A + 7),A
-
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
-	RET
-
-
-; ------------------------------------------------------
-; SEND_FRAME: DMA_WRITE BC bytes from TX_BUF to packet RAM
-; 0x4000, set TBCR=BC, trigger TX, wait PTX.
-; In: BC = frame length.
-; Out: CF=0 OK, CF=1 fail.
-; ------------------------------------------------------
-SEND_FRAME
-	LD	(TX_LEN),BC
-	LD	HL,TX_BUF
-	LD	DE,0x4000
-	CALL	@RTL.DMA_WRITE
-	RET	C
-	LD	HL,(TX_LEN)
-	LD	A,L
-	LD	(RTL_TBCR0_A),A
-	LD	A,H
-	LD	(RTL_TBCR1_A),A
-	LD	A,CR_PAGE0_START | CR_TXP
-	LD	(RTL_CR_A),A
-	; fall through to WAIT_PTX
-
-WAIT_PTX
-	LD	BC,PTX_LOOPS
-.LP
-	LD	A,(RTL_ISR_A)
-	AND	ISR_PTX
-	JR	NZ,.OK
-	DEC	BC
-	LD	A,B
-	OR	C
-	JR	NZ,.LP
-	SCF
-	RET
-.OK
-	LD	A,ISR_PTX
-	LD	(RTL_ISR_A),A
-	OR	A
-	RET
-
-
-; ------------------------------------------------------
 ; BUILD_ARP_REQUEST: 60-byte broadcast ARP "who-has" in TX_BUF.
 ; ------------------------------------------------------
 BUILD_ARP_REQUEST
 	LD	DE,TX_BUF
-	; DST = FF*6
 	LD	A,0xFF
 	LD	B,6
 .DST
 	LD	(DE),A
 	INC	DE
 	DJNZ	.DST
-	; SRC = OUR_MAC
 	LD	HL,OUR_MAC
 	LD	BC,6
 	LDIR
-	; EtherType = 0x0806
 	LD	A,HIGH ETH_TYPE_ARP
 	LD	(DE),A
 	INC	DE
 	LD	A,LOW ETH_TYPE_ARP
 	LD	(DE),A
 	INC	DE
-	; ARP body: HW=Ethernet, Proto=IPv4, sizes, op=request
 	XOR	A
 	LD	(DE),A
 	INC	DE
@@ -348,7 +258,6 @@ BUILD_ARP_REQUEST
 	LD	HL,TARGET_IP
 	LD	BC,4
 	LDIR
-	; pad zero up to 60
 	XOR	A
 	LD	B,ARP_FRAME_LEN - 14 - 28
 .PAD
@@ -360,17 +269,8 @@ BUILD_ARP_REQUEST
 
 ; ------------------------------------------------------
 ; BUILD_ICMP_ECHO: 74-byte ICMP echo request frame in TX_BUF.
-; Layout:
-;   [0..5]   DST MAC = TARGET_MAC (resolved by ARP)
-;   [6..11]  SRC MAC = OUR_MAC
-;   [12..13] EtherType = 0x0800
-;   [14..33] IPv4 header (20 bytes)
-;   [34..41] ICMP header (8 bytes: type, code, csum, id, seq)
-;   [42..73] ICMP payload (32 bytes: 0..31)
-; Computes IP and ICMP checksums in place.
 ; ------------------------------------------------------
 BUILD_ICMP_ECHO
-	; Ethernet
 	LD	DE,TX_BUF
 	LD	HL,TARGET_MAC
 	LD	BC,6
@@ -385,11 +285,10 @@ BUILD_ICMP_ECHO
 	LD	(DE),A
 	INC	DE
 
-	; IPv4 header at TX_BUF + 14
-	LD	A,0x45			; version 4, IHL 5
+	LD	A,0x45
 	LD	(DE),A
 	INC	DE
-	XOR	A			; TOS
+	XOR	A
 	LD	(DE),A
 	INC	DE
 	LD	A,HIGH (IP_HDR_LEN + ICMP_HDR_LEN + ICMP_PAYLOAD_LEN)
@@ -398,43 +297,42 @@ BUILD_ICMP_ECHO
 	LD	A,LOW (IP_HDR_LEN + ICMP_HDR_LEN + ICMP_PAYLOAD_LEN)
 	LD	(DE),A
 	INC	DE
-	XOR	A			; ID = 0x0001
+	XOR	A
 	LD	(DE),A
 	INC	DE
 	LD	A,1
 	LD	(DE),A
 	INC	DE
-	XOR	A			; flags+frag = 0
+	XOR	A
 	LD	(DE),A
 	INC	DE
 	LD	(DE),A
 	INC	DE
-	LD	A,64			; TTL
+	LD	A,64
 	LD	(DE),A
 	INC	DE
 	LD	A,IP_PROTO_ICMP
 	LD	(DE),A
 	INC	DE
-	XOR	A			; csum placeholder lo/hi
+	XOR	A
 	LD	(DE),A
 	INC	DE
 	LD	(DE),A
 	INC	DE
-	LD	HL,OUR_IP		; src IP
+	LD	HL,OUR_IP
 	LD	BC,4
 	LDIR
-	LD	HL,TARGET_IP		; dst IP
+	LD	HL,TARGET_IP
 	LD	BC,4
 	LDIR
 
-	; ICMP header at TX_BUF + 34
 	LD	A,ICMP_T_ECHO_REQ
 	LD	(DE),A
 	INC	DE
-	XOR	A			; code
+	XOR	A
 	LD	(DE),A
 	INC	DE
-	XOR	A			; csum placeholder
+	XOR	A
 	LD	(DE),A
 	INC	DE
 	LD	(DE),A
@@ -452,7 +350,6 @@ BUILD_ICMP_ECHO
 	LD	(DE),A
 	INC	DE
 
-	; ICMP payload: bytes 0..31
 	LD	B,ICMP_PAYLOAD_LEN
 	XOR	A
 .PAY
@@ -461,19 +358,18 @@ BUILD_ICMP_ECHO
 	INC	A
 	DJNZ	.PAY
 
-	; -- compute IP checksum over TX_BUF+14, length 20 --
+	; IP checksum over TX_BUF+14, length 20.
 	PUSH	IX
 	LD	IX,TX_BUF + 14
 	LD	BC,IP_HDR_LEN
 	CALL	@UTIL.CHECKSUM
 	POP	IX
-	; HL = ~accum, store as BE bytes at TX_BUF + 14 + 10
 	LD	A,H
 	LD	(TX_BUF + 14 + 10),A
 	LD	A,L
 	LD	(TX_BUF + 14 + 11),A
 
-	; -- compute ICMP checksum over TX_BUF+34, length 40 --
+	; ICMP checksum over TX_BUF+34, length 40.
 	PUSH	IX
 	LD	IX,TX_BUF + 14 + IP_HDR_LEN
 	LD	BC,ICMP_HDR_LEN + ICMP_PAYLOAD_LEN
@@ -487,18 +383,19 @@ BUILD_ICMP_ECHO
 
 
 ; ------------------------------------------------------
-; WAIT_FOR_ARP_REPLY: ring-state-based wait, drops non-ARP-
-; reply frames, populates TARGET_MAC on match.
-; OUTER_LEFT must be initialized before call.
-; Out: CF=0 OK, CF=1 timeout.
+; WAIT_FOR_ARP_REPLY: spin on RTL.RING_HAS_PACKET +
+; RTL.READ_PACKET, drop anything that isn't a matching ARP
+; reply, populate TARGET_MAC on match.
+;   OUTER_LEFT must be set before call.
+;   Out: CF=0 OK, CF=1 timeout.
 ; ------------------------------------------------------
 WAIT_FOR_ARP_REPLY
 .MAIN
-	CALL	RING_NONEMPTY
+	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
 	LD	BC,0
 .WAIT
-	CALL	RING_NONEMPTY
+	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
 	DEC	BC
 	LD	A,B
@@ -512,30 +409,31 @@ WAIT_FOR_ARP_REPLY
 	JR	Z,.TIMEOUT
 	JR	.MAIN
 .HAVE
-	LD	A,ISR_PRX
-	LD	(RTL_ISR_A),A
-	CALL	READ_RX
-	JR	C,.DROP
-	; Filter: ARP reply matching TARGET_IP.
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JR	C,.MAIN			; DMA error, drop and continue
+	; Filter: ARP reply, sender_ip == TARGET_IP
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_ARP
-	JR	NZ,.DROP
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_ARP
-	JR	NZ,.DROP
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 14 + 6)
 	OR	A
-	JR	NZ,.DROP
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 14 + 7)
 	CP	ARP_OP_REPLY
-	JR	NZ,.DROP
+	JR	NZ,.MAIN
 	LD	HL,RX_BUF + 14 + 14
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPIP
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.DROP
+	JR	NZ,.MAIN
 	INC	HL
 	INC	DE
 	DJNZ	.CMPIP
@@ -544,30 +442,25 @@ WAIT_FOR_ARP_REPLY
 	LD	DE,TARGET_MAC
 	LD	BC,6
 	LDIR
-	CALL	ADVANCE_BNRY
 	OR	A
 	RET
-.DROP
-	CALL	ADVANCE_BNRY
-	JR	.MAIN
 .TIMEOUT
 	SCF
 	RET
 
 
 ; ------------------------------------------------------
-; WAIT_FOR_ICMP_REPLY: ring-state-based wait, drops anything
-; that isn't an ICMP echo reply matching our identifier.
-; Populates REPLY_ID, REPLY_SEQ on match.
-; Out: CF=0 OK, CF=1 timeout.
+; WAIT_FOR_ICMP_REPLY: same loop pattern, ICMP echo-reply
+; filter, capture id/seq.
+;   Out: CF=0 OK, CF=1 timeout.
 ; ------------------------------------------------------
 WAIT_FOR_ICMP_REPLY
 .MAIN
-	CALL	RING_NONEMPTY
+	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
 	LD	BC,0
 .WAIT
-	CALL	RING_NONEMPTY
+	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
 	DEC	BC
 	LD	A,B
@@ -581,48 +474,43 @@ WAIT_FOR_ICMP_REPLY
 	JR	Z,.TIMEOUT
 	JR	.MAIN
 .HAVE
-	LD	A,ISR_PRX
-	LD	(RTL_ISR_A),A
-	CALL	READ_RX
-	JR	C,.DROP
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JR	C,.MAIN
 	; Filter: IPv4 / ICMP / echo reply / matching id.
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_IPV4
-	JR	NZ,.DROP
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_IPV4
-	JR	NZ,.DROP
-	; IP version+IHL: must be 0x45 (no options for our path).
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 14)
 	CP	0x45
-	JR	NZ,.DROP
-	; protocol == ICMP
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 14 + 9)
 	CP	IP_PROTO_ICMP
-	JR	NZ,.DROP
-	; src IP == TARGET_IP
+	JR	NZ,.MAIN
 	LD	HL,RX_BUF + 14 + 12
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPSRC
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.DROP
+	JR	NZ,.MAIN
 	INC	HL
 	INC	DE
 	DJNZ	.CMPSRC
-	; ICMP type == 0 (echo reply)
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
 	CP	ICMP_T_ECHO_REP
-	JR	NZ,.DROP
-	; identifier match
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
 	CP	ECHO_ID_HI
-	JR	NZ,.DROP
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
 	CP	ECHO_ID_LO
-	JR	NZ,.DROP
-	; Capture id and seq for printing.
+	JR	NZ,.MAIN
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
 	LD	(REPLY_ID + 0),A
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
@@ -631,101 +519,16 @@ WAIT_FOR_ICMP_REPLY
 	LD	(REPLY_SEQ + 0),A
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 7)
 	LD	(REPLY_SEQ + 1),A
-	CALL	ADVANCE_BNRY
 	OR	A
 	RET
-.DROP
-	CALL	ADVANCE_BNRY
-	JP	.MAIN
 .TIMEOUT
 	SCF
 	RET
 
 
 ; ------------------------------------------------------
-; READ_RX: read header at (BNRY+1)<<8 + body into RX_HDR / RX_BUF.
-; Out: CF=0 OK, BODY_LEN populated.
-;      CF=1 DMA error (caller drops).
-; ------------------------------------------------------
-READ_RX
-	LD	A,(RTL_BNRY_A)
-	INC	A
-	CP	RTL_PSTOP_INIT
-	JR	C,.NW
-	LD	A,RTL_PSTART_INIT
-.NW
-	LD	D,A
-	LD	E,0
-	PUSH	DE
-	LD	HL,RX_HDR
-	LD	BC,4
-	CALL	@RTL.DMA_READ
-	POP	DE
-	RET	C
-	; body length = header.len - 4, capped
-	LD	A,(RX_HDR + 2)
-	LD	L,A
-	LD	A,(RX_HDR + 3)
-	LD	H,A
-	LD	BC,4
-	OR	A
-	SBC	HL,BC
-	LD	BC,RX_BUF_SIZE
-	LD	A,H
-	CP	B
-	JR	C,.OKLEN
-	JR	NZ,.CAPLEN
-	LD	A,L
-	CP	C
-	JR	C,.OKLEN
-.CAPLEN
-	LD	HL,RX_BUF_SIZE
-.OKLEN
-	LD	(BODY_LEN),HL
-	INC	DE
-	INC	DE
-	INC	DE
-	INC	DE
-	LD	HL,RX_BUF
-	LD	BC,(BODY_LEN)
-	JP	@RTL.DMA_READ
-
-
-; ------------------------------------------------------
-; RING_NONEMPTY: ZF=1 if (BNRY+1)==CURR.
-; ------------------------------------------------------
-RING_NONEMPTY
-	LD	A,(RTL_BNRY_A)
-	INC	A
-	CP	RTL_PSTOP_INIT
-	JR	C,.NW
-	LD	A,RTL_PSTART_INIT
-.NW
-	LD	B,A
-	LD	A,CR_PAGE1_START
-	LD	(RTL_CR_A),A
-	LD	A,(RTL_CURR_A)
-	LD	C,A
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
-	LD	A,B
-	CP	C
-	RET
-
-
-ADVANCE_BNRY
-	LD	A,(RX_HDR + 1)
-	DEC	A
-	CP	RTL_PSTART_INIT
-	JR	NC,.OK
-	LD	A,RTL_PSTOP_INIT - 1
-.OK
-	LD	(RTL_BNRY_A),A
-	RET
-
-
-; ------------------------------------------------------
-; PRINT_IPV4: HL points at 4 bytes; print "a.b.c.d".
+; PRINT_IPV4 / PRINT_DEC_A / PUTCHAR / PRINT_REG_DUMP
+; (app-local helpers; could be lifted to lib later)
 ; ------------------------------------------------------
 PRINT_IPV4
 	PUSH	HL,BC
@@ -830,8 +633,6 @@ OUR_MAC		DB 0x02, 0x80, 0x19, 0x11, 0x22, 0x33
 OUR_IP		DB 192, 168, 7, 2
 TARGET_IP	DB 192, 168, 7, 1
 TARGET_MAC	DB 0,0,0,0,0,0
-TX_LEN		DW 0
-BODY_LEN	DW 0
 OUTER_LEFT	DW 0
 REPLY_ID	DW 0
 REPLY_SEQ	DW 0

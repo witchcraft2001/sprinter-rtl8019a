@@ -19,8 +19,11 @@ EXE_VERSION		EQU 1
 	INCLUDE "dss.inc"
 	INCLUDE "rtl8019.inc"
 
+	DEFINE USE_RTL_INIT_LOOPBACK
+	DEFINE USE_RTL_SEND_FRAME
+	DEFINE USE_RTL_WAIT_PTX
+
 ; -- timeouts --
-PTX_LOOPS	EQU 8000
 PRX_LOOPS	EQU 8000
 
 ; -- frame layout in TX_BUF --
@@ -63,7 +66,8 @@ START
 
 	; [L1] CFG -- internal loopback configuration
 	PRINT MSG_L1
-	CALL	CONFIG_LOOPBACK
+	LD	HL,TEST_MAC
+	CALL	@RTL.INIT_LOOPBACK
 	PRINTLN MSG_OK
 
 	; [L2] FRAME -- build 60-byte broadcast frame in TX_BUF
@@ -76,30 +80,16 @@ START
 	CALL	@UTIL.PRINT_HEX_HL
 	PRINT LINE_END
 
-	; [L3] WRITE TX
+	; [L3] WRITE TX (DMA + TBCR + CR.TXP + wait PTX)
 	PRINT MSG_L3
 	LD	HL,TX_BUF
 	LD	BC,FRAME_LEN
-	LD	DE,0x4000		; TPSR<<8
-	CALL	@RTL.DMA_WRITE
+	CALL	@RTL.SEND_FRAME
 	JP	C,WRITE_FAIL
 	PRINTLN MSG_OK
 
-	; Set TBCR = FRAME_LEN
-	LD	A,LOW FRAME_LEN
-	LD	(RTL_TBCR0_A),A
-	LD	A,HIGH FRAME_LEN
-	LD	(RTL_TBCR1_A),A
-
-	; Trigger TX: CR = page 0, abort, STA, TXP = 0x26
-	LD	A,CR_PAGE0_START | CR_TXP
-	LD	(RTL_CR_A),A
-
-	; [L4] PTX
-	PRINT MSG_L4
-	CALL	WAIT_PTX
-	JP	C,PTX_FAIL
-	PRINTLN MSG_OK
+	; [L4] PTX done by SEND_FRAME above, just confirm.
+	PRINTLN MSG_L4_OK
 
 	; [L5] PRX (loopback frame should already be in RX ring)
 	PRINT MSG_L5
@@ -174,11 +164,6 @@ WRITE_FAIL
 	PRINTLN MSG_E_WRITE
 	JP	FAIL_NIC
 
-PTX_FAIL
-	PRINT LINE_END
-	PRINTLN MSG_E_PTX
-	JP	FAIL_NIC
-
 PRX_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_PRX
@@ -220,73 +205,6 @@ FAIL_NIC
 	PRINTLN MSG_RESULT_FAIL
 	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NIC_ERR
-
-
-; ------------------------------------------------------
-; CONFIG_LOOPBACK: complete chip init for internal loopback.
-; Trashes A.
-; ------------------------------------------------------
-CONFIG_LOOPBACK
-	; Page 0, stop, abort
-	LD	A,CR_PAGE0_STOP			; 0x21
-	LD	(RTL_CR_A),A
-	LD	A,DCR_LOOPBACK			; 0x40 -- LS=0 enables loopback
-	LD	(RTL_DCR_A),A
-	XOR	A
-	LD	(RTL_RBCR0_A),A
-	LD	(RTL_RBCR1_A),A
-	LD	A,RCR_AB			; 0x04 -- accept broadcast
-	LD	(RTL_RCR_A),A
-	LD	A,TCR_LB_INTERNAL		; 0x02 -- internal MAC loopback
-	LD	(RTL_TCR_A),A
-	LD	A,RTL_TPSR_INIT			; 0x40
-	LD	(RTL_TPSR_A),A
-	LD	A,RTL_PSTART_INIT		; 0x46
-	LD	(RTL_PSTART_A),A
-	LD	A,RTL_PSTOP_INIT		; 0x80
-	LD	(RTL_PSTOP_A),A
-	LD	A,RTL_BNRY_INIT			; 0x46
-	LD	(RTL_BNRY_A),A
-	LD	A,0xFF
-	LD	(RTL_ISR_A),A			; clear ISR
-	XOR	A
-	LD	(RTL_IMR_A),A			; mask all IRQs
-
-	; Page 1: PAR0..5, CURR, MAR0..7
-	LD	A,CR_PAGE1_STOP			; 0x61
-	LD	(RTL_CR_A),A
-
-	LD	A,(TEST_MAC + 0)
-	LD	(RTL_PAR0_A),A
-	LD	A,(TEST_MAC + 1)
-	LD	(RTL_PAR1_A),A
-	LD	A,(TEST_MAC + 2)
-	LD	(RTL_PAR2_A),A
-	LD	A,(TEST_MAC + 3)
-	LD	(RTL_PAR3_A),A
-	LD	A,(TEST_MAC + 4)
-	LD	(RTL_PAR4_A),A
-	LD	A,(TEST_MAC + 5)
-	LD	(RTL_PAR5_A),A
-
-	LD	A,RTL_CURR_INIT			; 0x47
-	LD	(RTL_CURR_A),A
-
-	; MAR0..7 = 0
-	XOR	A
-	LD	(RTL_MAR0_A + 0),A
-	LD	(RTL_MAR0_A + 1),A
-	LD	(RTL_MAR0_A + 2),A
-	LD	(RTL_MAR0_A + 3),A
-	LD	(RTL_MAR0_A + 4),A
-	LD	(RTL_MAR0_A + 5),A
-	LD	(RTL_MAR0_A + 6),A
-	LD	(RTL_MAR0_A + 7),A
-
-	; Back to page 0, START
-	LD	A,CR_PAGE0_START		; 0x22
-	LD	(RTL_CR_A),A
-	RET
 
 
 ; ------------------------------------------------------
@@ -340,28 +258,8 @@ BUILD_FRAME
 
 
 ; ------------------------------------------------------
-; WAIT_PTX / WAIT_PRX: poll ISR for the given bit.
-; CF=0 OK, CF=1 timeout. Trashes A,BC.
+; WAIT_PRX: poll ISR.PRX. CF=0 OK, CF=1 timeout. Trashes A,BC.
 ; ------------------------------------------------------
-WAIT_PTX
-	LD	BC,PTX_LOOPS
-.LP
-	LD	A,(RTL_ISR_A)
-	AND	ISR_PTX
-	JR	NZ,.OK
-	DEC	BC
-	LD	A,B
-	OR	C
-	JR	NZ,.LP
-	SCF
-	RET
-.OK
-	; Clear PTX
-	LD	A,ISR_PTX
-	LD	(RTL_ISR_A),A
-	OR	A
-	RET
-
 WAIT_PRX
 	LD	BC,PRX_LOOPS
 .LP
@@ -469,7 +367,7 @@ MSG_L1		DB "[L1] CFG (DCR=40 RCR=04 TCR=02 PSTART=46 PSTOP=80 BNRY=46 CURR=47) "
 MSG_L2		DB "[L2] FRAME LEN=",0
 MSG_TYPE_EQ	DB " TYPE=",0
 MSG_L3		DB "[L3] WRITE TX ",0
-MSG_L4		DB "[L4] PTX ",0
+MSG_L4_OK	DB "[L4] PTX OK",0
 MSG_L5		DB "[L5] PRX ",0
 MSG_L6		DB "[L6] RX HDR",0
 MSG_STS_EQ	DB " STS=",0
@@ -481,8 +379,7 @@ MSG_REGS	DB "REGS ",0
 MSG_RESULT_OK	DB "RESULT OK",0
 MSG_RESULT_FAIL	DB "RESULT FAIL",0
 MSG_E_RESET	DB "[E20] RESET timeout",0
-MSG_E_WRITE	DB "[E21] DMA write timeout",0
-MSG_E_PTX	DB "[E22] PTX timeout",0
+MSG_E_WRITE	DB "[E21] DMA write or PTX timeout",0
 MSG_E_PRX	DB "[E23] PRX timeout (loopback frame did not appear in RX ring)",0
 MSG_E_READ	DB "[E24] DMA read timeout",0
 MSG_E_STS	DB "[E25] RX status mismatch, got STS=",0
