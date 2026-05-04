@@ -6,6 +6,8 @@
 	IFNDEF	_UTIL
 	DEFINE	_UTIL
 
+	INCLUDE "memmap.inc"
+
 	MODULE UTIL
 
 ; ------------------------------------------------------
@@ -46,7 +48,7 @@ PRINT_HEX_A
 	RST	DSS
 	POP	HL,DE,BC,AF
 	RET
-.HBUF	DS 4,0
+.HBUF	EQU UTIL_HBUF			; 4 bytes in runtime BSS
 
 ; ------------------------------------------------------
 ; Print word in HL as 4 hex digits.

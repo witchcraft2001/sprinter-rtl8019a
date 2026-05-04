@@ -202,13 +202,38 @@ semicolon comments. Keep reusable routines in `src/lib/` and entry points in
 `src/apps/<name>.asm`. Source-code comments are written in English. User
 documentation under `docs/` is provided in both Russian and English.
 
-For DSS assembly, avoid storing large zero-filled work buffers in `.EXE`
-outputs. Assemblers such as `sjasmplus --raw` emit `DS ...,0` bytes into the
-file, wasting disk space. Prefer runtime-only BSS-style labels placed after
-the loaded image, for example after the driver's RX/TX buffer block end
-label. Clear that runtime area at program start only when the code depends
-on zeroed memory. Small state variables and required initialized data may
-remain in the file.
+**Mandatory rule: zero-filled work buffers MUST NOT live inside the
+`.EXE` image.** `sjasmplus --raw` emits `DS N,0` and similar zero-filled
+storage as bytes in the output, which inflates disk size, slows DSS load,
+and consumes floppy capacity for nothing. Even small buffers (a few
+bytes) follow this rule -- the cost of a couple of `LD (label),0`
+instructions at startup is far cheaper than zero bytes shipped on every
+copy of the program. Concretely:
+
+- Small/medium runtime buffers (anything that the program writes before
+  it reads, e.g. DMA work buffers, parser scratch, ARGV, response
+  buffers): declare them with `EQU` at fixed addresses inside the
+  directly-addressable Z80 RAM (above the loaded image, below the
+  `0xC000` banking window). Initialize to zero at program start ONLY if
+  the code actually depends on the initial value; otherwise leave them
+  uninitialized and let normal "write before read" handle it.
+- Large buffers (more than a few KB, or anything that won't fit between
+  end-of-image and `0xC000`): allocate DSS paged memory via the
+  appropriate DSS syscall and map it through `WIN0`-`WIN3`.
+- Initialized data (lookup tables, message strings, default values that
+  the program reads BEFORE writing) stays in the `.EXE` as DB/DW. This
+  rule is about *zero-filled* uninitialized buffers only.
+
+Project-wide runtime memory map for shared library buffers lives in
+`src/include/memmap.inc`. Each library exposes a single `EQU` for its
+buffer base and another for the size; per-app private buffers start at
+`APP_BSS_BASE` (also in `memmap.inc`). When you add a new library
+buffer, place it in `memmap.inc` -- do not pick an ad-hoc address in the
+library file.
+
+Required initialized data (default values, banner strings, lookup
+tables) stays in the `.EXE` as `DB/DW`. The rule applies to
+*zero-filled* buffers only.
 
 DSS EXE header conventions used in this project (locked, taken from the
 `sprinter_wifi/network` toolchain):

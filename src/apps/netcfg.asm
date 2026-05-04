@@ -24,6 +24,7 @@ EXE_VERSION	EQU 1
 
 	INCLUDE "macro.inc"
 	INCLUDE "dss.inc"
+	INCLUDE "memmap.inc"
 
 	DEFINE USE_NETCFG_LOAD
 	DEFINE USE_UTIL_EXIT
@@ -665,9 +666,10 @@ V_STATIC	DB "STATIC",0
 
 LINE_END	DB 13,10,0
 
-; -- runtime work buffers (kept inside .EXE for now; small) --
-SET_BUF		DS 290, 0	; "NAME=value\0", 32 + 1 + 255 + 1 ~= 290
-SHOW_VAL_BUF	DS 256, 0	; GETENV destination
+; -- runtime work buffers (live in BSS at APP_BSS_BASE, NOT
+; in the .EXE; always written before read) --
+SET_BUF		EQU APP_BSS_BASE		; "NAME=value\0", up to 290 bytes
+SHOW_VAL_BUF	EQU APP_BSS_BASE + 290		; GETENV destination, 256 bytes
 
 	ENDMODULE
 

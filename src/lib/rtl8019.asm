@@ -197,7 +197,7 @@ SNAPSHOT_REGS
 	LD	(RTL_CR_A),A
 	RET
 
-REG_SNAPSHOT	DS 10,0
+REG_SNAPSHOT	EQU RTL_REG_SNAPSHOT	; 10 bytes in runtime BSS
 REG_SNAPSHOT_LEN EQU 10
 
 ; ------------------------------------------------------

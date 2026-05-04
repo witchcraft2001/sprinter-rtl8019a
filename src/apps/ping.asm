@@ -35,6 +35,7 @@ EXE_VERSION		EQU 1
 
 	INCLUDE "macro.inc"
 	INCLUDE "dss.inc"
+	INCLUDE "memmap.inc"
 	INCLUDE "rtl8019.inc"
 
 ; Pull in the high-level RTL + ARP + NETCFG helpers we need.
@@ -44,7 +45,7 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_RING_HAS_PACKET
 	DEFINE USE_RTL_READ_PACKET
 	DEFINE USE_ARP_BUILD_REQUEST
-	DEFINE USE_NETCFG_LOAD
+	DEFINE USE_NETENV
 
 ARP_OUTER	EQU 32			; ~15s ARP budget (arbitrary tick units)
 ICMP_OUTER	EQU 32			; ~15s ICMP reply budget
@@ -94,8 +95,13 @@ EXE_HEADER
 START
 	PRINTLN MSG_BANNER
 
-	; Read NET.CFG (defaults applied if file missing).
-	CALL	@NETCFG.LOAD
+	; Pull NET_IP / NET_MAC from env (populated by NETCFG -i).
+	LD	HL,N_NET_IP
+	LD	DE,OUR_IP
+	CALL	@NETENV.REQUIRE_IP
+	LD	HL,N_NET_MAC
+	LD	DE,OUR_MAC
+	CALL	@NETENV.REQUIRE_MAC
 
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
@@ -105,13 +111,13 @@ START
 	PRINT MSG_P0
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
-	LD	HL,@NETCFG.OUR_MAC
+	LD	HL,OUR_MAC
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
 	; ARP module setup -- point at NETCFG fields.
-	LD	HL,@NETCFG.OUR_MAC
+	LD	HL,OUR_MAC
 	LD	(@ARP.OUR_MAC_PTR),HL
-	LD	HL,@NETCFG.OUR_IP
+	LD	HL,OUR_IP
 	LD	(@ARP.OUR_IP_PTR),HL
 	PRINTLN MSG_OK
 
@@ -119,7 +125,7 @@ START
 	LD	HL,TARGET_IP
 	CALL	PRINT_IPV4
 	PRINT MSG_FROM
-	LD	HL,@NETCFG.OUR_IP
+	LD	HL,OUR_IP
 	CALL	PRINT_IPV4
 	PRINT LINE_END
 
@@ -219,7 +225,7 @@ BUILD_ICMP_ECHO
 	LD	HL,TARGET_MAC
 	LD	BC,6
 	LDIR
-	LD	HL,@NETCFG.OUR_MAC
+	LD	HL,OUR_MAC
 	LD	BC,6
 	LDIR
 	LD	A,HIGH ETH_TYPE_IPV4
@@ -263,7 +269,7 @@ BUILD_ICMP_ECHO
 	INC	DE
 	LD	(DE),A
 	INC	DE
-	LD	HL,@NETCFG.OUR_IP
+	LD	HL,OUR_IP
 	LD	BC,4
 	LDIR
 	LD	HL,TARGET_IP
@@ -521,7 +527,7 @@ PRINT_DEC_A
 	POP	HL,DE,BC,AF
 	RET
 
-DEC_BUF		DS 4,0
+DEC_BUF		EQU APP_BSS_BASE + 22		; 4 bytes scratch for PRINT_DEC_A
 
 
 PUTCHAR
@@ -573,12 +579,17 @@ REG_NAMES
 
 
 ; ------- in-EXE data -------
-; OUR_MAC / OUR_IP now live in @NETCFG.* (loaded by NETCFG.LOAD).
+N_NET_IP	DB "NET_IP",0
+N_NET_MAC	DB "NET_MAC",0
 TARGET_IP	DB 192, 168, 7, 1
-TARGET_MAC	DB 0,0,0,0,0,0
-OUTER_LEFT	DW 0
-REPLY_ID	DW 0
-REPLY_SEQ	DW 0
+
+; ------- runtime BSS (lives at APP_BSS_BASE, NOT in .EXE) --
+OUR_IP		EQU APP_BSS_BASE		; 4 bytes
+OUR_MAC		EQU APP_BSS_BASE + 4		; 6 bytes
+TARGET_MAC	EQU APP_BSS_BASE + 10		; 6 bytes
+OUTER_LEFT	EQU APP_BSS_BASE + 16		; 2 bytes
+REPLY_ID	EQU APP_BSS_BASE + 18		; 2 bytes
+REPLY_SEQ	EQU APP_BSS_BASE + 20		; 2 bytes
 
 
 ; ------- messages -------
@@ -606,9 +617,9 @@ LINE_END	DB 13,10,0
 	ENDMODULE
 
 
-	; netcfg_lib transitively DEFINEs USE_UTIL_* helpers it needs,
+	; netenv_lib transitively DEFINEs USE_UTIL_* helpers it needs,
 	; so it must be included BEFORE util.asm.
-	INCLUDE "netcfg_lib.asm"
+	INCLUDE "netenv_lib.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"

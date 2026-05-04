@@ -47,6 +47,8 @@
 	IFNDEF	_NETENV
 	DEFINE	_NETENV
 
+	INCLUDE "memmap.inc"
+
 	IFDEF USE_NETENV
 	IFNDEF USE_UTIL_PARSE_DEC_BYTE
 	DEFINE USE_UTIL_PARSE_DEC_BYTE
@@ -63,9 +65,12 @@
 
 	IFDEF USE_NETENV
 
-; Internal value buffer shared by all NETENV.* getters.
-; DSS limits env value length to 255; +1 for terminator.
-VAL_BUF		DS 256, 0
+; Internal value buffer shared by all NETENV.* getters --
+; lives in runtime BSS (see src/include/memmap.inc), NOT in
+; the .EXE image.  DSS limits env value length to 255; +1
+; for terminator. Always written by GETENV before read, so
+; no zero-init needed.
+VAL_BUF		EQU NETENV_VAL_BUF
 
 
 ; ------------------------------------------------------

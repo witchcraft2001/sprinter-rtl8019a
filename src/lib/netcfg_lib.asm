@@ -38,6 +38,8 @@
 	IFNDEF	_NETCFG
 	DEFINE	_NETCFG
 
+	INCLUDE "memmap.inc"
+
 	IFDEF USE_NETCFG_LOAD
 ; Transitive util-helper deps. IFNDEF guards keep multipass quiet.
 	IFNDEF USE_UTIL_STARTSWITH
@@ -57,19 +59,19 @@ NETCFG_BUF_SIZE	EQU 1024
 
 	IFDEF USE_NETCFG_LOAD
 
-; -------- output fields --------
-OUR_MAC		DS 6, 0
-OUR_IP		DS 4, 0
-NETMASK		DS 4, 0
-GATEWAY		DS 4, 0
-DNS1		DS 4, 0
-DNS2		DS 4, 0
-NTP		DS 32, 0
-TZ		DB 0
-
-; -------- internals --------
-LOAD_FH		DB 0
-LOAD_BUF	DS NETCFG_BUF_SIZE, 0
+; -------- output fields & internals --------
+; All NETCFG buffers live in runtime BSS (memmap.inc), NOT
+; the .EXE.  APPLY_DEFAULTS / LOAD always write before read.
+OUR_MAC		EQU NETCFG_OUR_MAC
+OUR_IP		EQU NETCFG_OUR_IP
+NETMASK		EQU NETCFG_NETMASK
+GATEWAY		EQU NETCFG_GATEWAY
+DNS1		EQU NETCFG_DNS1
+DNS2		EQU NETCFG_DNS2
+NTP		EQU NETCFG_NTP
+TZ		EQU NETCFG_TZ
+LOAD_FH		EQU NETCFG_LOAD_FH
+LOAD_BUF	EQU NETCFG_LOAD_BUF
 
 
 ; ------------------------------------------------------
@@ -350,7 +352,7 @@ PARSE_IPV4_LINE
 	POP	DE
 	JP	SKIP_TO_NEXT_LINE
 
-.TMP_IP		DS 4, 0
+.TMP_IP		EQU NETCFG_TMP_IP	; 4 bytes in runtime BSS
 
 
 ; ------------------------------------------------------
@@ -396,7 +398,7 @@ PARSE_MAC_LINE
 .SKIP
 	JP	SKIP_TO_NEXT_LINE
 
-.TMP_MAC	DS 6, 0
+.TMP_MAC	EQU NETCFG_TMP_MAC	; 6 bytes in runtime BSS
 
 
 ; ------------------------------------------------------

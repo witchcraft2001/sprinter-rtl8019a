@@ -32,6 +32,7 @@ EXE_VERSION		EQU 1
 
 	INCLUDE "macro.inc"
 	INCLUDE "dss.inc"
+	INCLUDE "memmap.inc"
 	INCLUDE "rtl8019.inc"
 
 	DEFINE USE_RTL_INIT_NORMAL
@@ -40,7 +41,7 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_RING_HAS_PACKET
 	DEFINE USE_RTL_READ_PACKET
 	DEFINE USE_ARP_BUILD_REQUEST
-	DEFINE USE_NETCFG_LOAD
+	DEFINE USE_NETENV
 
 PRX_OUTER	EQU 32			; ~15s budget for ARP reply
 
@@ -76,8 +77,13 @@ EXE_HEADER
 START
 	PRINTLN MSG_BANNER
 
-	; Read NET.CFG (defaults applied if file missing).
-	CALL	@NETCFG.LOAD
+	; Pull NET_IP / NET_MAC from env (populated by NETCFG -i).
+	LD	HL,N_NET_IP
+	LD	DE,OUR_IP
+	CALL	@NETENV.REQUIRE_IP
+	LD	HL,N_NET_MAC
+	LD	DE,OUR_MAC
+	CALL	@NETENV.REQUIRE_MAC
 
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
@@ -87,22 +93,22 @@ START
 	PRINT MSG_A0
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
-	LD	HL,@NETCFG.OUR_MAC
+	LD	HL,OUR_MAC
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
 	; Configure ARP module pointers (once).
-	LD	HL,@NETCFG.OUR_MAC
+	LD	HL,OUR_MAC
 	LD	(@ARP.OUR_MAC_PTR),HL
-	LD	HL,@NETCFG.OUR_IP
+	LD	HL,OUR_IP
 	LD	(@ARP.OUR_IP_PTR),HL
 	PRINTLN MSG_OK
 
 	; [A1] info banner
 	PRINT MSG_FROM_IP
-	LD	HL,@NETCFG.OUR_IP
+	LD	HL,OUR_IP
 	CALL	PRINT_IPV4
 	PRINT MSG_OUR_MAC
-	LD	HL,@NETCFG.OUR_MAC
+	LD	HL,OUR_MAC
 	CALL	@UTIL.PRINT_MAC
 	PRINT LINE_END
 	PRINT MSG_TO_IP
@@ -293,7 +299,7 @@ PRINT_DEC_A
 	POP	HL,DE,BC,AF
 	RET
 
-DEC_BUF		DS 4,0
+DEC_BUF		EQU APP_BSS_BASE + 16		; 4 bytes scratch for PRINT_DEC_A
 
 
 ; ------------------------------------------------------
@@ -345,9 +351,14 @@ REG_NAMES
 
 
 ; ------- in-EXE data -------
-; OUR_MAC / OUR_IP now live in @NETCFG.* (loaded by NETCFG.LOAD).
+N_NET_IP	DB "NET_IP",0
+N_NET_MAC	DB "NET_MAC",0
 TARGET_IP	DB 192, 168, 7, 1
-REPLY_MAC	DB 0,0,0,0,0,0
+
+; ------- runtime BSS (lives at APP_BSS_BASE, NOT in .EXE) --
+OUR_IP		EQU APP_BSS_BASE		; 4 bytes, filled by REQUIRE_IP
+OUR_MAC		EQU APP_BSS_BASE + 4		; 6 bytes, filled by REQUIRE_MAC
+REPLY_MAC	EQU APP_BSS_BASE + 10		; 6 bytes, filled by ARP reply parser
 
 
 ; ------- messages -------
@@ -372,9 +383,9 @@ LINE_END	DB 13,10,0
 	ENDMODULE
 
 
-	; netcfg_lib transitively DEFINEs USE_UTIL_* helpers it needs,
+	; netenv_lib transitively DEFINEs USE_UTIL_* helpers it needs,
 	; so it must be included BEFORE util.asm.
-	INCLUDE "netcfg_lib.asm"
+	INCLUDE "netenv_lib.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
