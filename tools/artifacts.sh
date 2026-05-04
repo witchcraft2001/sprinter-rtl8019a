@@ -18,6 +18,7 @@ BUILD_APPS=(
   nicram
   niclb
   nictx
+  nicrx
 )
 
 # Text/documentation files copied to the distribution root.

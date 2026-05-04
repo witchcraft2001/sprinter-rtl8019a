@@ -296,25 +296,31 @@ CONFIG_LOOPBACK
 ;   [12..13] EtherType = ETH_TYPE (BE)
 ;   [14..]   payload "SPRINTER NICLB TEST", zero-padded to 60.
 ; ------------------------------------------------------
+; LDIR copies (HL) -> (DE), so DE is the destination cursor and HL
+; is the source pointer. We walk DE through TX_BUF and pull DST/SRC/
+; payload bytes from constants via HL.
 BUILD_FRAME
-	LD	HL,TX_BUF
+	LD	DE,TX_BUF
 	; DST = FF*6
 	LD	B,6
 .DST
-	LD	(HL),0xFF
-	INC	HL
+	LD	A,0xFF
+	LD	(DE),A
+	INC	DE
 	DJNZ	.DST
 	; SRC = TEST_MAC
-	LD	DE,TEST_MAC
+	LD	HL,TEST_MAC
 	LD	BC,6
 	LDIR
 	; EtherType (big endian)
-	LD	(HL),HIGH ETH_TYPE
-	INC	HL
-	LD	(HL),LOW ETH_TYPE
-	INC	HL
+	LD	A,HIGH ETH_TYPE
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW ETH_TYPE
+	LD	(DE),A
+	INC	DE
 	; Payload
-	LD	DE,PAYLOAD
+	LD	HL,PAYLOAD
 	LD	BC,PAYLOAD_LEN
 	LDIR
 	; Zero-pad up to FRAME_LEN
@@ -324,8 +330,8 @@ BUILD_FRAME
 	RET	Z
 .PAD
 	XOR	A
-	LD	(HL),A
-	INC	HL
+	LD	(DE),A
+	INC	DE
 	DEC	BC
 	LD	A,B
 	OR	C

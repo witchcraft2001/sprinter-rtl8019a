@@ -10,12 +10,13 @@ Requires `scapy` and pcap-level access on macOS:
     sudo chmod g+rw /dev/bpf*    # or install Wireshark's ChmodBPF helper
 
 Examples:
-    # Smallest case: broadcast 88B5 frame with the default payload.
+    # Default: unicast 88B5 frame addressed to the driver's PAR
+    # (02:80:19:11:22:33), with payload "SPRINTER NICRX TEST".
     sudo python3 tools/dev/send_frame.py --iface en0
 
-    # Unicast to the MAC printed by `rtl8019as: start ... mac=...`.
+    # Broadcast variant (only useful when the driver has RCR.AB set).
     sudo python3 tools/dev/send_frame.py --iface en0 \\
-        --dst 02:80:19:11:22:33 --payload "SPRINTER NICRX TEST"
+        --dst ff:ff:ff:ff:ff:ff
 
     # Higher-throughput burst for OVW debugging (post stage 5).
     sudo python3 tools/dev/send_frame.py --iface en0 --count 16 --interval 0.05
@@ -37,7 +38,10 @@ def _import_scapy():
     return Ether, sendp
 
 
-DEFAULT_DST = "ff:ff:ff:ff:ff:ff"
+# NICRX uses RCR=0 (physical match only), so the default destination
+# is the locally administered MAC the driver programs into PAR0..5.
+# Use --dst ff:ff:ff:ff:ff:ff to fall back to broadcast when needed.
+DEFAULT_DST = "02:80:19:11:22:33"
 DEFAULT_TYPE = 0x88B5            # IEEE Std experimental EtherType, used by NICTX
 DEFAULT_PAYLOAD = b"SPRINTER NICRX TEST"
 
