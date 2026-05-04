@@ -1,0 +1,862 @@
+; ======================================================
+; TFTP.EXE - stage 7 of the Sprinter RTL8019AS network kit.
+; Downloads a hardcoded file ("TEST.TXT") via TFTP read
+; (octet mode, 512-byte default block size) from a hardcoded
+; server (192.168.7.1:69) and writes the bytes into a DSS
+; file ("TEST.TXT" in current directory).
+;
+; v0.1: hardcoded everything. NET.CFG / cmdline filename arrive
+;       in v0.2.
+;
+; Host setup (single-machine via feth pair):
+;   sudo ifconfig feth0 create
+;   sudo ifconfig feth1 create
+;   sudo ifconfig feth0 peer feth1
+;   sudo ifconfig feth0 up
+;   sudo ifconfig feth1 inet 192.168.7.1/24 up
+;   echo "hello tftp" > /tmp/test.txt
+;   sudo python3 tools/dev/tftp_serve.py --root /tmp
+;
+; Stage codes:
+;   [F0] INIT
+;   [F1] RRQ <filename>
+;   [F2] DATA BLK=<n> LEN=<bytes>
+;   [F3] ACK BLK=<n>
+;   ... loop ...
+;   [Fn] DONE SIZE=<total>
+; ======================================================
+
+EXE_VERSION		EQU 1
+
+	DEVICE NOSLOT64K
+
+	INCLUDE "macro.inc"
+	INCLUDE "dss.inc"
+	INCLUDE "rtl8019.inc"
+
+	DEFINE USE_RTL_INIT_NORMAL
+	DEFINE USE_RTL_SEND_FRAME
+	DEFINE USE_RTL_WAIT_PTX
+	DEFINE USE_RTL_RING_HAS_PACKET
+	DEFINE USE_RTL_READ_PACKET
+	DEFINE USE_ARP_BUILD_REQUEST
+
+ARP_OUTER	EQU 32
+TFTP_OUTER	EQU 32			; ~15s per DATA wait
+
+ETH_TYPE_ARP	EQU 0x0806
+ETH_TYPE_IPV4	EQU 0x0800
+IP_PROTO_UDP	EQU 17
+
+ARP_OP_REQUEST	EQU 1
+ARP_OP_REPLY	EQU 2
+
+ARP_FRAME_LEN	EQU 60
+IP_HDR_LEN	EQU 20
+UDP_HDR_LEN	EQU 8
+
+OUR_PORT_HI	EQU 0xC1
+OUR_PORT_LO	EQU 0x00
+TFTP_SRV_PORT_HI EQU 0
+TFTP_SRV_PORT_LO EQU 69
+
+; -- TFTP opcodes
+OP_RRQ		EQU 1
+OP_DATA		EQU 3
+OP_ACK		EQU 4
+OP_ERROR	EQU 5
+
+; -- TFTP defaults
+TFTP_BLOCK	EQU 512
+
+DSS_CREATE_OVERWRITE EQU 0x0A
+NO_HANDLE	EQU 0xFF
+
+	MODULE MAIN
+
+	ORG 0x8080
+
+EXE_HEADER
+	DB "EXE"
+	DB EXE_VERSION
+	DW 0x0080
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW START
+	DW START
+	DW STACK_TOP
+	DS 106, 0
+
+	ORG 0x8100
+@STACK_TOP
+
+START
+	PRINTLN MSG_BANNER
+
+	LD	A,1
+	LD	(@ISA.ISA_SLOT),A
+	CALL	@ISA.ISA_OPEN
+
+	; [F0] INIT
+	PRINT MSG_F0
+	CALL	@RTL.RESET
+	JP	C,RESET_FAIL
+	LD	HL,OUR_MAC
+	LD	A,RCR_AB
+	CALL	@RTL.INIT_NORMAL
+	; ARP module setup
+	LD	HL,OUR_MAC
+	LD	(@ARP.OUR_MAC_PTR),HL
+	LD	HL,OUR_IP
+	LD	(@ARP.OUR_IP_PTR),HL
+	; Init state.
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+	LD	HL,1
+	LD	(EXPECTED_BLOCK),HL
+	XOR	A
+	LD	(SERVER_PORT_HI),A
+	LD	(SERVER_PORT_LO),A
+	LD	HL,0
+	LD	(TOTAL_BYTES),HL
+	PRINTLN MSG_OK
+
+	PRINT MSG_HDR
+	LD	HL,TARGET_IP
+	CALL	PRINT_IPV4
+	PRINT MSG_GET
+	LD	HL,FILENAME
+	PRINT_HL
+	PRINT LINE_END
+
+	; ARP resolve target (server) for L2 destination.
+	LD	DE,TX_BUF
+	LD	HL,TARGET_IP
+	CALL	@ARP.BUILD_REQUEST
+	LD	HL,TX_BUF
+	LD	BC,ARP_FRAME_LEN
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+
+	LD	HL,ARP_OUTER
+	LD	(OUTER_LEFT),HL
+	CALL	WAIT_FOR_ARP_REPLY
+	JP	C,ARP_TIMEOUT
+
+	; Open output file.
+	LD	HL,FILENAME
+	LD	A,FA_ARCHIVE
+	LD	C,DSS_CREATE_OVERWRITE
+	RST	DSS
+	JP	C,FILE_FAIL
+	LD	(OUT_FH),A
+
+	; [F1] RRQ
+	PRINT MSG_F1
+	LD	HL,FILENAME
+	PRINT_HL
+	PRINT LINE_END
+
+	CALL	BUILD_RRQ_PAYLOAD
+	; Set up frame parameters and build full UDP-over-IP frame.
+	LD	HL,TFTP_BUF
+	LD	(TFTP_PAYLOAD_PTR),HL
+	LD	HL,(RRQ_LEN)
+	LD	(TFTP_PAYLOAD_LEN),HL
+	LD	A,TFTP_SRV_PORT_HI
+	LD	(TFTP_DST_PORT_HI),A
+	LD	A,TFTP_SRV_PORT_LO
+	LD	(TFTP_DST_PORT_LO),A
+	CALL	BUILD_UDP_FRAME		; returns frame length in BC
+	LD	HL,TX_BUF
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+
+	; -- Block loop --
+.BLOCK_LOOP
+	LD	HL,TFTP_OUTER
+	LD	(OUTER_LEFT),HL
+	CALL	WAIT_FOR_TFTP_DATA
+	JP	C,TFTP_TIMEOUT
+
+	; [F2] DATA BLK=N LEN=M
+	PRINT MSG_F2
+	LD	HL,(EXPECTED_BLOCK)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT MSG_LEN_EQ
+	LD	HL,(DATA_LEN)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT LINE_END
+
+	; Write data to file.
+	LD	BC,(DATA_LEN)
+	LD	A,B
+	OR	C
+	JR	Z,.NO_WRITE
+	LD	HL,RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 4
+	LD	A,(OUT_FH)
+	LD	D,B
+	LD	E,C
+	LD	C,DSS_WRITE
+	RST	DSS
+	JP	C,FILE_FAIL
+	; Accumulate total bytes.
+	LD	HL,(DATA_LEN)
+	LD	BC,(TOTAL_BYTES)
+	ADD	HL,BC
+	LD	(TOTAL_BYTES),HL
+.NO_WRITE
+
+	; Send ACK for current block.
+	CALL	BUILD_ACK_PAYLOAD
+	LD	HL,TFTP_BUF
+	LD	(TFTP_PAYLOAD_PTR),HL
+	LD	HL,4
+	LD	(TFTP_PAYLOAD_LEN),HL
+	LD	A,(SERVER_PORT_HI)
+	LD	(TFTP_DST_PORT_HI),A
+	LD	A,(SERVER_PORT_LO)
+	LD	(TFTP_DST_PORT_LO),A
+	CALL	BUILD_UDP_FRAME
+	LD	HL,TX_BUF
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+
+	; [F3] ACK BLK=N
+	PRINT MSG_F3
+	LD	HL,(EXPECTED_BLOCK)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT LINE_END
+
+	; If DATA_LEN < 512, this was the last block.
+	LD	HL,(DATA_LEN)
+	LD	DE,TFTP_BLOCK
+	LD	A,H
+	CP	D
+	JR	C,.DONE
+	JR	NZ,.MORE
+	LD	A,L
+	CP	E
+	JR	C,.DONE
+.MORE
+	LD	HL,(EXPECTED_BLOCK)
+	INC	HL
+	LD	(EXPECTED_BLOCK),HL
+	JP	.BLOCK_LOOP
+
+.DONE
+	; Close file.
+	LD	A,(OUT_FH)
+	CP	NO_HANDLE
+	JR	Z,.NOCLOSE
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+.NOCLOSE
+	PRINT MSG_FN
+	LD	HL,(TOTAL_BYTES)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT LINE_END
+
+	PRINTLN MSG_RESULT_OK
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_OK
+
+
+RESET_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_RESET
+	JP	FAIL_NIC
+
+SEND_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_SEND
+	JP	FAIL_NIC
+
+ARP_TIMEOUT
+	PRINTLN MSG_E_ARP
+	JP	FAIL_NIC
+
+TFTP_TIMEOUT
+	PRINTLN MSG_E_TFTP
+	JP	FAIL_FILE
+
+FILE_FAIL
+	PRINTLN MSG_E_FILE
+	JP	FAIL_FILE
+
+FAIL_FILE
+	; Best-effort close
+	LD	A,(OUT_FH)
+	CP	NO_HANDLE
+	JR	Z,.NOC
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+.NOC
+	JP	FAIL_NIC
+
+FAIL_NIC
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	PRINT_REG_DUMP
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NIC_ERR
+
+
+; ------------------------------------------------------
+; BUILD_RRQ_PAYLOAD: TFTP_BUF = opcode_RRQ(BE) + filename + 0
+; + "octet" + 0. Sets RRQ_LEN.
+; ------------------------------------------------------
+BUILD_RRQ_PAYLOAD
+	LD	DE,TFTP_BUF
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,OP_RRQ
+	LD	(DE),A
+	INC	DE
+	; Filename + 0
+	LD	HL,FILENAME
+	CALL	COPY_ASCIIZ
+	; "octet" + 0
+	LD	HL,MODE_OCTET
+	CALL	COPY_ASCIIZ
+	; Compute length: DE - TFTP_BUF
+	LD	HL,TFTP_BUF
+	OR	A
+	EX	DE,HL
+	SBC	HL,DE			; HL = end - start
+	LD	(RRQ_LEN),HL
+	RET
+
+; COPY_ASCIIZ: copy ASCIIZ string from HL to DE (including
+; the trailing zero). Trashes A, advances HL and DE.
+COPY_ASCIIZ
+.LP
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	OR	A
+	JR	NZ,.LP
+	RET
+
+
+; ------------------------------------------------------
+; BUILD_ACK_PAYLOAD: TFTP_BUF = opcode_ACK(BE) + EXPECTED_BLOCK(BE).
+; Length is fixed at 4 bytes.
+; ------------------------------------------------------
+BUILD_ACK_PAYLOAD
+	LD	DE,TFTP_BUF
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,OP_ACK
+	LD	(DE),A
+	INC	DE
+	LD	HL,(EXPECTED_BLOCK)
+	LD	A,H
+	LD	(DE),A
+	INC	DE
+	LD	A,L
+	LD	(DE),A
+	INC	DE
+	RET
+
+
+; ------------------------------------------------------
+; BUILD_UDP_FRAME: assemble ETH + IPv4 + UDP + TFTP payload
+; in TX_BUF. Inputs (set in module data before call):
+;   TFTP_PAYLOAD_PTR  -- DW pointer to payload bytes
+;   TFTP_PAYLOAD_LEN  -- DW payload length in bytes
+;   TFTP_DST_PORT_HI/LO -- destination UDP port (BE bytes)
+; Out: BC = total ETH frame length (14 + 20 + 8 + payload_len).
+; UDP checksum is set to 0 (allowed in IPv4).
+; ------------------------------------------------------
+BUILD_UDP_FRAME
+	; ETH header
+	LD	DE,TX_BUF
+	LD	HL,TARGET_MAC
+	LD	BC,6
+	LDIR
+	LD	HL,OUR_MAC
+	LD	BC,6
+	LDIR
+	LD	A,HIGH ETH_TYPE_IPV4
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW ETH_TYPE_IPV4
+	LD	(DE),A
+	INC	DE
+
+	; IPv4 header. total_len = 20 + 8 + payload_len.
+	LD	HL,(TFTP_PAYLOAD_LEN)
+	LD	BC,IP_HDR_LEN + UDP_HDR_LEN
+	ADD	HL,BC
+	LD	(IP_TOTAL_LEN),HL
+	LD	A,0x45
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,H
+	LD	(DE),A
+	INC	DE
+	LD	A,L
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,1
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	(DE),A
+	INC	DE
+	LD	A,64
+	LD	(DE),A
+	INC	DE
+	LD	A,IP_PROTO_UDP
+	LD	(DE),A
+	INC	DE
+	XOR	A			; csum placeholder
+	LD	(DE),A
+	INC	DE
+	LD	(DE),A
+	INC	DE
+	LD	HL,OUR_IP
+	LD	BC,4
+	LDIR
+	LD	HL,TARGET_IP
+	LD	BC,4
+	LDIR
+
+	; UDP header. udp_len = 8 + payload_len.
+	LD	HL,(TFTP_PAYLOAD_LEN)
+	LD	BC,UDP_HDR_LEN
+	ADD	HL,BC
+	LD	(UDP_LEN),HL
+	LD	A,OUR_PORT_HI
+	LD	(DE),A
+	INC	DE
+	LD	A,OUR_PORT_LO
+	LD	(DE),A
+	INC	DE
+	LD	A,(TFTP_DST_PORT_HI)
+	LD	(DE),A
+	INC	DE
+	LD	A,(TFTP_DST_PORT_LO)
+	LD	(DE),A
+	INC	DE
+	LD	A,H
+	LD	(DE),A
+	INC	DE
+	LD	A,L
+	LD	(DE),A
+	INC	DE
+	XOR	A			; UDP csum = 0 (disabled)
+	LD	(DE),A
+	INC	DE
+	LD	(DE),A
+	INC	DE
+
+	; TFTP payload
+	LD	HL,(TFTP_PAYLOAD_PTR)
+	LD	BC,(TFTP_PAYLOAD_LEN)
+	LD	A,B
+	OR	C
+	JR	Z,.NOPL
+	LDIR
+.NOPL
+	; Compute IP checksum over TX_BUF+14, length 20.
+	PUSH	IX
+	LD	IX,TX_BUF + 14
+	LD	BC,IP_HDR_LEN
+	CALL	@UTIL.CHECKSUM
+	POP	IX
+	LD	A,H
+	LD	(TX_BUF + 14 + 10),A
+	LD	A,L
+	LD	(TX_BUF + 14 + 11),A
+
+	; Total frame length = 14 + IP total length.
+	LD	HL,(IP_TOTAL_LEN)
+	LD	BC,14
+	ADD	HL,BC
+	LD	B,H
+	LD	C,L
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_FOR_ARP_REPLY: same pattern as PING/UDPTEST.
+; ------------------------------------------------------
+WAIT_FOR_ARP_REPLY
+.MAIN
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	LD	BC,0
+.WAIT
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.WAIT
+	LD	HL,(OUTER_LEFT)
+	DEC	HL
+	LD	(OUTER_LEFT),HL
+	LD	A,H
+	OR	L
+	JR	Z,.TIMEOUT
+	JR	.MAIN
+.HAVE
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JR	C,.MAIN
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_ARP
+	JR	NZ,.MAIN
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_ARP
+	JR	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + 6)
+	OR	A
+	JR	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + 7)
+	CP	ARP_OP_REPLY
+	JR	NZ,.MAIN
+	LD	HL,RX_BUF + 14 + 14
+	LD	DE,TARGET_IP
+	LD	B,4
+.CMPIP
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.MAIN
+	INC	HL
+	INC	DE
+	DJNZ	.CMPIP
+	LD	HL,RX_BUF + 14 + 8
+	LD	DE,TARGET_MAC
+	LD	BC,6
+	LDIR
+	OR	A
+	RET
+.TIMEOUT
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_FOR_TFTP_DATA: poll for incoming UDP from TARGET_IP
+; with TFTP DATA opcode (3) and matching block#. On match:
+;  - capture server source port into SERVER_PORT (first packet).
+;  - validate block# == EXPECTED_BLOCK.
+;  - set DATA_LEN = (UDP body) - 4 (TFTP header).
+;  - body bytes are at RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 4.
+; Out: CF=0 OK, CF=1 timeout.
+; ------------------------------------------------------
+WAIT_FOR_TFTP_DATA
+.MAIN
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	LD	BC,0
+.WAIT
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.WAIT
+	LD	HL,(OUTER_LEFT)
+	DEC	HL
+	LD	(OUTER_LEFT),HL
+	LD	A,H
+	OR	L
+	JP	Z,.TIMEOUT
+	JR	.MAIN
+.HAVE
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JP	C,.MAIN
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_IPV4
+	JP	NZ,.MAIN
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_IPV4
+	JP	NZ,.MAIN
+	LD	A,(RX_BUF + 14)
+	CP	0x45
+	JP	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + 9)
+	CP	IP_PROTO_UDP
+	JP	NZ,.MAIN
+	; src IP == TARGET_IP
+	LD	HL,RX_BUF + 14 + 12
+	LD	DE,TARGET_IP
+	LD	B,4
+.CMPSRC
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,.MAIN
+	INC	HL
+	INC	DE
+	DJNZ	.CMPSRC
+	; UDP dst_port == OUR_PORT
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 2)
+	CP	OUR_PORT_HI
+	JP	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 3)
+	CP	OUR_PORT_LO
+	JP	NZ,.MAIN
+	; If SERVER_PORT not yet captured, capture src_port now.
+	LD	A,(SERVER_PORT_HI)
+	OR	A
+	JR	NZ,.HAVE_PORT
+	LD	A,(SERVER_PORT_LO)
+	OR	A
+	JR	NZ,.HAVE_PORT
+	; capture
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
+	LD	(SERVER_PORT_HI),A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 1)
+	LD	(SERVER_PORT_LO),A
+.HAVE_PORT
+	; UDP src_port must match SERVER_PORT.
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
+	LD	HL,SERVER_PORT_HI
+	CP	(HL)
+	JP	NZ,.MAIN
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 1)
+	LD	HL,SERVER_PORT_LO
+	CP	(HL)
+	JP	NZ,.MAIN
+	; TFTP opcode (BE) at offset +14+IP_HDR+UDP_HDR..+1.
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 0)
+	OR	A
+	JP	NZ,.MAIN_OR_ERR
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 1)
+	CP	OP_DATA
+	JP	NZ,.MAIN_OR_ERR
+	; Block# (BE) at offset +14+IP_HDR+UDP_HDR+2..+3.
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 2)
+	LD	H,A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 3)
+	LD	L,A
+	; Compare to EXPECTED_BLOCK
+	LD	DE,(EXPECTED_BLOCK)
+	LD	A,H
+	CP	D
+	JP	NZ,.MAIN
+	LD	A,L
+	CP	E
+	JP	NZ,.MAIN
+	; Compute DATA_LEN = UDP_LEN - 8 - 4 (UDP header + TFTP header).
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
+	LD	L,A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
+	LD	H,A
+	LD	BC,UDP_HDR_LEN + 4
+	OR	A
+	SBC	HL,BC
+	LD	(DATA_LEN),HL
+	OR	A
+	RET
+.MAIN_OR_ERR
+	; If TFTP opcode is ERROR, bail with timeout (caller will fail).
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 1)
+	CP	OP_ERROR
+	JR	Z,.TFTP_ERROR
+	JP	.MAIN
+.TFTP_ERROR
+	SCF
+	RET
+.TIMEOUT
+	SCF
+	RET
+
+
+PRINT_IPV4
+	PUSH	HL,BC
+	LD	B,4
+.LP
+	LD	A,(HL)
+	CALL	PRINT_DEC_A
+	INC	HL
+	DEC	B
+	JR	Z,.DONE
+	PUSH	BC
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC
+	JR	.LP
+.DONE
+	POP	BC,HL
+	RET
+
+
+PRINT_DEC_A
+	PUSH	AF,BC,DE,HL
+	LD	C,A
+	LD	HL,DEC_BUF + 3
+	LD	(HL),0
+.LP
+	LD	A,C
+	LD	B,0
+.SUB
+	CP	10
+	JR	C,.GOT
+	SUB	10
+	INC	B
+	JR	.SUB
+.GOT
+	ADD	A,'0'
+	DEC	HL
+	LD	(HL),A
+	LD	C,B
+	LD	A,B
+	OR	A
+	JR	NZ,.LP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	POP	HL,DE,BC,AF
+	RET
+
+DEC_BUF		DS 4,0
+
+
+PUTCHAR
+	PUSH	AF,BC
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC,AF
+	RET
+
+
+PRINT_REG_DUMP
+	PRINT MSG_REGS
+	LD	HL,REG_NAMES
+	LD	DE,@RTL.REG_SNAPSHOT
+	LD	B,@RTL.REG_SNAPSHOT_LEN
+.LP
+	PUSH	BC,DE
+.NCHR
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	Z,.NDONE
+	CALL	PUTCHAR
+	JR	.NCHR
+.NDONE
+	LD	A,'='
+	CALL	PUTCHAR
+	POP	DE,BC
+	LD	A,(DE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	DE
+	DJNZ	.LP
+	PRINT LINE_END
+	RET
+
+REG_NAMES
+	DB "CR",0
+	DB "ISR",0
+	DB "DCR",0
+	DB "RCR",0
+	DB "TCR",0
+	DB "IMR",0
+	DB "PSTART",0
+	DB "PSTOP",0
+	DB "BNRY",0
+	DB "CURR",0
+
+
+; ------- in-EXE data -------
+OUR_MAC		DB 0x02, 0x80, 0x19, 0x11, 0x22, 0x33
+OUR_IP		DB 192, 168, 7, 2
+TARGET_IP	DB 192, 168, 7, 1
+TARGET_MAC	DB 0,0,0,0,0,0
+OUTER_LEFT	DW 0
+SERVER_PORT_HI	DB 0
+SERVER_PORT_LO	DB 0
+EXPECTED_BLOCK	DW 0
+DATA_LEN	DW 0
+TOTAL_BYTES	DW 0
+RRQ_LEN		DW 0
+IP_TOTAL_LEN	DW 0
+UDP_LEN		DW 0
+OUT_FH		DB 0xFF
+
+; BUILD_UDP_FRAME args:
+TFTP_PAYLOAD_PTR DW 0
+TFTP_PAYLOAD_LEN DW 0
+TFTP_DST_PORT_HI DB 0
+TFTP_DST_PORT_LO DB 0
+
+FILENAME	DB "TEST.TXT",0
+MODE_OCTET	DB "octet",0
+
+
+; ------- messages -------
+MSG_BANNER	DB "RTL8019AS TFTP v0.1",0
+MSG_F0		DB "[F0] INIT ",0
+MSG_OK		DB "OK",0
+MSG_HDR		DB "TFTP ",0
+MSG_GET		DB " GET ",0
+MSG_F1		DB "[F1] RRQ ",0
+MSG_F2		DB "[F2] DATA BLK=",0
+MSG_LEN_EQ	DB " LEN=",0
+MSG_F3		DB "[F3] ACK BLK=",0
+MSG_FN		DB "[F4] DONE SIZE=",0
+MSG_REGS	DB "REGS ",0
+MSG_RESULT_OK	DB "RESULT OK",0
+MSG_RESULT_FAIL	DB "RESULT FAIL",0
+MSG_E_RESET	DB "[E80] RESET timeout",0
+MSG_E_SEND	DB "[E81] DMA write or PTX timeout",0
+MSG_E_ARP	DB "[E82] ARP reply timeout",0
+MSG_E_TFTP	DB "[E83] TFTP timeout or server error",0
+MSG_E_FILE	DB "[E84] file create/write/close failed",0
+LINE_END	DB 13,10,0
+
+	ENDMODULE
+
+
+	INCLUDE "isa.asm"
+	INCLUDE "util.asm"
+	INCLUDE "rtl8019.asm"
+	INCLUDE "arp_lib.asm"
+
+
+TFTP_IMAGE_END
+
+RX_BUF_SIZE	EQU 1518
+TFTP_BUF_SIZE	EQU 32			; RRQ <= 17, ACK = 4
+
+	MODULE MAIN
+
+TX_BUF		EQU TFTP_IMAGE_END
+RX_HDR		EQU TX_BUF + 1518	; max ETH frame (RRQ/ACK fits, DATA up to 558)
+RX_BUF		EQU RX_HDR + 4
+TFTP_BUF	EQU RX_BUF + RX_BUF_SIZE
+TFTP_BSS_END	EQU TFTP_BUF + TFTP_BUF_SIZE
+
+	ENDMODULE
+
+	END MAIN.START

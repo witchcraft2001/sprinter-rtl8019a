@@ -22,6 +22,7 @@ BUILD_APPS=(
   arp
   ping
   udptest
+  tftp
 )
 
 # Text/documentation files copied to the distribution root.
