@@ -122,6 +122,148 @@ DELAY_MS
 	RET
 
 ; ------------------------------------------------------
+; STARTSWITH: ZF=1 if string at HL starts with the ASCIIZ
+; prefix at DE. HL is preserved either way; DE is advanced.
+; Trashes A.
+; ------------------------------------------------------
+	IFDEF USE_UTIL_STARTSWITH
+STARTSWITH
+	PUSH	HL
+.LP
+	LD	A,(DE)
+	OR	A
+	JR	Z,.MATCH
+	CP	(HL)
+	JR	NZ,.MISS
+	INC	HL
+	INC	DE
+	JR	.LP
+.MATCH
+	POP	HL
+	XOR	A			; ZF=1
+	RET
+.MISS
+	POP	HL
+	LD	A,0xFF
+	OR	A			; ZF=0
+	RET
+	ENDIF
+
+; ------------------------------------------------------
+; PARSE_DEC_BYTE: read decimal digits at (HL) into A, stopping
+; at the first non-digit. Returns A = value (mod 256), HL points
+; at the first non-digit byte. Saturates at 255 on overflow.
+;   Out: A = byte, HL advanced past digits.
+;        CF=1 if no digit consumed (otherwise CF=0).
+; Trashes A only. BC preserved (saved/restored on stack).
+; ------------------------------------------------------
+	IFDEF USE_UTIL_PARSE_DEC_BYTE
+PARSE_DEC_BYTE
+	PUSH	BC			; save caller's BC
+	LD	B,0			; B = local digit-consumed counter
+	XOR	A			; accumulator
+.LP
+	PUSH	AF
+	LD	A,(HL)
+	SUB	'0'
+	JR	C,.END
+	CP	10
+	JR	NC,.END
+	LD	C,A
+	POP	AF
+	PUSH	BC
+	LD	B,A
+	ADD	A,A
+	ADD	A,A
+	ADD	A,B
+	ADD	A,A
+	POP	BC
+	ADD	A,C
+	INC	HL
+	INC	B
+	JR	.LP
+.END
+	POP	AF
+	PUSH	AF
+	LD	A,B
+	OR	A
+	JR	Z,.NODIG
+	POP	AF
+	POP	BC			; restore caller's BC
+	OR	A			; CF=0
+	RET
+.NODIG
+	POP	AF
+	POP	BC
+	SCF
+	RET
+	ENDIF
+
+; ------------------------------------------------------
+; PARSE_HEX_NIBBLE: A = '0'..'9'/'a'..'f'/'A'..'F' -> 0..15
+; Out: A = nibble (low 4 bits). CF=1 if input not a hex digit.
+; ------------------------------------------------------
+	IFDEF USE_UTIL_PARSE_HEX_BYTE
+PARSE_HEX_NIBBLE
+	CP	'0'
+	JR	C,.BAD
+	CP	'9'+1
+	JR	C,.D09
+	CP	'A'
+	JR	C,.BAD
+	CP	'F'+1
+	JR	C,.DAF
+	CP	'a'
+	JR	C,.BAD
+	CP	'f'+1
+	JR	NC,.BAD
+	SUB	'a'-10
+	OR	A
+	RET
+.D09
+	SUB	'0'
+	OR	A
+	RET
+.DAF
+	SUB	'A'-10
+	OR	A
+	RET
+.BAD
+	SCF
+	RET
+
+; ------------------------------------------------------
+; PARSE_HEX_BYTE: read 2 hex digits at (HL), HL += 2.
+;   Out: A = byte; CF=1 on bad digit.
+; Trashes A only. BC preserved (saved/restored on stack).
+; ------------------------------------------------------
+PARSE_HEX_BYTE
+	PUSH	BC			; save caller's BC
+	LD	A,(HL)
+	CALL	PARSE_HEX_NIBBLE
+	JR	C,.BAD
+	RLCA
+	RLCA
+	RLCA
+	RLCA
+	AND	0xF0
+	LD	B,A
+	INC	HL
+	LD	A,(HL)
+	CALL	PARSE_HEX_NIBBLE
+	JR	C,.BAD
+	OR	B
+	INC	HL
+	POP	BC			; restore caller's BC
+	OR	A			; CF=0
+	RET
+.BAD
+	POP	BC
+	SCF
+	RET
+	ENDIF
+
+; ------------------------------------------------------
 ; Internet checksum (RFC 1071): one's-complement sum of
 ; 16-bit BE words, complemented.
 ;
