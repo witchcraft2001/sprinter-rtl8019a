@@ -42,8 +42,11 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_READ_PACKET
 	DEFINE USE_ARP_BUILD_REQUEST
 	DEFINE USE_NETENV
+	DEFINE USE_CMDL
+	DEFINE CMDLINE_AT_LARGE			; ORG 0x4100 -> cmd line at IX-0x80 = 0x4180
 
-PRX_OUTER	EQU 32			; ~15s budget for ARP reply
+ARP_TIMEOUT_MS	EQU 3000		; ARP reply budget (ms)
+SCAN_C		EQU 0xAC		; DSS scancode for the C key
 
 ETH_TYPE_ARP	EQU 0x0806
 
@@ -55,12 +58,13 @@ ARP_BODY_LEN	EQU 28
 
 	MODULE MAIN
 
-	ORG 0x8080
+	; Large EXE header (256 bytes, 0x4100..0x41FF).
+	ORG 0x4100
 
 EXE_HEADER
 	DB "EXE"
 	DB EXE_VERSION
-	DW 0x0080
+	DW 0x0100			; hdr_size = 256
 	DW 0
 	DW 0
 	DW 0
@@ -68,14 +72,30 @@ EXE_HEADER
 	DW 0
 	DW START
 	DW START
-	DW STACK_TOP
-	DS 106, 0
+	DW 0xBFFF			; stack at top of directly-addressable RAM
+	DS 234, 0
 
-	ORG 0x8100
-@STACK_TOP
+	ORG 0x4200
 
 START
 	PRINTLN MSG_BANNER
+
+	; Init CANCELLED (BSS; not zeroed by loader).
+	XOR	A
+	LD	(CANCELLED),A
+
+	; Tokenize and check help.
+	CALL	@CMDL.PARSE
+	CALL	@CMDL.IS_HELP
+	JP	NC,SHOW_HELP
+
+	; Mandatory positional: target IPv4.
+	LD	B,0
+	CALL	@CMDL.GET_POSITIONAL
+	JP	C,USAGE_ERROR
+	LD	DE,TARGET_IP
+	CALL	@CMDL.PARSE_IPV4
+	JP	C,USAGE_ERROR
 
 	; Pull NET_IP / NET_MAC from env (populated by NETCFG -i).
 	LD	HL,N_NET_IP
@@ -85,65 +105,58 @@ START
 	LD	DE,OUR_MAC
 	CALL	@NETENV.REQUIRE_MAC
 
+	; Init NIC.
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@ISA.ISA_OPEN
-
-	; [A0] INIT
-	PRINT MSG_A0
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
 	LD	HL,OUR_MAC
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
-	; Configure ARP module pointers (once).
 	LD	HL,OUR_MAC
 	LD	(@ARP.OUR_MAC_PTR),HL
 	LD	HL,OUR_IP
 	LD	(@ARP.OUR_IP_PTR),HL
-	PRINTLN MSG_OK
 
-	; [A1] info banner
+	; "ARPING X from Y (MAC)"
+	PRINT LINE_END
+	PRINT MSG_ARPING
+	LD	HL,TARGET_IP
+	CALL	PRINT_IPV4
 	PRINT MSG_FROM_IP
 	LD	HL,OUR_IP
 	CALL	PRINT_IPV4
-	PRINT MSG_OUR_MAC
+	PRINT MSG_OPEN_PAREN
 	LD	HL,OUR_MAC
 	CALL	@UTIL.PRINT_MAC
-	PRINT LINE_END
-	PRINT MSG_TO_IP
-	LD	HL,TARGET_IP
-	CALL	PRINT_IPV4
-	PRINT LINE_END
+	PRINTLN MSG_CLOSE_PAREN
 
-	; [A2] BUILD via @ARP.BUILD_REQUEST.
+	; Build and send ARP request.
 	LD	DE,TX_BUF
 	LD	HL,TARGET_IP
 	CALL	@ARP.BUILD_REQUEST
-	PRINTLN MSG_A2
-
-	; [A3] SEND (DMA + TBCR + CR.TXP + wait PTX)
-	PRINT MSG_A3
 	LD	HL,TX_BUF
 	LD	BC,FRAME_LEN
 	CALL	@RTL.SEND_FRAME
 	JP	C,WRITE_FAIL
-	PRINTLN MSG_OK
 
-	; [A4] WAIT REPLY
-	PRINTLN MSG_A4
+	; Wait for reply (ms timeout, key-cancellable).
+	LD	HL,ARP_TIMEOUT_MS
+	LD	(TIMEOUT_MS_LEFT),HL
 	CALL	WAIT_FOR_ARP_REPLY
 	JP	C,REPLY_TIMEOUT
 
-	; [A5] REPLY
-	PRINT MSG_A5
+	; "Reply from X.X.X.X: aa:bb:..."
+	PRINT MSG_REPLY_FROM
+	LD	HL,TARGET_IP
+	CALL	PRINT_IPV4
+	PRINT MSG_COLON
 	LD	HL,REPLY_MAC
 	CALL	@UTIL.PRINT_MAC
 	PRINT LINE_END
-
-	PRINTLN MSG_RESULT_OK
 	CALL	@ISA.ISA_CLOSE
-	DSS_RETURN EX_OK
+	JP	@UTIL.EXIT_OK
 
 
 RESET_FAIL
@@ -157,15 +170,73 @@ WRITE_FAIL
 	JP	FAIL_NIC
 
 REPLY_TIMEOUT
+	LD	A,(CANCELLED)
+	OR	A
+	JR	NZ,.CANCEL
 	PRINTLN MSG_E_REPLY
 	JP	FAIL_NIC
+.CANCEL
+	PRINTLN MSG_ABORTED
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
 
 FAIL_NIC
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	PRINT_REG_DUMP
-	PRINTLN MSG_RESULT_FAIL
 	CALL	@ISA.ISA_CLOSE
-	DSS_RETURN EX_NIC_ERR
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+
+SHOW_HELP
+	LD	HL,MSG_HELP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	JP	@UTIL.EXIT_OK
+
+
+USAGE_ERROR
+	PRINTLN MSG_USAGE_ERR
+	LD	HL,MSG_HELP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	B,1
+	JP	@UTIL.EXIT_FAIL
+
+
+; ------------------------------------------------------
+; TICK_AND_CHECK_KEY: ~1 ms wait + non-blocking key poll.
+; Esc and Ctrl+C cancel the wait.  SCANKEY may switch
+; memory pages, so we close the ISA window around the call.
+;   Out: CF=0 normal; CF=1 cancelled (CANCELLED set).
+; ------------------------------------------------------
+TICK_AND_CHECK_KEY
+	CALL	@UTIL.DELAY_1MS
+	CALL	@ISA.ISA_CLOSE
+	LD	C,DSS_SCANKEY
+	RST	DSS
+	JR	Z,.NO_KEY
+	LD	A,E
+	CP	0x1B			; Esc
+	JR	Z,.CANCEL
+	LD	A,B
+	AND	KB_CTRL | KB_L_CTRL | KB_R_CTRL
+	JR	Z,.NO_KEY
+	LD	A,D
+	CP	SCAN_C			; Ctrl+C
+	JR	Z,.CANCEL
+	JR	.NO_KEY
+.CANCEL
+	LD	A,1
+	LD	(CANCELLED),A
+	CALL	@ISA.ISA_OPEN
+	SCF
+	RET
+.NO_KEY
+	CALL	@ISA.ISA_OPEN
+	OR	A
+	RET
 
 
 ; ------------------------------------------------------
@@ -183,52 +254,44 @@ FAIL_NIC
 ;   Out: CF=0 OK, CF=1 timeout.
 ; ------------------------------------------------------
 WAIT_FOR_ARP_REPLY
-	LD	HL,PRX_OUTER
-	LD	(OUTER_LEFT),HL
-.MAIN
+.LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
-	LD	BC,0
-.WAIT
-	CALL	@RTL.RING_HAS_PACKET
-	JR	NZ,.HAVE
-	DEC	BC
-	LD	A,B
-	OR	C
-	JR	NZ,.WAIT
-	LD	HL,(OUTER_LEFT)
+	CALL	TICK_AND_CHECK_KEY	; ~1 ms + Esc/Ctrl+C poll
+	JR	C,.TIMEOUT		; cancelled
+	LD	HL,(TIMEOUT_MS_LEFT)
 	DEC	HL
-	LD	(OUTER_LEFT),HL
+	LD	(TIMEOUT_MS_LEFT),HL
 	LD	A,H
 	OR	L
-	JR	Z,.TIMEOUT
-	JR	.MAIN
+	JR	NZ,.LP
+	JR	.TIMEOUT
 .HAVE
 	LD	HL,RX_HDR
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.MAIN			; DMA error, drop and continue
+	JR	C,.LP			; DMA error, drop and continue
 	; Filter: ARP reply for TARGET_IP.
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_ARP
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_ARP
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14 + 6)
 	OR	A
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14 + 7)
 	CP	ARP_OP_REPLY
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	HL,RX_BUF + 14 + 14
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPIP
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	INC	HL
 	INC	DE
 	DJNZ	.CMPIP
@@ -242,8 +305,6 @@ WAIT_FOR_ARP_REPLY
 .TIMEOUT
 	SCF
 	RET
-
-OUTER_LEFT	DW 0
 
 
 ; ------------------------------------------------------
@@ -353,39 +414,44 @@ REG_NAMES
 ; ------- in-EXE data -------
 N_NET_IP	DB "NET_IP",0
 N_NET_MAC	DB "NET_MAC",0
-TARGET_IP	DB 192, 168, 7, 1
 
 ; ------- runtime BSS (lives at APP_BSS_BASE, NOT in .EXE) --
 OUR_IP		EQU APP_BSS_BASE		; 4 bytes, filled by REQUIRE_IP
 OUR_MAC		EQU APP_BSS_BASE + 4		; 6 bytes, filled by REQUIRE_MAC
-REPLY_MAC	EQU APP_BSS_BASE + 10		; 6 bytes, filled by ARP reply parser
+TARGET_IP	EQU APP_BSS_BASE + 10		; 4 bytes, filled from positional arg
+REPLY_MAC	EQU APP_BSS_BASE + 14		; 6 bytes, filled by ARP reply parser
+TIMEOUT_MS_LEFT	EQU APP_BSS_BASE + 20		; 2 bytes
+CANCELLED	EQU APP_BSS_BASE + 22		; 1 byte
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS ARP v0.1",0
-MSG_A0		DB "[A0] INIT ",0
-MSG_OK		DB "OK",0
-MSG_FROM_IP	DB "     from ",0
-MSG_OUR_MAC	DB " (",0
-MSG_TO_IP	DB "     who-has ",0
-MSG_A2		DB "[A2] BUILD OK",0
-MSG_A3		DB "[A3] SEND ",0
-MSG_A4		DB "[A4] WAIT REPLY",0
-MSG_A5		DB "[A5] REPLY MAC=",0
+MSG_BANNER	DB "RTL8019AS ARP v0.2",0
+MSG_ARPING	DB "ARPING ",0
+MSG_FROM_IP	DB " from ",0
+MSG_OPEN_PAREN	DB " (",0
+MSG_CLOSE_PAREN	DB ")",0
+MSG_REPLY_FROM	DB "Reply from ",0
+MSG_COLON	DB ": ",0
 MSG_REGS	DB "REGS ",0
-MSG_RESULT_OK	DB "RESULT OK",0
-MSG_RESULT_FAIL	DB "RESULT FAIL",0
+MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
 MSG_E_RESET	DB "[E50] RESET timeout",0
 MSG_E_WRITE	DB "[E51] DMA write or PTX timeout",0
-MSG_E_REPLY	DB "[E53] ARP reply timeout (no matching reply within budget)",0
+MSG_E_REPLY	DB "ARP request timed out.",0
+MSG_USAGE_ERR	DB "[E] usage: missing or invalid target IPv4",0
+MSG_HELP
+	DB "Usage:",13,10
+	DB "  ARP target",13,10
+	DB "  ARP /?",13,10,13,10
+	DB "  target  destination IPv4 (e.g. 192.168.7.1).",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
 
 
-	; netenv_lib transitively DEFINEs USE_UTIL_* helpers it needs,
-	; so it must be included BEFORE util.asm.
+	; netenv_lib / cmdline_lib transitively DEFINE USE_UTIL_*
+	; helpers they need, so they must be included BEFORE util.asm.
 	INCLUDE "netenv_lib.asm"
+	INCLUDE "cmdline_lib.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
