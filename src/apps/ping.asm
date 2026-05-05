@@ -46,9 +46,12 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_READ_PACKET
 	DEFINE USE_ARP_BUILD_REQUEST
 	DEFINE USE_NETENV
+	DEFINE USE_CMDL
+	DEFINE CMDLINE_AT_LARGE			; ORG 0x4100 -> cmd line at IX-0x80 = 0x4180
 
-ARP_OUTER	EQU 32			; ~15s ARP budget (arbitrary tick units)
-ICMP_OUTER	EQU 32			; ~15s ICMP reply budget
+ARP_TIMEOUT_MS	EQU 3000		; ARP reply budget (ms)
+ICMP_TIMEOUT_MS	EQU 1000		; per-echo reply budget (ms, default Windows -w)
+SCAN_C		EQU 0xAC		; DSS scancode for the C key (observed)
 
 ETH_TYPE_ARP	EQU 0x0806
 ETH_TYPE_IPV4	EQU 0x0800
@@ -73,12 +76,16 @@ ECHO_SEQ_LO	EQU 0x01
 
 	MODULE MAIN
 
-	ORG 0x8080
+	; Large-variant EXE header (256 bytes, 0x4100..0x41FF).
+	; Required because the small variant's header sits on top of
+	; the DSS command line at 0x8080; this utility takes a host
+	; argument and must keep that buffer free.
+	ORG 0x4100
 
 EXE_HEADER
 	DB "EXE"
 	DB EXE_VERSION
-	DW 0x0080
+	DW 0x0100			; hdr_size = 256
 	DW 0
 	DW 0
 	DW 0
@@ -86,14 +93,49 @@ EXE_HEADER
 	DW 0
 	DW START
 	DW START
-	DW STACK_TOP
-	DS 106, 0
+	DW 0xBFFF			; stack at top of directly-addressable RAM
+	DS 234, 0
 
-	ORG 0x8100
-@STACK_TOP
+	ORG 0x4200
 
 START
 	PRINTLN MSG_BANNER
+
+	; Init CANCELLED (BSS; not zeroed by loader).
+	XOR	A
+	LD	(CANCELLED),A
+
+	; Tokenize the command line; check for help.
+	CALL	@CMDL.PARSE
+	CALL	@CMDL.IS_HELP
+	JP	NC,SHOW_HELP
+
+	; -n count (default 4, max 255).
+	LD	A,4
+	LD	(COUNT),A
+	LD	A,'n'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_N
+	CALL	@CMDL.PARSE_U16
+	JP	C,USAGE_ERROR
+	LD	A,H
+	OR	A
+	JR	Z,.SET_N
+	LD	L,255			; cap at 255
+.SET_N
+	LD	A,L
+	OR	A
+	JP	Z,USAGE_ERROR
+	LD	(COUNT),A
+.NO_N
+
+	; Mandatory positional: target IPv4.
+	LD	B,0
+	CALL	@CMDL.GET_POSITIONAL
+	JP	C,USAGE_ERROR
+	LD	DE,TARGET_IP
+	CALL	@CMDL.PARSE_IPV4
+	JP	C,USAGE_ERROR
 
 	; Pull NET_IP / NET_MAC from env (populated by NETCFG -i).
 	LD	HL,N_NET_IP
@@ -103,38 +145,31 @@ START
 	LD	DE,OUR_MAC
 	CALL	@NETENV.REQUIRE_MAC
 
+	; Init NIC.
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@ISA.ISA_OPEN
-
-	; [P0] INIT
-	PRINT MSG_P0
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
 	LD	HL,OUR_MAC
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
-	; ARP module setup -- point at NETCFG fields.
 	LD	HL,OUR_MAC
 	LD	(@ARP.OUR_MAC_PTR),HL
 	LD	HL,OUR_IP
 	LD	(@ARP.OUR_IP_PTR),HL
-	PRINTLN MSG_OK
 
-	PRINT MSG_PING_HDR
+	; "Pinging X with N bytes of data:"
+	PRINT LINE_END
+	PRINT MSG_PINGING
 	LD	HL,TARGET_IP
 	CALL	PRINT_IPV4
-	PRINT MSG_FROM
-	LD	HL,OUR_IP
-	CALL	PRINT_IPV4
-	PRINT LINE_END
+	PRINT MSG_WITH
+	LD	A,ICMP_PAYLOAD_LEN
+	CALL	PRINT_DEC_A
+	PRINTLN MSG_BYTES_DATA
 
-	; [P1] ARP
-	PRINT MSG_P1
-	LD	HL,TARGET_IP
-	CALL	PRINT_IPV4
-	PRINT LINE_END
-
+	; Resolve ARP for target (one-time, before loop).
 	LD	DE,TX_BUF
 	LD	HL,TARGET_IP
 	CALL	@ARP.BUILD_REQUEST
@@ -142,53 +177,113 @@ START
 	LD	BC,ARP_FRAME_LEN
 	CALL	@RTL.SEND_FRAME
 	JP	C,SEND_FAIL
-
-	LD	HL,ARP_OUTER
-	LD	(OUTER_LEFT),HL
+	LD	HL,ARP_TIMEOUT_MS
+	LD	(TIMEOUT_MS_LEFT),HL
 	CALL	WAIT_FOR_ARP_REPLY
 	JP	C,ARP_TIMEOUT
 
-	; [P2] ARP REPLY
-	PRINT MSG_P2
-	LD	HL,TARGET_MAC
-	CALL	@UTIL.PRINT_MAC
-	PRINT LINE_END
+	; Init counters and ICMP sequence.
+	XOR	A
+	LD	(SENT),A
+	LD	(RECVD),A
+	LD	A,1
+	LD	(SEQ_LO),A
+	XOR	A
+	LD	(SEQ_HI),A
 
-	; [P3] BUILD ICMP
+PING_LOOP
+	LD	A,(SENT)
+	LD	HL,COUNT
+	CP	(HL)
+	JR	NC,PING_LOOP_END
+
+	; Build and send ICMP echo with current SEQ.
 	CALL	BUILD_ICMP_ECHO
-	PRINTLN MSG_P3
-
-	; [P4] SEND
-	PRINT MSG_P4
 	LD	HL,TX_BUF
 	LD	BC,ICMP_FRAME_LEN
 	CALL	@RTL.SEND_FRAME
 	JP	C,SEND_FAIL
-	PRINTLN MSG_OK
+	LD	A,(SENT)
+	INC	A
+	LD	(SENT),A
 
-	; [P5] WAIT REPLY
-	PRINTLN MSG_P5
-	LD	HL,ICMP_OUTER
-	LD	(OUTER_LEFT),HL
+	; Wait for matching reply.
+	LD	HL,ICMP_TIMEOUT_MS
+	LD	(TIMEOUT_MS_LEFT),HL
 	CALL	WAIT_FOR_ICMP_REPLY
-	JP	C,ICMP_TIMEOUT
+	JR	C,.TIMED_OUT
 
-	; [P6] REPLY id=xxxx seq=xxxx
-	PRINT MSG_P6_ID
-	LD	A,(REPLY_ID + 0)
-	CALL	@UTIL.PRINT_HEX_A
-	LD	A,(REPLY_ID + 1)
-	CALL	@UTIL.PRINT_HEX_A
-	PRINT MSG_SEQ_EQ
-	LD	A,(REPLY_SEQ + 0)
-	CALL	@UTIL.PRINT_HEX_A
-	LD	A,(REPLY_SEQ + 1)
-	CALL	@UTIL.PRINT_HEX_A
+	; "Reply from X.X.X.X: bytes=N time<1ms TTL=64"
+	PRINT MSG_REPLY_FROM
+	LD	HL,TARGET_IP
+	CALL	PRINT_IPV4
+	PRINT MSG_BYTES_EQ
+	LD	A,ICMP_PAYLOAD_LEN
+	CALL	PRINT_DEC_A
+	PRINTLN MSG_TIME_TTL
+	LD	A,(RECVD)
+	INC	A
+	LD	(RECVD),A
+	JR	.NEXT_SEQ
+
+.TIMED_OUT
+	; If user cancelled, skip the "Request timed out." line
+	; and stop the loop -- "Aborted..." is shown by PING_LOOP_END.
+	LD	A,(CANCELLED)
+	OR	A
+	JR	NZ,PING_LOOP_END
+	PRINTLN MSG_TIMED_OUT
+
+.NEXT_SEQ
+	LD	HL,SEQ_LO
+	INC	(HL)
+	JR	NZ,PING_LOOP
+	INC	HL			; HL = SEQ_HI (adjacent)
+	INC	(HL)
+	JR	PING_LOOP
+
+PING_LOOP_END
+	; If user cancelled mid-loop, mention it before stats.
+	LD	A,(CANCELLED)
+	OR	A
+	JR	Z,.STATS
+	PRINTLN MSG_ABORTED
+.STATS
+	; Statistics block.
 	PRINT LINE_END
+	PRINT MSG_STATS_HDR
+	LD	HL,TARGET_IP
+	CALL	PRINT_IPV4
+	PRINTLN MSG_COLON
 
+	PRINT MSG_PACKETS_SENT
+	LD	A,(SENT)
+	CALL	PRINT_DEC_A
+	PRINT MSG_RECEIVED_EQ
+	LD	A,(RECVD)
+	CALL	PRINT_DEC_A
+	PRINT MSG_LOST_EQ
+	; lost = sent - received
+	LD	A,(SENT)
+	LD	B,A
+	LD	A,(RECVD)
+	LD	C,A
+	LD	A,B
+	SUB	C
+	CALL	PRINT_DEC_A
+	PRINTLN MSG_LOSS_END
+
+	; Exit: 0 if any received, 3 if all lost.
+	LD	A,(RECVD)
+	OR	A
+	JR	Z,.ALL_LOST
 	PRINTLN MSG_RESULT_OK
 	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_OK
+.ALL_LOST
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NET_ERR
 
 
 RESET_FAIL
@@ -202,12 +297,16 @@ SEND_FAIL
 	JP	FAIL_NIC
 
 ARP_TIMEOUT
+	LD	A,(CANCELLED)
+	OR	A
+	JR	NZ,.CANCEL
 	PRINTLN MSG_E_ARP
 	JP	FAIL_NIC
-
-ICMP_TIMEOUT
-	PRINTLN MSG_E_ICMP
-	JP	FAIL_NIC
+.CANCEL
+	PRINTLN MSG_ABORTED
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
 
 FAIL_NIC
 	CALL	@RTL.SNAPSHOT_REGS
@@ -215,6 +314,22 @@ FAIL_NIC
 	PRINTLN MSG_RESULT_FAIL
 	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NIC_ERR
+
+
+SHOW_HELP
+	LD	HL,MSG_HELP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	JP	@UTIL.EXIT_OK
+
+
+USAGE_ERROR
+	PRINTLN MSG_USAGE_ERR
+	LD	HL,MSG_HELP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	B,1
+	JP	@UTIL.EXIT_FAIL
 
 
 ; ------------------------------------------------------
@@ -293,10 +408,10 @@ BUILD_ICMP_ECHO
 	LD	A,ECHO_ID_LO
 	LD	(DE),A
 	INC	DE
-	LD	A,ECHO_SEQ_HI
+	LD	A,(SEQ_HI)
 	LD	(DE),A
 	INC	DE
-	LD	A,ECHO_SEQ_LO
+	LD	A,(SEQ_LO)
 	LD	(DE),A
 	INC	DE
 
@@ -333,57 +448,92 @@ BUILD_ICMP_ECHO
 
 
 ; ------------------------------------------------------
+; TICK_AND_CHECK_KEY: ~1 ms wait + non-blocking key poll.
+; Esc and Ctrl+C cancel the wait.  SCANKEY may switch
+; memory pages, so we close the ISA window around the call.
+;   Out: CF=0 normal; CF=1 cancelled (CANCELLED byte set).
+;   Trashes A, BC, DE.
+; ------------------------------------------------------
+TICK_AND_CHECK_KEY
+	CALL	@UTIL.DELAY_1MS
+	CALL	@ISA.ISA_CLOSE
+	LD	C,DSS_SCANKEY
+	RST	DSS
+	JR	Z,.NO_KEY
+	; SCANKEY return: E = ASCII (=A), B = modifiers (KB_*),
+	; D = scancode.  Cancel checks:
+	; - Esc: E = 0x1B (no modifier required).
+	; - Ctrl+C: DSS does not deliver 'C' ASCII while Ctrl is
+	;   held; we recognise the C-key scancode (SCAN_C) plus a
+	;   Ctrl modifier bit in B.
+	LD	A,E
+	CP	0x1B
+	JR	Z,.CANCEL
+	LD	A,B
+	AND	KB_CTRL | KB_L_CTRL | KB_R_CTRL
+	JR	Z,.NO_KEY
+	LD	A,D
+	CP	SCAN_C
+	JR	Z,.CANCEL
+	JR	.NO_KEY
+.CANCEL
+	LD	A,1
+	LD	(CANCELLED),A
+	CALL	@ISA.ISA_OPEN
+	SCF
+	RET
+.NO_KEY
+	CALL	@ISA.ISA_OPEN
+	OR	A
+	RET
+
+
+; ------------------------------------------------------
 ; WAIT_FOR_ARP_REPLY: spin on RTL.RING_HAS_PACKET +
 ; RTL.READ_PACKET, drop anything that isn't a matching ARP
 ; reply, populate TARGET_MAC on match.
-;   OUTER_LEFT must be set before call.
+;   TIMEOUT_MS_LEFT must be set before call.
 ;   Out: CF=0 OK, CF=1 timeout.
 ; ------------------------------------------------------
 WAIT_FOR_ARP_REPLY
-.MAIN
+.LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
-	LD	BC,0
-.WAIT
-	CALL	@RTL.RING_HAS_PACKET
-	JR	NZ,.HAVE
-	DEC	BC
-	LD	A,B
-	OR	C
-	JR	NZ,.WAIT
-	LD	HL,(OUTER_LEFT)
+	CALL	TICK_AND_CHECK_KEY	; ~1ms wait + ESC/Ctrl-C poll
+	JR	C,.TIMEOUT		; cancelled
+	LD	HL,(TIMEOUT_MS_LEFT)
 	DEC	HL
-	LD	(OUTER_LEFT),HL
+	LD	(TIMEOUT_MS_LEFT),HL
 	LD	A,H
 	OR	L
-	JR	Z,.TIMEOUT
-	JR	.MAIN
+	JR	NZ,.LP
+	JR	.TIMEOUT
 .HAVE
 	LD	HL,RX_HDR
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.MAIN			; DMA error, drop and continue
+	JR	C,.LP			; DMA error, drop and continue
 	; Filter: ARP reply, sender_ip == TARGET_IP
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_ARP
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_ARP
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14 + 6)
 	OR	A
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14 + 7)
 	CP	ARP_OP_REPLY
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	HL,RX_BUF + 14 + 14
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPIP
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	INC	HL
 	INC	DE
 	DJNZ	.CMPIP
@@ -405,62 +555,56 @@ WAIT_FOR_ARP_REPLY
 ;   Out: CF=0 OK, CF=1 timeout.
 ; ------------------------------------------------------
 WAIT_FOR_ICMP_REPLY
-.MAIN
+.LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
-	LD	BC,0
-.WAIT
-	CALL	@RTL.RING_HAS_PACKET
-	JR	NZ,.HAVE
-	DEC	BC
-	LD	A,B
-	OR	C
-	JR	NZ,.WAIT
-	LD	HL,(OUTER_LEFT)
+	CALL	TICK_AND_CHECK_KEY
+	JR	C,.TIMEOUT
+	LD	HL,(TIMEOUT_MS_LEFT)
 	DEC	HL
-	LD	(OUTER_LEFT),HL
+	LD	(TIMEOUT_MS_LEFT),HL
 	LD	A,H
 	OR	L
-	JR	Z,.TIMEOUT
-	JR	.MAIN
+	JR	NZ,.LP
+	JR	.TIMEOUT
 .HAVE
 	LD	HL,RX_HDR
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.MAIN
+	JR	C,.LP
 	; Filter: IPv4 / ICMP / echo reply / matching id.
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_IPV4
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_IPV4
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14)
 	CP	0x45
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14 + 9)
 	CP	IP_PROTO_ICMP
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	HL,RX_BUF + 14 + 12
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPSRC
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	INC	HL
 	INC	DE
 	DJNZ	.CMPSRC
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
 	CP	ICMP_T_ECHO_REP
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
 	CP	ECHO_ID_HI
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
 	CP	ECHO_ID_LO
-	JR	NZ,.MAIN
+	JR	NZ,.LP
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
 	LD	(REPLY_ID + 0),A
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
@@ -527,8 +671,6 @@ PRINT_DEC_A
 	POP	HL,DE,BC,AF
 	RET
 
-DEC_BUF		EQU APP_BSS_BASE + 22		; 4 bytes scratch for PRINT_DEC_A
-
 
 PUTCHAR
 	PUSH	AF,BC
@@ -581,45 +723,62 @@ REG_NAMES
 ; ------- in-EXE data -------
 N_NET_IP	DB "NET_IP",0
 N_NET_MAC	DB "NET_MAC",0
-TARGET_IP	DB 192, 168, 7, 1
 
 ; ------- runtime BSS (lives at APP_BSS_BASE, NOT in .EXE) --
 OUR_IP		EQU APP_BSS_BASE		; 4 bytes
 OUR_MAC		EQU APP_BSS_BASE + 4		; 6 bytes
-TARGET_MAC	EQU APP_BSS_BASE + 10		; 6 bytes
-OUTER_LEFT	EQU APP_BSS_BASE + 16		; 2 bytes
-REPLY_ID	EQU APP_BSS_BASE + 18		; 2 bytes
-REPLY_SEQ	EQU APP_BSS_BASE + 20		; 2 bytes
+TARGET_IP	EQU APP_BSS_BASE + 10		; 4 bytes (filled from positional arg)
+TARGET_MAC	EQU APP_BSS_BASE + 14		; 6 bytes
+TIMEOUT_MS_LEFT	EQU APP_BSS_BASE + 20		; 2 bytes
+REPLY_ID	EQU APP_BSS_BASE + 22		; 2 bytes
+REPLY_SEQ	EQU APP_BSS_BASE + 24		; 2 bytes
+DEC_BUF		EQU APP_BSS_BASE + 26		; 4 bytes scratch for PRINT_DEC_A
+COUNT		EQU APP_BSS_BASE + 30		; 1 byte (default 4, max 255)
+SENT		EQU APP_BSS_BASE + 31		; 1 byte
+RECVD		EQU APP_BSS_BASE + 32		; 1 byte
+SEQ_LO		EQU APP_BSS_BASE + 33		; 1 byte (must be adjacent to SEQ_HI)
+SEQ_HI		EQU APP_BSS_BASE + 34		; 1 byte
+CANCELLED	EQU APP_BSS_BASE + 35		; 1 byte (set by TICK_AND_CHECK_KEY)
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS PING v0.1",0
-MSG_PING_HDR	DB "PING ",0
-MSG_FROM	DB " from ",0
-MSG_P0		DB "[P0] INIT ",0
-MSG_OK		DB "OK",0
-MSG_P1		DB "[P1] ARP WHO-HAS ",0
-MSG_P2		DB "[P2] ARP REPLY MAC=",0
-MSG_P3		DB "[P3] BUILD ICMP OK",0
-MSG_P4		DB "[P4] SEND ",0
-MSG_P5		DB "[P5] WAIT REPLY",0
-MSG_P6_ID	DB "[P6] REPLY id=",0
-MSG_SEQ_EQ	DB " seq=",0
+MSG_BANNER	DB "RTL8019AS PING v0.2",0
+MSG_PINGING	DB "Pinging ",0
+MSG_WITH	DB " with ",0
+MSG_BYTES_DATA	DB " bytes of data:",0
+MSG_REPLY_FROM	DB "Reply from ",0
+MSG_BYTES_EQ	DB ": bytes=",0
+MSG_TIME_TTL	DB " time<1ms TTL=64",0
+MSG_TIMED_OUT	DB "Request timed out.",0
+MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
+MSG_STATS_HDR	DB "Ping statistics for ",0
+MSG_COLON	DB ":",0
+MSG_PACKETS_SENT DB "    Packets: Sent = ",0
+MSG_RECEIVED_EQ	DB ", Received = ",0
+MSG_LOST_EQ	DB ", Lost = ",0
+MSG_LOSS_END	DB ".",0
 MSG_REGS	DB "REGS ",0
 MSG_RESULT_OK	DB "RESULT OK",0
 MSG_RESULT_FAIL	DB "RESULT FAIL",0
 MSG_E_RESET	DB "[E60] RESET timeout",0
 MSG_E_SEND	DB "[E61] DMA write or PTX timeout",0
 MSG_E_ARP	DB "[E62] ARP reply timeout",0
-MSG_E_ICMP	DB "[E63] ICMP echo reply timeout",0
+MSG_USAGE_ERR	DB "[E] usage: missing or invalid target IPv4",0
+MSG_HELP
+	DB "Usage:",13,10
+	DB "  PING [-n count] target",13,10
+	DB "  PING /?",13,10,13,10
+	DB "  -n count  number of echo requests (default 4, max 255).",13,10
+	DB "  target    destination IPv4 (e.g. 192.168.7.1).",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
 
 
-	; netenv_lib transitively DEFINEs USE_UTIL_* helpers it needs,
-	; so it must be included BEFORE util.asm.
+	; netenv_lib / cmdline_lib transitively DEFINE USE_UTIL_*
+	; helpers they need, so they must be included BEFORE util.asm.
 	INCLUDE "netenv_lib.asm"
+	INCLUDE "cmdline_lib.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"

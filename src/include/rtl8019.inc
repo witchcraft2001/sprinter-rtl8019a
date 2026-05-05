@@ -138,7 +138,8 @@ ETH_FRAME_MAX	EQU 1518		; max frame including header (no FCS)
 EX_OK		EQU 0
 EX_USAGE	EQU 1
 EX_NO_HW	EQU 2
-EX_NIC_ERR	EQU 3
+EX_NIC_ERR	EQU 3				; alias of EX_NET_ERR (driver-level fail)
+EX_NET_ERR	EQU 3				; ARP/ICMP/UDP/TCP timeout, no route, etc.
 EX_CFG_ERR	EQU 4
 
 	ENDIF

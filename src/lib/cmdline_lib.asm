@@ -41,6 +41,17 @@
 
 	INCLUDE "memmap.inc"
 
+; DSS places the command line at IX-0x80, where IX is the entry
+; point.  For ORG 0x8080 / entry 0x8100 -> 0x8080 (small variant).
+; For ORG 0x4100 / entry 0x4200 -> 0x4180 (large variant).
+; Apps using the large variant must DEFINE CMDLINE_AT_LARGE
+; BEFORE including cmdline_lib (selects 0x4180 instead of 0x8080).
+	IFDEF CMDLINE_AT_LARGE
+CMDLINE_AT	EQU 0x4180
+	ELSE
+CMDLINE_AT	EQU 0x8080
+	ENDIF
+
 	IFDEF USE_CMDL
 	IFNDEF USE_UTIL_PARSE_DEC_BYTE
 	DEFINE USE_UTIL_PARSE_DEC_BYTE
@@ -54,7 +65,6 @@
 
 	IFDEF USE_CMDL
 
-CMDLINE_AT	EQU 0x8080
 MAX_ARGS	EQU 16
 
 ; Storage lives in runtime BSS (memmap.inc), NOT in the .EXE.
