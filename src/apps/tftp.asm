@@ -42,6 +42,7 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_READ_PACKET
 	DEFINE USE_ARP_BUILD_REQUEST
 	DEFINE USE_NETENV
+	DEFINE USE_RESOLVE
 	DEFINE USE_CMDL
 	DEFINE CMDLINE_AT_LARGE
 
@@ -106,13 +107,11 @@ START
 	CALL	@CMDL.IS_HELP
 	JP	NC,SHOW_HELP
 
-	; positional 0: host (IPv4)
+	; positional 0: host (IPv4 literal or hostname)
 	LD	B,0
 	CALL	@CMDL.GET_POSITIONAL
 	JP	C,USAGE_ERROR
-	LD	DE,TARGET_IP
-	CALL	@CMDL.PARSE_IPV4
-	JP	C,USAGE_ERROR
+	LD	(TARGET_HOST_PTR),HL
 
 	; positional 1: subcommand "GET" (only mode supported in v0.2)
 	LD	B,1
@@ -162,6 +161,13 @@ START
 	LD	(@ARP.OUR_MAC_PTR),HL
 	LD	HL,OUR_IP
 	LD	(@ARP.OUR_IP_PTR),HL
+
+	; Resolve target host (literal IPv4 or hostname).
+	LD	HL,(TARGET_HOST_PTR)
+	LD	DE,TARGET_IP
+	CALL	@RESOLVE.HOST
+	JP	C,RESOLVE_FAIL
+
 	; Init TFTP state.
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
@@ -347,6 +353,40 @@ FAIL_FILE
 FAIL_NIC
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	PRINT_REG_DUMP
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+
+RESOLVE_FAIL
+	LD	A,(@RESOLVE.LAST_FAIL)
+	CP	1
+	JR	Z,.USG
+	CP	2
+	JR	Z,.NDNS
+	CP	3
+	JR	Z,.NGW
+	CP	7
+	JR	Z,.CAN
+	PRINTLN MSG_E_RESOLVE
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+.USG
+	CALL	@ISA.ISA_CLOSE
+	JP	USAGE_ERROR
+.NDNS
+	PRINTLN MSG_E_NO_DNS1
+	CALL	@ISA.ISA_CLOSE
+	LD	B,4
+	JP	@UTIL.EXIT_FAIL
+.NGW
+	PRINTLN MSG_E_NO_GW
+	CALL	@ISA.ISA_CLOSE
+	LD	B,4
+	JP	@UTIL.EXIT_FAIL
+.CAN
+	PRINTLN MSG_ABORTED
 	CALL	@ISA.ISA_CLOSE
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
@@ -987,6 +1027,7 @@ IP_TOTAL_LEN	 EQU APP_BSS_BASE + 32		; 2 bytes
 UDP_LEN		 EQU APP_BSS_BASE + 34		; 2 bytes
 OUT_FH		 EQU APP_BSS_BASE + 36		; 1 byte (set to NO_HANDLE at startup)
 CANCELLED	 EQU APP_BSS_BASE + 37		; 1 byte
+TARGET_HOST_PTR	 EQU APP_BSS_BASE + 38		; 2 bytes (-> argv token)
 TFTP_PAYLOAD_PTR EQU APP_BSS_BASE + 38		; 2 bytes
 TFTP_PAYLOAD_LEN EQU APP_BSS_BASE + 40		; 2 bytes
 TFTP_DST_PORT_HI EQU APP_BSS_BASE + 42		; 1 byte
@@ -1008,6 +1049,9 @@ MSG_E_ARP	DB "ARP request timed out.",0
 MSG_E_TFTP	DB "TFTP timeout or server error.",0
 MSG_E_FILE	DB "[E] file create/write/close failed",0
 MSG_USAGE_ERR	DB "[E] usage: missing or invalid arguments",0
+MSG_E_RESOLVE	DB "[E] could not resolve host (DNS / ARP timeout or NXDOMAIN).",0
+MSG_E_NO_DNS1	DB "[E] NET_DNS1 not set; pass an IPv4 literal or run NETCFG/IFUP first.",0
+MSG_E_NO_GW	DB "[E] DNS server is off-subnet but NET_GW is not set.",0
 MSG_HELP
 	DB "Usage:",13,10
 	DB "  TFTP host GET filename",13,10
@@ -1028,6 +1072,8 @@ LINE_END	DB 13,10,0
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
 	INCLUDE "arp_lib.asm"
+	INCLUDE "resolve_lib.asm"
+	INCLUDE "dns_lib.asm"
 
 
 TFTP_IMAGE_END

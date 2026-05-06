@@ -49,6 +49,20 @@ respond to **Esc** and **Ctrl+C** while polling for replies.  A
 cancelled run prints `Aborted by user (Esc/Ctrl+C).` and returns
 `B=3`.
 
+### Hostnames vs IPv4 literals
+
+Utilities that take a destination (`PING`, `UDPTEST`,
+`TFTP`, `NTP`) accept either a dotted-decimal IPv4
+address or a DNS hostname.  When a hostname is supplied,
+the utility issues a DNS A-record query to `NET_DNS1`
+before the actual operation.  If `NET_DNS1` is unset,
+the utility prints a configuration error -- pass an IPv4
+literal or run `NETCFG -i` / `IFUP` first.
+
+`NSLOOKUP` is a separate utility for explicit DNS
+testing; the inline resolver in PING / UDPTEST / TFTP /
+NTP uses the same library.
+
 ### Configuration
 
 The kit relies on DSS environment variables populated by
