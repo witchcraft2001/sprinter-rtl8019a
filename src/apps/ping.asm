@@ -110,9 +110,28 @@ START
 	CALL	@CMDL.IS_HELP
 	JP	NC,SHOW_HELP
 
-	; -n count (default 4, max 255).
+	; Defaults: count=4 send, payload=32, TTL=64, timeout=1000ms,
+	; forever=off.
 	LD	A,4
 	LD	(COUNT),A
+	LD	A,32
+	LD	(PAYLOAD_LEN),A
+	LD	A,64
+	LD	(TTL_VAL),A
+	LD	HL,1000
+	LD	(TIMEOUT_MS_VAL),HL
+	XOR	A
+	LD	(FOREVER),A
+
+	; -t: ping forever.
+	LD	A,'t'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_T
+	LD	A,1
+	LD	(FOREVER),A
+.NO_T
+
+	; -n count (default 4, max 255).  Ignored when -t set.
 	LD	A,'n'
 	CALL	@CMDL.GET_FLAG_VALUE
 	JR	C,.NO_N
@@ -121,13 +140,57 @@ START
 	LD	A,H
 	OR	A
 	JR	Z,.SET_N
-	LD	L,255			; cap at 255
+	LD	L,255
 .SET_N
 	LD	A,L
 	OR	A
 	JP	Z,USAGE_ERROR
 	LD	(COUNT),A
 .NO_N
+
+	; -l size (default 32, cap 255).
+	LD	A,'l'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_L
+	CALL	@CMDL.PARSE_U16
+	JP	C,USAGE_ERROR
+	LD	A,H
+	OR	A
+	JR	Z,.SET_L
+	LD	L,255
+.SET_L
+	LD	A,L
+	LD	(PAYLOAD_LEN),A
+.NO_L
+
+	; -i TTL (default 64, range 1..255).
+	LD	A,'i'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_I
+	CALL	@CMDL.PARSE_U16
+	JP	C,USAGE_ERROR
+	LD	A,H
+	OR	A
+	JR	Z,.SET_I
+	LD	L,255
+.SET_I
+	LD	A,L
+	OR	A
+	JP	Z,USAGE_ERROR
+	LD	(TTL_VAL),A
+.NO_I
+
+	; -w MS (default 1000, range 1..65535).
+	LD	A,'w'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_W
+	CALL	@CMDL.PARSE_U16
+	JP	C,USAGE_ERROR
+	LD	A,H
+	OR	L
+	JP	Z,USAGE_ERROR
+	LD	(TIMEOUT_MS_VAL),HL
+.NO_W
 
 	; Mandatory positional: target IPv4.
 	LD	B,0
@@ -165,7 +228,7 @@ START
 	LD	HL,TARGET_IP
 	CALL	PRINT_IPV4
 	PRINT MSG_WITH
-	LD	A,ICMP_PAYLOAD_LEN
+	LD	A,(PAYLOAD_LEN)
 	CALL	PRINT_DEC_A
 	PRINTLN MSG_BYTES_DATA
 
@@ -192,38 +255,59 @@ START
 	LD	(SEQ_HI),A
 
 PING_LOOP
+	; Stop condition: -t -> never; otherwise SENT < COUNT.
+	LD	A,(FOREVER)
+	OR	A
+	JR	NZ,.LIVE
 	LD	A,(SENT)
 	LD	HL,COUNT
 	CP	(HL)
-	JR	NC,PING_LOOP_END
-
+	JP	NC,PING_LOOP_END
+.LIVE
 	; Build and send ICMP echo with current SEQ.
 	CALL	BUILD_ICMP_ECHO
 	LD	HL,TX_BUF
-	LD	BC,ICMP_FRAME_LEN
+	; BC = 14 + IP_HDR_LEN + ICMP_HDR_LEN + PAYLOAD_LEN = 42 + payload.
+	LD	A,(PAYLOAD_LEN)
+	ADD	A,42
+	LD	C,A
+	LD	B,0
+	JR	NC,.NO_HC
+	INC	B
+.NO_HC
 	CALL	@RTL.SEND_FRAME
 	JP	C,SEND_FAIL
+	; Saturate SENT counter at 255 (overflow stays at 255 in -t mode).
 	LD	A,(SENT)
+	CP	255
+	JR	Z,.SENT_SAT
 	INC	A
 	LD	(SENT),A
+.SENT_SAT
 
 	; Wait for matching reply.
-	LD	HL,ICMP_TIMEOUT_MS
+	LD	HL,(TIMEOUT_MS_VAL)
 	LD	(TIMEOUT_MS_LEFT),HL
 	CALL	WAIT_FOR_ICMP_REPLY
 	JR	C,.TIMED_OUT
 
-	; "Reply from X.X.X.X: bytes=N time<1ms TTL=64"
+	; "Reply from X.X.X.X: bytes=N time<1ms TTL=...".
 	PRINT MSG_REPLY_FROM
 	LD	HL,TARGET_IP
 	CALL	PRINT_IPV4
 	PRINT MSG_BYTES_EQ
-	LD	A,ICMP_PAYLOAD_LEN
+	LD	A,(PAYLOAD_LEN)
 	CALL	PRINT_DEC_A
-	PRINTLN MSG_TIME_TTL
+	PRINT MSG_TIME_TTL_PRE
+	LD	A,(TTL_VAL)
+	CALL	PRINT_DEC_A
+	PRINT LINE_END
 	LD	A,(RECVD)
+	CP	255
+	JR	Z,.RECVD_SAT
 	INC	A
 	LD	(RECVD),A
+.RECVD_SAT
 	JR	.NEXT_SEQ
 
 .TIMED_OUT
@@ -237,10 +321,10 @@ PING_LOOP
 .NEXT_SEQ
 	LD	HL,SEQ_LO
 	INC	(HL)
-	JR	NZ,PING_LOOP
+	JP	NZ,PING_LOOP
 	INC	HL			; HL = SEQ_HI (adjacent)
 	INC	(HL)
-	JR	PING_LOOP
+	JP	PING_LOOP
 
 PING_LOOP_END
 	; If user cancelled mid-loop, mention it before stats.
@@ -355,11 +439,19 @@ BUILD_ICMP_ECHO
 	XOR	A
 	LD	(DE),A
 	INC	DE
-	LD	A,HIGH (IP_HDR_LEN + ICMP_HDR_LEN + ICMP_PAYLOAD_LEN)
-	LD	(DE),A
+	; IP total length = IP_HDR_LEN + ICMP_HDR_LEN + payload = 28 + payload.
+	LD	A,(PAYLOAD_LEN)
+	ADD	A,IP_HDR_LEN + ICMP_HDR_LEN
+	LD	C,A
+	LD	B,0
+	JR	NC,.IPLEN
+	INC	B
+.IPLEN
+	LD	A,B
+	LD	(DE),A			; total length hi
 	INC	DE
-	LD	A,LOW (IP_HDR_LEN + ICMP_HDR_LEN + ICMP_PAYLOAD_LEN)
-	LD	(DE),A
+	LD	A,C
+	LD	(DE),A			; total length lo
 	INC	DE
 	XOR	A
 	LD	(DE),A
@@ -372,7 +464,7 @@ BUILD_ICMP_ECHO
 	INC	DE
 	LD	(DE),A
 	INC	DE
-	LD	A,64
+	LD	A,(TTL_VAL)
 	LD	(DE),A
 	INC	DE
 	LD	A,IP_PROTO_ICMP
@@ -414,13 +506,17 @@ BUILD_ICMP_ECHO
 	LD	(DE),A
 	INC	DE
 
-	LD	B,ICMP_PAYLOAD_LEN
+	LD	A,(PAYLOAD_LEN)
+	OR	A
+	JR	Z,.PAY_DONE
+	LD	B,A
 	XOR	A
 .PAY
 	LD	(DE),A
 	INC	DE
 	INC	A
 	DJNZ	.PAY
+.PAY_DONE
 
 	; IP checksum over TX_BUF+14, length 20.
 	PUSH	IX
@@ -433,10 +529,17 @@ BUILD_ICMP_ECHO
 	LD	A,L
 	LD	(TX_BUF + 14 + 11),A
 
-	; ICMP checksum over TX_BUF+34, length 40.
+	; ICMP checksum over TX_BUF+34, length = ICMP_HDR_LEN + payload.
+	; Must be even length for CHECKSUM; payload sizes default to even.
 	PUSH	IX
 	LD	IX,TX_BUF + 14 + IP_HDR_LEN
-	LD	BC,ICMP_HDR_LEN + ICMP_PAYLOAD_LEN
+	LD	A,(PAYLOAD_LEN)
+	ADD	A,ICMP_HDR_LEN
+	LD	C,A
+	LD	B,0
+	JR	NC,.CKLEN
+	INC	B
+.CKLEN
 	CALL	@UTIL.CHECKSUM
 	POP	IX
 	LD	A,H
@@ -738,6 +841,10 @@ RECVD		EQU APP_BSS_BASE + 32		; 1 byte
 SEQ_LO		EQU APP_BSS_BASE + 33		; 1 byte (must be adjacent to SEQ_HI)
 SEQ_HI		EQU APP_BSS_BASE + 34		; 1 byte
 CANCELLED	EQU APP_BSS_BASE + 35		; 1 byte (set by TICK_AND_CHECK_KEY)
+PAYLOAD_LEN	EQU APP_BSS_BASE + 36		; 1 byte (-l size, default 32)
+TTL_VAL		EQU APP_BSS_BASE + 37		; 1 byte (-i TTL, default 64)
+TIMEOUT_MS_VAL	EQU APP_BSS_BASE + 38		; 2 bytes (-w ms, default 1000)
+FOREVER		EQU APP_BSS_BASE + 40		; 1 byte (1 if -t set)
 
 
 ; ------- messages -------
@@ -747,7 +854,7 @@ MSG_WITH	DB " with ",0
 MSG_BYTES_DATA	DB " bytes of data:",0
 MSG_REPLY_FROM	DB "Reply from ",0
 MSG_BYTES_EQ	DB ": bytes=",0
-MSG_TIME_TTL	DB " time<1ms TTL=64",0
+MSG_TIME_TTL_PRE DB " time<1ms TTL=",0
 MSG_TIMED_OUT	DB "Request timed out.",0
 MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
 MSG_STATS_HDR	DB "Ping statistics for ",0
@@ -763,9 +870,13 @@ MSG_E_ARP	DB "[E62] ARP reply timeout",0
 MSG_USAGE_ERR	DB "[E] usage: missing or invalid target IPv4",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  PING [-n count] target",13,10
+	DB "  PING [-t] [-n count] [-l size] [-i TTL] [-w ms] target",13,10
 	DB "  PING /?",13,10,13,10
+	DB "  -t        ping until interrupted (Esc/Ctrl+C).",13,10
 	DB "  -n count  number of echo requests (default 4, max 255).",13,10
+	DB "  -l size   payload size in bytes (default 32, max 255).",13,10
+	DB "  -i TTL    IP TTL on outgoing requests (default 64).",13,10
+	DB "  -w ms     per-reply wait timeout (default 1000 ms).",13,10
 	DB "  target    destination IPv4 (e.g. 192.168.7.1).",13,10,0
 LINE_END	DB 13,10,0
 
@@ -788,8 +899,10 @@ RX_BUF_SIZE	EQU 1518
 
 	MODULE MAIN
 
+; Largest ICMP echo frame we may send: 14 + 20 + 8 + 255 = 297 bytes.
+ICMP_FRAME_MAX	EQU 14 + IP_HDR_LEN + ICMP_HDR_LEN + 255
 TX_BUF		EQU PING_IMAGE_END
-RX_HDR		EQU TX_BUF + ICMP_FRAME_LEN
+RX_HDR		EQU TX_BUF + ICMP_FRAME_MAX
 RX_BUF		EQU RX_HDR + 4
 PING_BSS_END	EQU RX_BUF + RX_BUF_SIZE
 

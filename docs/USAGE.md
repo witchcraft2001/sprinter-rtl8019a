@@ -190,14 +190,22 @@ and is not persisted; an "arp -a" listing is not available in v0.2.
 Sends ICMP echo requests, prints replies and per-run statistics.
 
 ```
-PING [-n count] target
+PING [-t] [-n count] [-l size] [-i TTL] [-w ms] target
 PING /?
 ```
 
-| Option   | Meaning                                              |
-|----------|------------------------------------------------------|
-| `-n N`   | Number of echo requests, default 4, max 255          |
-| `target` | Destination IPv4                                     |
+| Option   | Meaning                                                |
+|----------|--------------------------------------------------------|
+| `-t`     | Ping until interrupted (Esc / Ctrl+C).                 |
+| `-n N`   | Number of echo requests (default 4, max 255).          |
+| `-l N`   | Payload size in bytes (default 32, max 255).           |
+| `-i TTL` | IP TTL on outgoing requests (default 64).              |
+| `-w MS`  | Per-reply wait timeout in milliseconds (default 1000). |
+| `target` | Destination IPv4.                                      |
+
+`-t` and `-n` are mutually compatible: when `-t` is supplied, the
+count from `-n` is ignored and the loop continues until the user
+cancels.
 
 Example output:
 
@@ -218,14 +226,9 @@ RESULT OK
 Exit codes: 0 if at least one reply was received, 3 if all timed
 out, 1 usage, 2 no NIC, 4 config.
 
-Notes on missing Windows flags: `-t` (ping forever), `-l` (payload
-size), `-i` (TTL), and `-w` (per-reply timeout) are not yet
-implemented.  Defaults: 32-byte payload, TTL=64, 1 sec per-reply
-budget.
-
 Timing resolution on the Sprinter Z80 is below 1 ms for LAN
 exchanges, so all replies show `time<1ms`.  A finer resolution
-will arrive together with `-w`.
+is planned alongside a per-reply RTT measurement upgrade.
 
 
 ## UDPTEST.EXE
@@ -295,6 +298,47 @@ Exit codes: 0 ok, 1 usage (including `PUT`), 2 no NIC,
 Cancelling with Esc/Ctrl+C closes the partial output file.
 
 
+## NTP.EXE
+
+Minimal NTPv3 client.  Sends a 48-byte client query to UDP
+port 123, receives the server's reply, and prints the time
+in UTC and local timezone.
+
+```
+NTP server-ipv4
+NTP /?
+```
+
+| Option         | Meaning                                          |
+|----------------|--------------------------------------------------|
+| `server-ipv4`  | Numeric IPv4 of the NTP server.  No DNS yet, so |
+|                | provide a literal address.                       |
+
+Example:
+
+```
+RTL8019AS NTP v0.1
+
+Querying NTP at 192.168.7.1 from 192.168.7.119
+Reply: stratum=2
+NTP transmit timestamp: 0xEDA5F312 (seconds since 1900-01-01)
+UTC time:   2026-05-06 17:04:18
+Local time: 2026-05-06 22:04:18 (TZ +5)
+RESULT OK
+```
+
+The local-time line is computed by adding `NET_TZ` (signed
+integer hours, e.g. `+3`, `-5`, `0`) to the UTC seconds.
+Missing or unparseable `NET_TZ` is treated as UTC+0.
+
+Exit codes: 0 ok, 1 usage, 2 no NIC, 3 ARP/NTP timeout,
+4 config.
+
+NTP currently does NOT write the parsed time back into the
+DSS system clock (`DSS_SETTIME`).  This is a planned v0.2
+addition.  For now the utility is read-only.
+
+
 ## Batch examples
 
 A typical `AUTOEXEC.BAT` fragment to bring the network up:
@@ -302,6 +346,8 @@ A typical `AUTOEXEC.BAT` fragment to bring the network up:
 ```text
 NETCFG -i
 IF ERRORLEVEL 4 GOTO NOCFG
+IFUP
+IF ERRORLEVEL 3 GOTO NOLINK
 PING -n 1 192.168.7.1
 IF ERRORLEVEL 3 GOTO NOLINK
 ECHO Network up.
