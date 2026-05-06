@@ -24,12 +24,14 @@ BUILD_APPS=(
   udptest
   tftp
   netcfg
+  ifup
 )
 
 # Text/documentation files copied to the distribution root.
 # docs/MAME_NETWORK.md is intentionally NOT shipped: it is developer-only.
 DIST_DOC_FILES=(
   README.md
+  docs/USAGE.md
   LICENSE
 )
 

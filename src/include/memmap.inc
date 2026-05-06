@@ -45,11 +45,23 @@ NETCFG_DNS1		EQU 0xA212	; 4 bytes
 NETCFG_DNS2		EQU 0xA216	; 4 bytes
 NETCFG_NTP		EQU 0xA21A	; 32 bytes
 NETCFG_TZ		EQU 0xA23A	; 1 byte
+NETCFG_DHCP_MODE	EQU 0xA23C	; 1 byte (1 if IP=DHCP, 0 otherwise)
 NETCFG_LOAD_FH		EQU 0xA23B	; 1 byte
 NETCFG_LOAD_BUF		EQU 0xA240	; 1024 bytes
 NETCFG_LOAD_BUF_SIZE	EQU 1024
 NETCFG_TMP_IP		EQU 0xA640	; 4 bytes (parser scratch)
 NETCFG_TMP_MAC		EQU 0xA644	; 6 bytes (parser scratch)
+
+; dhcp_lib: parsed-field outputs.  Active only in IFUP.EXE.
+DHCP_XID		EQU 0xA800	; 4 bytes (transaction id, host order)
+DHCP_MSG_TYPE		EQU 0xA804	; 1 byte (option 53 from reply)
+DHCP_OFFERED_IP		EQU 0xA805	; 4 bytes (yiaddr from OFFER/ACK)
+DHCP_SERVER_ID		EQU 0xA809	; 4 bytes (option 54)
+DHCP_MASK		EQU 0xA80D	; 4 bytes (option 1)
+DHCP_ROUTER		EQU 0xA811	; 4 bytes (option 3)
+DHCP_DNS1		EQU 0xA815	; 4 bytes (option 6, first)
+DHCP_DNS2		EQU 0xA819	; 4 bytes (option 6, second)
+DHCP_LEASE_SECS		EQU 0xA81D	; 4 bytes (option 51, BE)
 
 ; ----- Per-app private BSS (0xB000+) ---------------------
 

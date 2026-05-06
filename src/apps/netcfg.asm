@@ -328,8 +328,28 @@ DO_CHECK
 DO_INIT
 	PRINTLN MSG_INITIALIZING
 	CALL	@NETCFG.LOAD
-	JR	C,.MISS
-	; Push each known field into env.
+	JP	C,.MISS
+	; Always push MAC, NTP, TZ.
+	LD	HL,N_NET_MAC
+	LD	IX,@NETCFG.OUR_MAC
+	CALL	SETENV_MAC
+	LD	HL,N_NET_NTP
+	LD	IX,@NETCFG.NTP
+	CALL	SETENV_STR
+	LD	HL,N_NET_TZ
+	LD	A,(@NETCFG.TZ)
+	CALL	SETENV_TZ
+
+	; IP_SRC and the IP/MASK/GW/DNS group depend on whether
+	; NET.CFG asked for DHCP.
+	LD	A,(@NETCFG.DHCP_MODE)
+	OR	A
+	JR	NZ,.DHCP_MODE
+
+	; STATIC: SETENV NET_IP_SRC=STATIC and the four IPv4 fields.
+	LD	HL,N_NET_IP_SRC
+	LD	DE,V_STATIC
+	CALL	SETENV_LITERAL
 	LD	HL,N_NET_IP
 	LD	IX,@NETCFG.OUR_IP
 	CALL	SETENV_IPV4
@@ -345,26 +365,53 @@ DO_INIT
 	LD	HL,N_NET_DNS2
 	LD	IX,@NETCFG.DNS2
 	CALL	SETENV_IPV4
-	LD	HL,N_NET_MAC
-	LD	IX,@NETCFG.OUR_MAC
-	CALL	SETENV_MAC
-	LD	HL,N_NET_NTP
-	LD	IX,@NETCFG.NTP
-	CALL	SETENV_STR
-	LD	HL,N_NET_TZ
-	LD	A,(@NETCFG.TZ)
-	CALL	SETENV_TZ
-	; STATIC source for now (DHCP stage adds dynamic case).
+	JR	.SHOW
+
+.DHCP_MODE
+	; DHCP: SETENV NET_IP_SRC=DHCP and clear the dynamic fields
+	; (so old leases from a previous run don't linger).  IFUP
+	; will populate NET_IP / NET_MASK / NET_GW / NET_DNS* / etc.
 	LD	HL,N_NET_IP_SRC
-	LD	DE,V_STATIC
+	LD	DE,V_DHCP
 	CALL	SETENV_LITERAL
-	; Show what we loaded.
+	LD	HL,N_NET_IP
+	CALL	DELETE_VAR
+	LD	HL,N_NET_MASK
+	CALL	DELETE_VAR
+	LD	HL,N_NET_GW
+	CALL	DELETE_VAR
+	LD	HL,N_NET_DNS1
+	CALL	DELETE_VAR
+	LD	HL,N_NET_DNS2
+	CALL	DELETE_VAR
+
+.SHOW
 	PRINT LINE_END
 	JP	DO_SHOW
 .MISS
 	PRINTLN MSG_INIT_MISS
 	LD	B,4
 	JP	@UTIL.EXIT_FAIL
+
+
+; ------------------------------------------------------
+; DELETE_VAR: SETENV "<NAME>=" to remove the entry.
+;   In: HL = ASCIIZ name.
+; ------------------------------------------------------
+DELETE_VAR
+	LD	DE,SET_BUF
+	CALL	COPY_ASCIIZ
+	DEC	DE
+	LD	A,'='
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	LD	HL,SET_BUF
+	LD	B,ENV_SET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	RET
 
 
 ; ------------------------------------------------------
@@ -663,6 +710,7 @@ N_NET_TZ	DB "NET_TZ",0
 		DB 0			; table terminator
 
 V_STATIC	DB "STATIC",0
+V_DHCP		DB "DHCP",0
 
 LINE_END	DB 13,10,0
 

@@ -70,6 +70,7 @@ DNS1		EQU NETCFG_DNS1
 DNS2		EQU NETCFG_DNS2
 NTP		EQU NETCFG_NTP
 TZ		EQU NETCFG_TZ
+DHCP_MODE	EQU NETCFG_DHCP_MODE
 LOAD_FH		EQU NETCFG_LOAD_FH
 LOAD_BUF	EQU NETCFG_LOAD_BUF
 
@@ -155,6 +156,8 @@ APPLY_DEFAULTS
 	LDIR
 	LD	A,3
 	LD	(TZ),A
+	XOR	A
+	LD	(DHCP_MODE),A
 	RET
 
 .D_MAC		DB 0x02, 0x80, 0x19, 0x11, 0x22, 0x33
@@ -164,6 +167,52 @@ APPLY_DEFAULTS
 .D_DNS1		DB 1, 1, 1, 1
 .D_DNS2		DB 8, 8, 8, 8
 .D_NTP		DB "pool.ntp.org",0
+
+
+; ------------------------------------------------------
+; MATCH_DHCP: HL points just past "IP=" of a config line.
+; ZF=1 if the value is the literal "DHCP" / "dhcp" / "Dhcp"
+; (case-insensitive) followed by end-of-line (0/CR/LF).  HL
+; is preserved either way.
+; Trashes A, B.
+; ------------------------------------------------------
+MATCH_DHCP
+	PUSH	HL
+	LD	A,(HL)
+	OR	0x20			; lower-case bit
+	CP	'd'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	OR	0x20
+	CP	'h'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	OR	0x20
+	CP	'c'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	OR	0x20
+	CP	'p'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	OR	A
+	JR	Z,.YES
+	CP	13
+	JR	Z,.YES
+	CP	10
+	JR	Z,.YES
+.NO
+	POP	HL
+	OR	1			; ZF=0
+	RET
+.YES
+	POP	HL
+	XOR	A			; ZF=1
+	RET
 
 
 ; ------------------------------------------------------
@@ -220,6 +269,14 @@ PARSE
 .IP
 	LD	BC,3			; len("IP=")
 	ADD	HL,BC
+	; Detect literal "DHCP" / "dhcp" (case-insensitive).
+	CALL	MATCH_DHCP
+	JR	NZ,.IP_NUM
+	; DHCP mode -- mark and skip the rest of the line.
+	LD	A,1
+	LD	(DHCP_MODE),A
+	JP	SKIP_TO_NEXT_LINE
+.IP_NUM
 	LD	DE,OUR_IP
 	CALL	PARSE_IPV4_LINE
 	JP	.LINE
