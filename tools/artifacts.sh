@@ -25,6 +25,7 @@ BUILD_APPS=(
   tftp
   netcfg
   ifup
+  ntp
 )
 
 # Text/documentation files copied to the distribution root.
