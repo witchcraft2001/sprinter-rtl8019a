@@ -298,6 +298,50 @@ Exit codes: 0 ok, 1 usage (including `PUT`), 2 no NIC,
 Cancelling with Esc/Ctrl+C closes the partial output file.
 
 
+## NSLOOKUP.EXE
+
+Single-shot DNS resolver.  Sends one A-record query over
+UDP/53 and prints the first address from the answer.
+
+```
+NSLOOKUP host [server-ip]
+NSLOOKUP /?
+```
+
+| Option       | Meaning                                                |
+|--------------|--------------------------------------------------------|
+| `host`       | Hostname to resolve (e.g. `pool.ntp.org`).             |
+| `server-ip`  | Optional DNS server IPv4.  Defaults to `NET_DNS1`.     |
+
+Next-hop selection: if the DNS server is on the same
+subnet as `NET_IP` (using `NET_MASK`), NSLOOKUP ARPs the
+server directly.  Otherwise it ARPs `NET_GW` -- so an
+upstream resolver like `8.8.8.8` requires a working
+gateway plus host-side NAT or routing.  Without
+`NET_MASK` the server is assumed reachable directly.
+
+Example:
+
+```
+RTL8019AS NSLOOKUP v0.1
+
+Querying google.com at 192.168.7.1 from 192.168.7.101
+Name:    google.com
+Address: 74.125.205.113
+RESULT OK
+```
+
+Exit codes: 0 ok, 1 usage / invalid hostname,
+2 no NIC, 3 ARP/DNS timeout / server returned NXDOMAIN
+or no A record, 4 config (`NET_DNS1` missing without
+`server-ip` arg, or off-subnet server with no `NET_GW`).
+
+Only A records and a single-question query are handled
+in v0.1; AAAA, CNAME chasing, MX, and multi-question are
+not supported.  Recursion is delegated to the server
+(RD=1 in the query).
+
+
 ## NTP.EXE
 
 Minimal NTPv3 client.  Sends a 48-byte client query to UDP

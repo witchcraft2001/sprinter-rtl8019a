@@ -1,0 +1,896 @@
+; ======================================================
+; NSLOOKUP.EXE - DNS A-record resolver / diagnostic for
+; the Sprinter RTL8019AS network kit.
+;
+;   NSLOOKUP host [server-ip]
+;   NSLOOKUP /?
+;
+; Sends a single DNS query for an A record over UDP/53.
+; If "server-ip" is omitted, NET_DNS1 from environment is
+; used.  Next-hop selection: if the server falls inside
+; (OUR_IP & NET_MASK), ARP the server directly; otherwise
+; ARP NET_GW.  Without NET_MASK / NET_GW the server is
+; assumed reachable directly.
+;
+; Stage codes:
+;   [N0] init (banner, env)
+;   [N1] ARP next hop
+;   [N2] BUILD query
+;   [N3] SEND
+;   [N4] WAIT REPLY
+;   [N5] PARSE -> RESULT OK
+; ======================================================
+
+EXE_VERSION		EQU 1
+
+	DEVICE NOSLOT64K
+
+	INCLUDE "macro.inc"
+	INCLUDE "dss.inc"
+	INCLUDE "memmap.inc"
+	INCLUDE "rtl8019.inc"
+
+	DEFINE USE_RTL_INIT_NORMAL
+	DEFINE USE_RTL_SEND_FRAME
+	DEFINE USE_RTL_WAIT_PTX
+	DEFINE USE_RTL_RING_HAS_PACKET
+	DEFINE USE_RTL_READ_PACKET
+	DEFINE USE_ARP_BUILD_REQUEST
+	DEFINE USE_NETENV
+	DEFINE USE_CMDL
+	DEFINE USE_DNS
+	DEFINE CMDLINE_AT_LARGE
+
+ARP_TIMEOUT_MS	EQU 3000
+DNS_TIMEOUT_MS	EQU 3000
+SCAN_C		EQU 0xAC
+
+ETH_TYPE_ARP	EQU 0x0806
+ETH_TYPE_IPV4	EQU 0x0800
+IP_PROTO_UDP	EQU 17
+
+ARP_OP_REQUEST	EQU 1
+ARP_OP_REPLY	EQU 2
+
+ARP_FRAME_LEN	EQU 60
+IP_HDR_LEN	EQU 20
+UDP_HDR_LEN	EQU 8
+
+OUR_PORT_HI	EQU 0xC1
+OUR_PORT_LO	EQU 0x00
+
+	MODULE MAIN
+
+	ORG 0x4100
+
+EXE_HEADER
+	DB "EXE"
+	DB EXE_VERSION
+	DW 0x0100
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW 0
+	DW START
+	DW START
+	DW 0xBFFF
+	DS 234, 0
+
+	ORG 0x4200
+
+START
+	PRINTLN MSG_BANNER
+
+	XOR	A
+	LD	(CANCELLED),A
+
+	CALL	@CMDL.PARSE
+	CALL	@CMDL.IS_HELP
+	JP	NC,SHOW_HELP
+
+	; positional 0: hostname (ASCIIZ token in cmdline buffer)
+	LD	B,0
+	CALL	@CMDL.GET_POSITIONAL
+	JP	C,USAGE_ERROR
+	LD	A,(HL)
+	OR	A
+	JP	Z,USAGE_ERROR			; empty string
+	LD	(HOSTNAME_PTR),HL
+
+	; positional 1: optional explicit DNS server IPv4
+	LD	A,0xFF
+	LD	(HAS_SERVER_ARG),A
+	LD	B,1
+	CALL	@CMDL.GET_POSITIONAL
+	JR	C,.NO_SRV
+	LD	DE,DNS_IP
+	CALL	@CMDL.PARSE_IPV4
+	JP	C,USAGE_ERROR
+	JR	.SRV_OK
+.NO_SRV
+	XOR	A
+	LD	(HAS_SERVER_ARG),A
+.SRV_OK
+
+	; Pull NET_IP, NET_MAC.
+	LD	HL,N_NET_IP
+	LD	DE,OUR_IP
+	CALL	@NETENV.REQUIRE_IP
+	LD	HL,N_NET_MAC
+	LD	DE,OUR_MAC
+	CALL	@NETENV.REQUIRE_MAC
+
+	; If no explicit server arg, read NET_DNS1.
+	LD	A,(HAS_SERVER_ARG)
+	OR	A
+	JR	NZ,.HAVE_DNS_IP
+	LD	HL,N_NET_DNS1
+	LD	DE,DNS_IP
+	CALL	@NETENV.GET_IP
+	JP	C,DNS1_MISSING
+.HAVE_DNS_IP
+
+	; Optional NET_MASK (used for next-hop decision).
+	LD	HL,N_NET_MASK
+	LD	DE,NET_MASK_BUF
+	CALL	@NETENV.GET_IP
+	LD	A,0
+	JR	C,.NO_MASK
+	LD	A,1
+.NO_MASK
+	LD	(HAS_NETMASK),A
+
+	; Optional NET_GW (used when server is off-subnet).
+	LD	HL,N_NET_GW
+	LD	DE,NET_GW_BUF
+	CALL	@NETENV.GET_IP
+	LD	A,0
+	JR	C,.NO_GW
+	LD	A,1
+.NO_GW
+	LD	(HAS_GW),A
+
+	; Init NIC.
+	LD	A,1
+	LD	(@ISA.ISA_SLOT),A
+	CALL	@ISA.ISA_OPEN
+	CALL	@RTL.RESET
+	JP	C,RESET_FAIL
+	LD	HL,OUR_MAC
+	LD	A,RCR_AB
+	CALL	@RTL.INIT_NORMAL
+	LD	HL,OUR_MAC
+	LD	(@ARP.OUR_MAC_PTR),HL
+	LD	HL,OUR_IP
+	LD	(@ARP.OUR_IP_PTR),HL
+
+	; Banner: "Querying <host> at <DNS_IP> from <OUR_IP>"
+	PRINT LINE_END
+	PRINT MSG_QUERYING
+	LD	HL,(HOSTNAME_PTR)
+	LD	C,DSS_PCHARS
+	RST	DSS
+	PRINT MSG_AT
+	LD	HL,DNS_IP
+	CALL	PRINT_IPV4
+	PRINT MSG_FROM_HOST
+	LD	HL,OUR_IP
+	CALL	PRINT_IPV4
+	PRINT LINE_END
+
+	; Decide next-hop.  If NET_MASK present and DNS_IP is on
+	; same subnet as OUR_IP -> NEXT_HOP = DNS_IP.  Otherwise
+	; NEXT_HOP = NET_GW (must be set).
+	CALL	DECIDE_NEXT_HOP
+	JP	C,GW_MISSING
+
+	; ARP resolve next hop.
+	LD	DE,TX_BUF
+	LD	HL,NEXT_HOP_IP
+	CALL	@ARP.BUILD_REQUEST
+	LD	HL,TX_BUF
+	LD	BC,ARP_FRAME_LEN
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+	LD	HL,ARP_TIMEOUT_MS
+	LD	(TIMEOUT_MS_LEFT),HL
+	CALL	WAIT_FOR_ARP_REPLY
+	JP	C,ARP_TIMEOUT
+
+	; Generate XID from R register XOR low byte of SP.
+	LD	A,R
+	LD	B,A
+	LD	HL,0
+	ADD	HL,SP
+	LD	A,L
+	XOR	B
+	LD	(XID_LO),A
+	LD	A,H
+	XOR	B
+	LD	(XID_HI),A
+
+	; Build full Ethernet+IP+UDP+DNS frame in TX_BUF.
+	CALL	BUILD_DNS_QUERY
+	JP	C,BUILD_FAIL
+
+	LD	HL,TX_BUF
+	LD	BC,(QUERY_FRAME_LEN)
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+
+	; Wait for matching DNS reply.
+	LD	HL,DNS_TIMEOUT_MS
+	LD	(TIMEOUT_MS_LEFT),HL
+	CALL	WAIT_FOR_DNS_REPLY
+	JP	C,DNS_TIMEOUT
+
+	; Parse: HL = DNS payload start, BC = DNS msg length,
+	; DE = output buffer, IY = expected XID.  Use PUSH/POP
+	; instead of LD IYH/IYL,A to avoid relying on undoc opcodes.
+	LD	A,(XID_HI)
+	LD	H,A
+	LD	A,(XID_LO)
+	LD	L,A
+	PUSH	HL
+	POP	IY
+	LD	HL,(DNS_MSG_PTR)
+	LD	BC,(DNS_MSG_LEN)
+	LD	DE,RESOLVED_IP
+	CALL	@DNS.PARSE_REPLY
+	JP	C,DNS_PARSE_FAIL
+
+	; "Name:    google.com"
+	; "Address: 142.250.180.142"
+	PRINT MSG_NAME
+	LD	HL,(HOSTNAME_PTR)
+	LD	C,DSS_PCHARS
+	RST	DSS
+	PRINT LINE_END
+	PRINT MSG_ADDRESS
+	LD	HL,RESOLVED_IP
+	CALL	PRINT_IPV4
+	PRINT LINE_END
+
+	CALL	@ISA.ISA_CLOSE
+	JP	@UTIL.EXIT_OK
+
+
+; ------------------------------------------------------
+; DECIDE_NEXT_HOP: pick ARP target based on subnet match.
+;   Out: NEXT_HOP_IP filled.  CF=1 if off-subnet and no
+;        NET_GW available.
+; ------------------------------------------------------
+DECIDE_NEXT_HOP
+	LD	A,(HAS_NETMASK)
+	OR	A
+	JR	Z,.DIRECT			; no mask -> direct
+	; Compare (DNS_IP & MASK) vs (OUR_IP & MASK), 4 bytes.
+	LD	HL,DNS_IP
+	LD	DE,OUR_IP
+	LD	IX,NET_MASK_BUF
+	LD	B,4
+.LP
+	LD	A,(IX+0)
+	AND	(HL)
+	LD	C,A
+	LD	A,(DE)
+	AND	(IX+0)
+	CP	C
+	JR	NZ,.OFFNET
+	INC	HL
+	INC	DE
+	INC	IX
+	DJNZ	.LP
+.DIRECT
+	LD	HL,DNS_IP
+	LD	DE,NEXT_HOP_IP
+	LD	BC,4
+	LDIR
+	OR	A
+	RET
+.OFFNET
+	LD	A,(HAS_GW)
+	OR	A
+	SCF
+	RET	Z
+	LD	HL,NET_GW_BUF
+	LD	DE,NEXT_HOP_IP
+	LD	BC,4
+	LDIR
+	OR	A
+	RET
+
+
+; ------------------------------------------------------
+; BUILD_DNS_QUERY: full ETH+IP+UDP+DNS frame in TX_BUF.
+; Stores frame length at QUERY_FRAME_LEN.
+;   CF=1 if hostname encoding fails.
+; ------------------------------------------------------
+BUILD_DNS_QUERY
+	; Build DNS message at TX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN.
+	LD	A,(XID_HI)
+	LD	B,A
+	LD	A,(XID_LO)
+	LD	C,A
+	LD	HL,(HOSTNAME_PTR)
+	LD	DE,TX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN
+	CALL	@DNS.BUILD_QUERY
+	RET	C
+	; DE now points just past the DNS message.  Compute msg
+	; length and total IP/UDP lengths.
+	LD	HL,TX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN
+	EX	DE,HL				; HL = end, DE = start
+	OR	A
+	SBC	HL,DE
+	LD	(DNS_MSG_LEN),HL		; DNS message length
+	LD	BC,UDP_HDR_LEN
+	ADD	HL,BC
+	; HL = UDP segment length (UDP hdr + DNS msg)
+	LD	(UDP_LEN),HL
+	LD	BC,IP_HDR_LEN
+	ADD	HL,BC
+	; HL = IP total length (IP hdr + UDP segment)
+	LD	(IP_TOTAL_LEN),HL
+	LD	BC,14
+	ADD	HL,BC
+	; HL = full Ethernet frame length
+	LD	(QUERY_FRAME_LEN),HL
+
+	; Ethernet header.
+	LD	DE,TX_BUF
+	LD	HL,NEXT_HOP_MAC
+	LD	BC,6
+	LDIR
+	LD	HL,OUR_MAC
+	LD	BC,6
+	LDIR
+	LD	A,HIGH ETH_TYPE_IPV4
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW ETH_TYPE_IPV4
+	LD	(DE),A
+	INC	DE
+
+	; IPv4 header.
+	LD	A,0x45
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,(IP_TOTAL_LEN + 1)
+	LD	(DE),A				; total length hi
+	INC	DE
+	LD	A,(IP_TOTAL_LEN)
+	LD	(DE),A				; total length lo
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	A,1
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	INC	DE
+	LD	(DE),A
+	INC	DE
+	LD	A,64
+	LD	(DE),A
+	INC	DE
+	LD	A,IP_PROTO_UDP
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A				; csum hi placeholder
+	INC	DE
+	LD	(DE),A				; csum lo placeholder
+	INC	DE
+	LD	HL,OUR_IP
+	LD	BC,4
+	LDIR
+	LD	HL,DNS_IP
+	LD	BC,4
+	LDIR
+
+	; UDP header.
+	LD	A,OUR_PORT_HI
+	LD	(DE),A
+	INC	DE
+	LD	A,OUR_PORT_LO
+	LD	(DE),A
+	INC	DE
+	LD	A,0
+	LD	(DE),A				; dst port hi (53)
+	INC	DE
+	LD	A,53
+	LD	(DE),A
+	INC	DE
+	LD	A,(UDP_LEN + 1)
+	LD	(DE),A				; UDP length hi
+	INC	DE
+	LD	A,(UDP_LEN)
+	LD	(DE),A				; UDP length lo
+	INC	DE
+	XOR	A
+	LD	(DE),A				; csum 0 (allowed)
+	INC	DE
+	LD	(DE),A
+	INC	DE
+
+	; IP checksum over TX_BUF+14, length 20.
+	PUSH	IX
+	LD	IX,TX_BUF + 14
+	LD	BC,IP_HDR_LEN
+	CALL	@UTIL.CHECKSUM
+	POP	IX
+	LD	A,H
+	LD	(TX_BUF + 14 + 10),A
+	LD	A,L
+	LD	(TX_BUF + 14 + 11),A
+	OR	A
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_FOR_ARP_REPLY: as in UDPTEST/PING -- wait for ARP
+; reply matching NEXT_HOP_IP.
+; ------------------------------------------------------
+WAIT_FOR_ARP_REPLY
+.LP
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	CALL	TICK_AND_CHECK_KEY
+	JR	C,.TIMEOUT
+	LD	HL,(TIMEOUT_MS_LEFT)
+	DEC	HL
+	LD	(TIMEOUT_MS_LEFT),HL
+	LD	A,H
+	OR	L
+	JR	NZ,.LP
+	JR	.TIMEOUT
+.HAVE
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JR	C,.LP
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_ARP
+	JR	NZ,.LP
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_ARP
+	JR	NZ,.LP
+	LD	A,(RX_BUF + 14 + 6)
+	OR	A
+	JR	NZ,.LP
+	LD	A,(RX_BUF + 14 + 7)
+	CP	ARP_OP_REPLY
+	JR	NZ,.LP
+	LD	HL,RX_BUF + 14 + 14
+	LD	DE,NEXT_HOP_IP
+	LD	B,4
+.CMPIP
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.LP
+	INC	HL
+	INC	DE
+	DJNZ	.CMPIP
+	LD	HL,RX_BUF + 14 + 8
+	LD	DE,NEXT_HOP_MAC
+	LD	BC,6
+	LDIR
+	OR	A
+	RET
+.TIMEOUT
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_FOR_DNS_REPLY: filter for UDP from DNS_IP:53 to
+; OUR_PORT.  Captures DNS payload pointer + length.
+; ------------------------------------------------------
+WAIT_FOR_DNS_REPLY
+.LP
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+	CALL	TICK_AND_CHECK_KEY
+	JP	C,.TIMEOUT
+	LD	HL,(TIMEOUT_MS_LEFT)
+	DEC	HL
+	LD	(TIMEOUT_MS_LEFT),HL
+	LD	A,H
+	OR	L
+	JP	NZ,.LP
+	JP	.TIMEOUT
+.HAVE
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JP	C,.LP
+	; Eth type IPv4
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_IPV4
+	JP	NZ,.LP
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_IPV4
+	JP	NZ,.LP
+	; IPv4 version+IHL = 0x45
+	LD	A,(RX_BUF + 14)
+	CP	0x45
+	JP	NZ,.LP
+	; protocol = UDP
+	LD	A,(RX_BUF + 14 + 9)
+	CP	IP_PROTO_UDP
+	JP	NZ,.LP
+	; src IP == DNS_IP
+	LD	HL,RX_BUF + 14 + 12
+	LD	DE,DNS_IP
+	LD	B,4
+.CMPSRC
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,.LP
+	INC	HL
+	INC	DE
+	DJNZ	.CMPSRC
+	; UDP src_port == 53
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
+	OR	A
+	JP	NZ,.LP
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 1)
+	CP	53
+	JP	NZ,.LP
+	; UDP dst_port == OUR_PORT
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 2)
+	CP	OUR_PORT_HI
+	JP	NZ,.LP
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 3)
+	CP	OUR_PORT_LO
+	JP	NZ,.LP
+	; UDP length BE; payload length = UDP_LEN - 8
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
+	LD	L,A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
+	LD	H,A
+	LD	BC,8
+	OR	A
+	SBC	HL,BC
+	LD	(DNS_MSG_LEN),HL
+	LD	HL,RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN
+	LD	(DNS_MSG_PTR),HL
+	OR	A
+	RET
+.TIMEOUT
+	SCF
+	RET
+
+
+RESET_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_RESET
+	JP	FAIL_NIC
+
+SEND_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_SEND
+	JP	FAIL_NIC
+
+ARP_TIMEOUT
+	LD	A,(CANCELLED)
+	OR	A
+	JR	NZ,.CANCEL
+	PRINTLN MSG_E_ARP
+	JP	FAIL_NIC
+.CANCEL
+	PRINTLN MSG_ABORTED
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+DNS_TIMEOUT
+	LD	A,(CANCELLED)
+	OR	A
+	JR	NZ,.CANCEL
+	PRINTLN MSG_E_DNS_TO
+	JP	FAIL_NIC
+.CANCEL
+	PRINTLN MSG_ABORTED
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+DNS_PARSE_FAIL
+	PRINTLN MSG_E_DNS_PARSE
+	; Diagnostic: dump XID + first 32 bytes of DNS message.
+	PRINT MSG_DBG_XID
+	LD	A,(XID_HI)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(XID_LO)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+	PRINT MSG_DBG_LEN
+	LD	HL,(DNS_MSG_LEN)
+	LD	A,H
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,L
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+	PRINT MSG_DBG_DUMP
+	LD	HL,(DNS_MSG_PTR)
+	LD	B,32
+.DUMP
+	LD	A,(HL)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	HL
+	DJNZ	.DUMP
+	PRINT LINE_END
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+BUILD_FAIL
+	PRINTLN MSG_E_NAME
+	CALL	@ISA.ISA_CLOSE
+	LD	B,1
+	JP	@UTIL.EXIT_FAIL
+
+DNS1_MISSING
+	PRINTLN MSG_E_NO_DNS1
+	LD	B,4
+	JP	@UTIL.EXIT_FAIL
+
+GW_MISSING
+	PRINTLN MSG_E_NO_GW
+	CALL	@ISA.ISA_CLOSE
+	LD	B,4
+	JP	@UTIL.EXIT_FAIL
+
+FAIL_NIC
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	PRINT_REG_DUMP
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+
+SHOW_HELP
+	LD	HL,MSG_HELP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	JP	@UTIL.EXIT_OK
+
+
+USAGE_ERROR
+	PRINTLN MSG_USAGE_ERR
+	LD	HL,MSG_HELP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	B,1
+	JP	@UTIL.EXIT_FAIL
+
+
+; ------------------------------------------------------
+; TICK_AND_CHECK_KEY: ~1 ms wait + Esc/Ctrl+C poll.
+; ------------------------------------------------------
+TICK_AND_CHECK_KEY
+	CALL	@UTIL.DELAY_1MS
+	CALL	@ISA.ISA_CLOSE
+	LD	C,DSS_SCANKEY
+	RST	DSS
+	JR	Z,.NO_KEY
+	LD	A,E
+	CP	0x1B
+	JR	Z,.CANCEL
+	LD	A,B
+	AND	KB_CTRL | KB_L_CTRL | KB_R_CTRL
+	JR	Z,.NO_KEY
+	LD	A,D
+	CP	SCAN_C
+	JR	Z,.CANCEL
+	JR	.NO_KEY
+.CANCEL
+	LD	A,1
+	LD	(CANCELLED),A
+	CALL	@ISA.ISA_OPEN
+	SCF
+	RET
+.NO_KEY
+	CALL	@ISA.ISA_OPEN
+	OR	A
+	RET
+
+
+PRINT_IPV4
+	PUSH	HL,BC
+	LD	B,4
+.LP
+	LD	A,(HL)
+	CALL	PRINT_DEC_A
+	INC	HL
+	DEC	B
+	JR	Z,.DONE
+	PUSH	BC
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC
+	JR	.LP
+.DONE
+	POP	BC,HL
+	RET
+
+
+PRINT_DEC_A
+	PUSH	AF,BC,DE,HL
+	LD	C,A
+	LD	HL,DEC_BUF + 5
+	LD	(HL),0
+.LP
+	LD	A,C
+	LD	B,0
+.SUB
+	CP	10
+	JR	C,.GOT
+	SUB	10
+	INC	B
+	JR	.SUB
+.GOT
+	ADD	A,'0'
+	DEC	HL
+	LD	(HL),A
+	LD	C,B
+	LD	A,B
+	OR	A
+	JR	NZ,.LP
+	LD	C,DSS_PCHARS
+	RST	DSS
+	POP	HL,DE,BC,AF
+	RET
+
+
+PUTCHAR
+	PUSH	AF,BC
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC,AF
+	RET
+
+
+PRINT_REG_DUMP
+	PRINT MSG_REGS
+	LD	HL,REG_NAMES
+	LD	DE,@RTL.REG_SNAPSHOT
+	LD	B,@RTL.REG_SNAPSHOT_LEN
+.LP
+	PUSH	BC,DE
+.NCHR
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	Z,.NDONE
+	CALL	PUTCHAR
+	JR	.NCHR
+.NDONE
+	LD	A,'='
+	CALL	PUTCHAR
+	POP	DE,BC
+	LD	A,(DE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	DE
+	DJNZ	.LP
+	PRINT LINE_END
+	RET
+
+REG_NAMES
+	DB "CR",0
+	DB "ISR",0
+	DB "DCR",0
+	DB "RCR",0
+	DB "TCR",0
+	DB "IMR",0
+	DB "PSTART",0
+	DB "PSTOP",0
+	DB "BNRY",0
+	DB "CURR",0
+
+
+; ------- in-EXE data -------
+N_NET_IP	DB "NET_IP",0
+N_NET_MAC	DB "NET_MAC",0
+N_NET_DNS1	DB "NET_DNS1",0
+N_NET_MASK	DB "NET_MASK",0
+N_NET_GW	DB "NET_GW",0
+
+
+; ------- runtime BSS (lives at APP_BSS_BASE, NOT in .EXE) --
+OUR_IP		EQU APP_BSS_BASE		; 4 bytes
+OUR_MAC		EQU APP_BSS_BASE + 4		; 6 bytes
+DNS_IP		EQU APP_BSS_BASE + 10		; 4 bytes
+NEXT_HOP_IP	EQU APP_BSS_BASE + 14		; 4 bytes
+NEXT_HOP_MAC	EQU APP_BSS_BASE + 18		; 6 bytes
+NET_MASK_BUF	EQU APP_BSS_BASE + 24		; 4 bytes
+NET_GW_BUF	EQU APP_BSS_BASE + 28		; 4 bytes
+HAS_NETMASK	EQU APP_BSS_BASE + 32		; 1 byte
+HAS_GW		EQU APP_BSS_BASE + 33		; 1 byte
+HAS_SERVER_ARG	EQU APP_BSS_BASE + 34		; 1 byte
+HOSTNAME_PTR	EQU APP_BSS_BASE + 35		; 2 bytes (-> token)
+RESOLVED_IP	EQU APP_BSS_BASE + 37		; 4 bytes
+TIMEOUT_MS_LEFT	EQU APP_BSS_BASE + 41		; 2 bytes
+QUERY_FRAME_LEN	EQU APP_BSS_BASE + 43		; 2 bytes
+DNS_MSG_PTR	EQU APP_BSS_BASE + 45		; 2 bytes
+DNS_MSG_LEN	EQU APP_BSS_BASE + 47		; 2 bytes
+IP_TOTAL_LEN	EQU APP_BSS_BASE + 49		; 2 bytes
+UDP_LEN		EQU APP_BSS_BASE + 51		; 2 bytes
+XID_HI		EQU APP_BSS_BASE + 53		; 1 byte
+XID_LO		EQU APP_BSS_BASE + 54		; 1 byte
+CANCELLED	EQU APP_BSS_BASE + 55		; 1 byte
+DEC_BUF		EQU APP_BSS_BASE + 56		; 6 bytes scratch
+
+
+; ------- messages -------
+MSG_BANNER	DB "RTL8019AS NSLOOKUP v0.1",0
+MSG_QUERYING	DB "Querying ",0
+MSG_AT		DB " at ",0
+MSG_FROM_HOST	DB " from ",0
+MSG_NAME	DB "Name:    ",0
+MSG_ADDRESS	DB "Address: ",0
+MSG_REGS	DB "REGS ",0
+MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
+MSG_E_RESET	DB "[E80] RESET timeout",0
+MSG_E_SEND	DB "[E81] DMA write or PTX timeout",0
+MSG_E_ARP	DB "ARP request timed out.",0
+MSG_E_DNS_TO	DB "DNS reply timed out.",0
+MSG_E_DNS_PARSE	DB "DNS reply: NXDOMAIN, no A record, or parse error.",0
+MSG_DBG_XID	DB "  expected XID=",0
+MSG_DBG_LEN	DB "  msg length=",0
+MSG_DBG_DUMP	DB "  msg[0..32]: ",0
+MSG_E_NAME	DB "[E] invalid hostname (empty / >63-char label).",0
+MSG_E_NO_DNS1	DB "[E] NET_DNS1 not set; pass server-ip arg or run NETCFG -i first.",0
+MSG_E_NO_GW	DB "[E] DNS server is off-subnet but NET_GW is not set.",0
+MSG_USAGE_ERR	DB "[E] usage: missing or invalid arguments",0
+MSG_HELP
+	DB "Usage:",13,10
+	DB "  NSLOOKUP host [server-ip]",13,10
+	DB "  NSLOOKUP /?",13,10,13,10
+	DB "  host       hostname to resolve (A record).",13,10
+	DB "  server-ip  optional DNS server IPv4; defaults to NET_DNS1.",13,10,0
+LINE_END	DB 13,10,0
+
+	ENDMODULE
+
+
+	; netenv_lib / cmdline_lib transitively DEFINE USE_UTIL_*
+	; helpers; include BEFORE util.asm.
+	INCLUDE "netenv_lib.asm"
+	INCLUDE "cmdline_lib.asm"
+	INCLUDE "isa.asm"
+	INCLUDE "util.asm"
+	INCLUDE "rtl8019.asm"
+	INCLUDE "arp_lib.asm"
+	INCLUDE "dns_lib.asm"
+
+
+NSLOOKUP_IMAGE_END
+
+RX_BUF_SIZE	EQU 1518
+
+	MODULE MAIN
+
+; TX_BUF must fit max DNS frame: 14 + 20 + 8 + 12 + (255+2) + 4 = 315 bytes.
+TX_BUF		EQU NSLOOKUP_IMAGE_END
+RX_HDR		EQU TX_BUF + 320
+RX_BUF		EQU RX_HDR + 4
+NSLOOKUP_BSS_END EQU RX_BUF + RX_BUF_SIZE
+
+	ENDMODULE
+
+	END MAIN.START
