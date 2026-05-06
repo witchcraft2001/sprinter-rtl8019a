@@ -591,16 +591,62 @@ READ_PACKET
 	LD	L,C
 .LEN_OK
 	LD	(.BODY_LEN),HL
-	; Read body.
+	; Compute body source address in NIC packet RAM.
 	LD	DE,(.PKT_ADDR)
 	INC	DE
 	INC	DE
 	INC	DE
-	INC	DE
-	LD	HL,(.BODY_PTR)
+	INC	DE			; DE = pkt_addr + 4
+	LD	(.BODY_ADDR),DE
+	; remaining_in_ring = PSTOP*256 - body_addr.
+	LD	HL,RTL_PSTOP_INIT * 256
+	OR	A
+	SBC	HL,DE			; HL = bytes from body_addr to PSTOP
+	LD	(.FIRST_LEN),HL
+	; Compare remaining (HL) vs body_len.
 	LD	BC,(.BODY_LEN)
+	LD	A,H
+	CP	B
+	JR	C,.DO_SPLIT
+	JR	NZ,.DO_SINGLE
+	LD	A,L
+	CP	C
+	JR	C,.DO_SPLIT
+.DO_SINGLE
+	; Body fits before PSTOP: single DMA read.
+	LD	BC,(.BODY_LEN)
+	LD	DE,(.BODY_ADDR)
+	LD	HL,(.BODY_PTR)
 	CALL	DMA_READ
 	RET	C
+	JR	.READ_DONE
+.DO_SPLIT
+	; First chunk: from BODY_ADDR up to PSTOP, into BODY_PTR.
+	LD	BC,(.FIRST_LEN)
+	LD	DE,(.BODY_ADDR)
+	LD	HL,(.BODY_PTR)
+	CALL	DMA_READ
+	RET	C
+	; Second chunk: from PSTART*256, len = BODY_LEN - FIRST_LEN,
+	; into BODY_PTR + FIRST_LEN.
+	LD	HL,(.BODY_LEN)
+	LD	BC,(.FIRST_LEN)
+	OR	A
+	SBC	HL,BC			; HL = remaining body bytes
+	LD	B,H
+	LD	C,L
+	LD	A,B
+	OR	C
+	JR	Z,.READ_DONE		; defensive: nothing left
+	LD	HL,(.BODY_PTR)
+	PUSH	BC
+	LD	BC,(.FIRST_LEN)
+	ADD	HL,BC
+	POP	BC
+	LD	DE,RTL_PSTART_INIT * 256
+	CALL	DMA_READ
+	RET	C
+.READ_DONE
 	; Advance BNRY = hdr.next - 1, wrap PSTART -> PSTOP-1.
 	LD	HL,(.HDR_PTR)
 	INC	HL			; hdr[1] = next
@@ -620,6 +666,8 @@ READ_PACKET
 .MAX_LEN	DW 0
 .PKT_ADDR	DW 0
 .BODY_LEN	DW 0
+.BODY_ADDR	DW 0
+.FIRST_LEN	DW 0
 	ENDIF
 
 
