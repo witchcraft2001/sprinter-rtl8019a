@@ -47,6 +47,7 @@ EXE_VERSION		EQU 1
 	DEFINE USE_ARP_BUILD_REQUEST
 	DEFINE USE_NETENV
 	DEFINE USE_CMDL
+	DEFINE USE_RESOLVE
 	DEFINE CMDLINE_AT_LARGE			; ORG 0x4100 -> cmd line at IX-0x80 = 0x4180
 
 ARP_TIMEOUT_MS	EQU 3000		; ARP reply budget (ms)
@@ -192,13 +193,11 @@ START
 	LD	(TIMEOUT_MS_VAL),HL
 .NO_W
 
-	; Mandatory positional: target IPv4.
+	; Mandatory positional: target host (IPv4 literal or name).
 	LD	B,0
 	CALL	@CMDL.GET_POSITIONAL
 	JP	C,USAGE_ERROR
-	LD	DE,TARGET_IP
-	CALL	@CMDL.PARSE_IPV4
-	JP	C,USAGE_ERROR
+	LD	(TARGET_HOST_PTR),HL
 
 	; Pull NET_IP / NET_MAC from env (populated by NETCFG -i).
 	LD	HL,N_NET_IP
@@ -221,6 +220,12 @@ START
 	LD	(@ARP.OUR_MAC_PTR),HL
 	LD	HL,OUR_IP
 	LD	(@ARP.OUR_IP_PTR),HL
+
+	; Resolve target host (literal IPv4 or hostname via NET_DNS1).
+	LD	HL,(TARGET_HOST_PTR)
+	LD	DE,TARGET_IP
+	CALL	@RESOLVE.HOST
+	JP	C,RESOLVE_FAIL
 
 	; "Pinging X with N bytes of data:"
 	PRINT LINE_END
@@ -394,6 +399,43 @@ ARP_TIMEOUT
 FAIL_NIC
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	PRINT_REG_DUMP
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+
+RESOLVE_FAIL
+	; @RESOLVE.LAST_FAIL: 1 usage, 2 no DNS1, 3 no GW, 4 ARP,
+	; 5 DNS to, 6 DNS parse, 7 cancel.
+	LD	A,(@RESOLVE.LAST_FAIL)
+	CP	1
+	JR	Z,.USG
+	CP	2
+	JR	Z,.NDNS
+	CP	3
+	JR	Z,.NGW
+	CP	7
+	JR	Z,.CAN
+	; 4/5/6 -> generic resolve error.
+	PRINTLN MSG_E_RESOLVE
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+.USG
+	CALL	@ISA.ISA_CLOSE
+	JP	USAGE_ERROR
+.NDNS
+	PRINTLN MSG_E_NO_DNS1
+	CALL	@ISA.ISA_CLOSE
+	LD	B,4
+	JP	@UTIL.EXIT_FAIL
+.NGW
+	PRINTLN MSG_E_NO_GW
+	CALL	@ISA.ISA_CLOSE
+	LD	B,4
+	JP	@UTIL.EXIT_FAIL
+.CAN
+	PRINTLN MSG_ABORTED
 	CALL	@ISA.ISA_CLOSE
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
@@ -845,6 +887,7 @@ PAYLOAD_LEN	EQU APP_BSS_BASE + 36		; 1 byte (-l size, default 32)
 TTL_VAL		EQU APP_BSS_BASE + 37		; 1 byte (-i TTL, default 64)
 TIMEOUT_MS_VAL	EQU APP_BSS_BASE + 38		; 2 bytes (-w ms, default 1000)
 FOREVER		EQU APP_BSS_BASE + 40		; 1 byte (1 if -t set)
+TARGET_HOST_PTR	EQU APP_BSS_BASE + 41		; 2 bytes (-> argv token)
 
 
 ; ------- messages -------
@@ -867,7 +910,10 @@ MSG_REGS	DB "REGS ",0
 MSG_E_RESET	DB "[E60] RESET timeout",0
 MSG_E_SEND	DB "[E61] DMA write or PTX timeout",0
 MSG_E_ARP	DB "[E62] ARP reply timeout",0
-MSG_USAGE_ERR	DB "[E] usage: missing or invalid target IPv4",0
+MSG_USAGE_ERR	DB "[E] usage: missing or invalid target",0
+MSG_E_RESOLVE	DB "[E] could not resolve host (DNS / ARP timeout or NXDOMAIN).",0
+MSG_E_NO_DNS1	DB "[E] NET_DNS1 not set; pass an IPv4 literal or run NETCFG/IFUP first.",0
+MSG_E_NO_GW	DB "[E] DNS server is off-subnet but NET_GW is not set.",0
 MSG_HELP
 	DB "Usage:",13,10
 	DB "  PING [-t] [-n count] [-l size] [-i TTL] [-w ms] target",13,10
@@ -891,6 +937,8 @@ LINE_END	DB 13,10,0
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
 	INCLUDE "arp_lib.asm"
+	INCLUDE "resolve_lib.asm"
+	INCLUDE "dns_lib.asm"
 
 
 PING_IMAGE_END
@@ -900,9 +948,11 @@ RX_BUF_SIZE	EQU 1518
 	MODULE MAIN
 
 ; Largest ICMP echo frame we may send: 14 + 20 + 8 + 255 = 297 bytes.
+; resolve_lib's DNS query frame can reach RESOLVE_MAX_FRAME (320),
+; so reserve the larger of the two.
 ICMP_FRAME_MAX	EQU 14 + IP_HDR_LEN + ICMP_HDR_LEN + 255
 TX_BUF		EQU PING_IMAGE_END
-RX_HDR		EQU TX_BUF + ICMP_FRAME_MAX
+RX_HDR		EQU TX_BUF + RESOLVE_MAX_FRAME
 RX_BUF		EQU RX_HDR + 4
 PING_BSS_END	EQU RX_BUF + RX_BUF_SIZE
 

@@ -63,6 +63,31 @@ DHCP_DNS1		EQU 0xA815	; 4 bytes (option 6, first)
 DHCP_DNS2		EQU 0xA819	; 4 bytes (option 6, second)
 DHCP_LEASE_SECS		EQU 0xA81D	; 4 bytes (option 51, BE)
 
+; resolve_lib: private BSS for hostname-or-IP resolution
+; (DNS A query helper).  Active only in apps that pull
+; resolve_lib (PING / UDPTEST / TFTP / NTP).
+RESOLVE_DNS_IP		EQU 0xA900	; 4 bytes
+RESOLVE_NEXT_HOP_IP	EQU 0xA904	; 4 bytes
+RESOLVE_NEXT_HOP_MAC	EQU 0xA908	; 6 bytes
+RESOLVE_NET_MASK	EQU 0xA90E	; 4 bytes
+RESOLVE_NET_GW		EQU 0xA912	; 4 bytes
+RESOLVE_HAS_MASK	EQU 0xA916	; 1 byte
+RESOLVE_HAS_GW		EQU 0xA917	; 1 byte
+RESOLVE_XID_HI		EQU 0xA918	; 1 byte
+RESOLVE_XID_LO		EQU 0xA919	; 1 byte
+RESOLVE_TIMEOUT_LEFT	EQU 0xA91A	; 2 bytes
+RESOLVE_QFRAME_LEN	EQU 0xA91C	; 2 bytes
+RESOLVE_DNS_MSG_PTR	EQU 0xA91E	; 2 bytes
+RESOLVE_DNS_MSG_LEN	EQU 0xA920	; 2 bytes
+RESOLVE_IP_TOTAL	EQU 0xA922	; 2 bytes
+RESOLVE_UDP_LEN		EQU 0xA924	; 2 bytes
+RESOLVE_DEST_PTR	EQU 0xA926	; 2 bytes (caller's output IP buffer)
+
+; Maximum DNS query/reply Ethernet frame size.  Apps that
+; pull resolve_lib must size their TX_BUF region to at
+; least this many bytes so the resolver can build a query.
+RESOLVE_MAX_FRAME	EQU 320
+
 ; ----- Per-app private BSS (0xB000+) ---------------------
 
 ; Each app lays out its own scratch starting at this base.
