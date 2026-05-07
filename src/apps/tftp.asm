@@ -74,9 +74,12 @@ OP_RRQ		EQU 1
 OP_DATA		EQU 3
 OP_ACK		EQU 4
 OP_ERROR	EQU 5
+OP_OACK		EQU 6				; RFC 2347 option ACK
 
 ; -- TFTP defaults
-TFTP_BLOCK	EQU 512
+TFTP_BLOCK_DEFAULT	EQU 512			; RFC 1350 fallback
+TFTP_BLOCK_REQ		EQU 1428		; RFC 2348 negotiated request
+TFTP_BLOCK_MAX		EQU 1468		; Ethernet MTU - IP/UDP/TFTP hdr
 
 NO_HANDLE	EQU 0xFF
 
@@ -194,6 +197,10 @@ START
 	LD	HL,0
 	LD	(TOTAL_BYTES_LO),HL
 	LD	(TOTAL_BYTES_HI),HL
+	; Default block size (RFC 1350) -- overwritten by an OACK
+	; reply if the server accepts our blksize=1428 option.
+	LD	HL,TFTP_BLOCK_DEFAULT
+	LD	(NEG_BLKSIZE),HL
 
 	; Banner: "GET FILENAME from HOST"
 	PRINT LINE_END
@@ -248,6 +255,36 @@ START
 	CALL	WAIT_FOR_TFTP_DATA
 	JP	C,TFTP_TIMEOUT
 
+	; A = OP_DATA or OP_OACK.
+	CP	OP_OACK
+	JR	NZ,.NOT_OACK
+
+	; OACK: parse options, ACK block 0, loop and expect DATA blk=1.
+	CALL	PARSE_OACK
+	; Send ACK(0).  EXPECTED_BLOCK is currently 1; temporarily 0
+	; for the OACK confirmation, then restore.
+	LD	HL,(EXPECTED_BLOCK)
+	PUSH	HL
+	LD	HL,0
+	LD	(EXPECTED_BLOCK),HL
+	CALL	BUILD_ACK_PAYLOAD
+	LD	HL,TFTP_BUF
+	LD	(TFTP_PAYLOAD_PTR),HL
+	LD	HL,4
+	LD	(TFTP_PAYLOAD_LEN),HL
+	LD	A,(SERVER_PORT_HI)
+	LD	(TFTP_DST_PORT_HI),A
+	LD	A,(SERVER_PORT_LO)
+	LD	(TFTP_DST_PORT_LO),A
+	CALL	BUILD_UDP_FRAME
+	LD	HL,TX_BUF
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+	POP	HL
+	LD	(EXPECTED_BLOCK),HL
+	JP	.BLOCK_LOOP
+
+.NOT_OACK
 	; Write data to file.
 	LD	BC,(DATA_LEN)
 	LD	A,B
@@ -286,9 +323,9 @@ START
 	CALL	@RTL.SEND_FRAME
 	JP	C,SEND_FAIL
 
-	; If DATA_LEN < 512, this was the last block.
+	; If DATA_LEN < negotiated block size, this was the last block.
 	LD	HL,(DATA_LEN)
-	LD	DE,TFTP_BLOCK
+	LD	DE,(NEG_BLKSIZE)
 	LD	A,H
 	CP	D
 	JR	C,.DONE
@@ -503,7 +540,10 @@ TICK_AND_CHECK_KEY
 
 ; ------------------------------------------------------
 ; BUILD_RRQ_PAYLOAD: TFTP_BUF = opcode_RRQ(BE) + filename + 0
-; + "octet" + 0. Sets RRQ_LEN.
+; + "octet" + 0 + "blksize" + 0 + "1428" + 0.
+; Sets RRQ_LEN.  RFC 2348 option negotiation: server may
+; reply OACK with the accepted blksize, or DATA blk=1 to
+; ignore options (we then fall back to the 512-byte default).
 ; ------------------------------------------------------
 BUILD_RRQ_PAYLOAD
 	LD	DE,TFTP_BUF
@@ -518,6 +558,12 @@ BUILD_RRQ_PAYLOAD
 	CALL	COPY_ASCIIZ
 	; "octet" + 0
 	LD	HL,MODE_OCTET
+	CALL	COPY_ASCIIZ
+	; "blksize" + 0
+	LD	HL,OPT_BLKSIZE
+	CALL	COPY_ASCIIZ
+	; "1428" + 0
+	LD	HL,OPT_VAL_BLK
 	CALL	COPY_ASCIIZ
 	; Compute length: DE - TFTP_BUF
 	LD	HL,TFTP_BUF
@@ -560,6 +606,142 @@ BUILD_ACK_PAYLOAD
 	LD	(DE),A
 	INC	DE
 	RET
+
+
+; ------------------------------------------------------
+; PARSE_OACK: walk the OACK option list in RX_BUF and, if a
+; "blksize" option is present, store the accepted value into
+; NEG_BLKSIZE (clamped to TFTP_BLOCK_DEFAULT..TFTP_BLOCK_MAX).
+; If no "blksize" option is found, NEG_BLKSIZE is left as the
+; pre-existing default.  Other options are ignored.
+; Trashes A,BC,DE,HL.
+; ------------------------------------------------------
+PARSE_OACK
+	; End ptr = RX_BUF + 14 + IP_HDR_LEN + UDP_LEN.
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
+	LD	D,A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
+	LD	E,A			; DE = UDP length (BE)
+	LD	HL,RX_BUF + 14 + IP_HDR_LEN
+	ADD	HL,DE
+	LD	(OACK_END_PTR),HL
+	; Cursor: first byte after the OACK opcode.
+	LD	HL,RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 2
+.LP
+	; If HL >= end -> done.
+	LD	DE,(OACK_END_PTR)
+	PUSH	HL
+	OR	A
+	SBC	HL,DE
+	POP	HL
+	JR	NC,.DONE
+	; Compare key at HL to "blksize" (case-insensitive).
+	PUSH	HL
+	CALL	OACK_KEY_IS_BLKSIZE
+	JR	C,.SKIP			; no match
+	POP	DE			; discard saved HL (HL already advanced)
+	; HL points to value start.
+	CALL	OACK_PARSE_DEC_WORD	; out: DE = value, HL advanced past digits
+	; Skip the trailing zero of the value, then we are done with
+	; this option -- and we accept the first blksize we see.
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.CLAMP		; malformed but harmless
+	INC	HL
+.CLAMP
+	; Clamp DE into [TFTP_BLOCK_DEFAULT, TFTP_BLOCK_MAX].
+	; If DE < 8 (sanity), keep default.
+	LD	HL,8
+	OR	A
+	SBC	HL,DE
+	JR	NC,.DONE		; DE < 8: ignore
+	LD	HL,TFTP_BLOCK_MAX
+	OR	A
+	SBC	HL,DE
+	JR	NC,.STORE
+	LD	DE,TFTP_BLOCK_MAX	; cap
+.STORE
+	LD	(NEG_BLKSIZE),DE
+	RET
+.SKIP
+	POP	HL
+	; Skip key (find \0).
+	CALL	OACK_SKIP_ASCIIZ
+	; Skip value (find \0).
+	CALL	OACK_SKIP_ASCIIZ
+	JR	.LP
+.DONE
+	RET
+
+; OACK_KEY_IS_BLKSIZE: HL -> key string.  CF=0 if matches
+; "blksize" exactly (then HL advanced past trailing \0); CF=1
+; otherwise (HL undefined; caller restores from saved copy).
+OACK_KEY_IS_BLKSIZE
+	LD	DE,LIT_BLKSIZE
+.CMP
+	LD	A,(DE)
+	OR	A
+	JR	Z,.LIT_END
+	LD	B,A			; B = expected (already lowercase)
+	LD	A,(HL)
+	OR	A
+	JR	Z,.NO			; key shorter than literal
+	OR	0x20			; force ASCII letter to lowercase
+	CP	B
+	JR	NZ,.NO
+	INC	HL
+	INC	DE
+	JR	.CMP
+.LIT_END
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.NO			; key longer than "blksize"
+	INC	HL			; past the \0
+	OR	A			; CF=0
+	RET
+.NO
+	SCF
+	RET
+LIT_BLKSIZE	DB "blksize",0
+
+; OACK_SKIP_ASCIIZ: HL -> string; advances HL past the \0.
+OACK_SKIP_ASCIIZ
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	NZ,OACK_SKIP_ASCIIZ
+	RET
+
+; OACK_PARSE_DEC_WORD: HL -> ASCIIZ decimal.  Out: DE = value,
+; HL advanced past the digits (NOT past the \0).
+; Trashes A.
+OACK_PARSE_DEC_WORD
+	LD	DE,0
+.LP
+	LD	A,(HL)
+	CP	'0'
+	RET	C
+	CP	'9'+1
+	RET	NC
+	SUB	'0'
+	PUSH	HL
+	PUSH	AF
+	; DE *= 10  via HL = DE*2 + DE*8
+	LD	H,D
+	LD	L,E
+	ADD	HL,HL			; HL = DE*2
+	ADD	HL,HL			; HL = DE*4
+	ADD	HL,DE			; HL = DE*5
+	ADD	HL,HL			; HL = DE*10
+	EX	DE,HL			; DE = DE*10
+	POP	AF
+	LD	H,0
+	LD	L,A
+	ADD	HL,DE
+	EX	DE,HL			; DE = DE*10 + digit
+	POP	HL
+	INC	HL
+	JR	.LP
 
 
 ; ------------------------------------------------------
@@ -747,12 +929,12 @@ WAIT_FOR_ARP_REPLY
 
 ; ------------------------------------------------------
 ; WAIT_FOR_TFTP_DATA: poll for incoming UDP from TARGET_IP
-; with TFTP DATA opcode (3) and matching block#. On match:
-;  - capture server source port into SERVER_PORT (first packet).
-;  - validate block# == EXPECTED_BLOCK.
-;  - set DATA_LEN = (UDP body) - 4 (TFTP header).
-;  - body bytes are at RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 4.
-; Out: CF=0 OK, CF=1 timeout.
+; with TFTP opcode DATA (3) or OACK (6).
+;  - First DATA / OACK from server captures SERVER_PORT.
+;  - For DATA: validate block# == EXPECTED_BLOCK; on match
+;    set DATA_LEN = (UDP body) - 4.
+;  - For OACK: leaves the packet in RX_BUF for PARSE_OACK.
+; Out: CF=0 + A = OP_DATA or OP_OACK; CF=1 on timeout / ERROR.
 ; ------------------------------------------------------
 WAIT_FOR_TFTP_DATA
 .LP
@@ -830,6 +1012,8 @@ WAIT_FOR_TFTP_DATA
 	OR	A
 	JP	NZ,.LP_OR_ERR
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 1)
+	CP	OP_OACK
+	JR	Z,.IS_OACK
 	CP	OP_DATA
 	JP	NZ,.LP_OR_ERR
 	; Block# (BE) at offset +14+IP_HDR+UDP_HDR+2..+3.
@@ -854,7 +1038,13 @@ WAIT_FOR_TFTP_DATA
 	OR	A
 	SBC	HL,BC
 	LD	(DATA_LEN),HL
-	OR	A
+	LD	A,OP_DATA
+	OR	A			; CF=0
+	RET
+.IS_OACK
+	; OACK: caller will parse options.  No DATA_LEN to compute.
+	LD	A,OP_OACK
+	OR	A			; CF=0
 	RET
 .LP_OR_ERR
 	; If TFTP opcode is ERROR, bail with timeout (caller will fail).
@@ -972,6 +1162,8 @@ REG_NAMES
 N_NET_IP	DB "NET_IP",0
 N_NET_MAC	DB "NET_MAC",0
 MODE_OCTET	DB "octet",0
+OPT_BLKSIZE	DB "blksize",0
+OPT_VAL_BLK	DB "1428",0
 
 ; ------- runtime BSS (lives at APP_BSS_BASE, NOT in .EXE) --
 FILENAME_BUF_SIZE EQU 80		; 8.3 + path room
@@ -998,10 +1190,13 @@ TFTP_PAYLOAD_LEN EQU APP_BSS_BASE + 44		; 2 bytes
 TFTP_DST_PORT_HI EQU APP_BSS_BASE + 46		; 1 byte
 TFTP_DST_PORT_LO EQU APP_BSS_BASE + 47		; 1 byte
 FILENAME_BUF	 EQU APP_BSS_BASE + 48		; FILENAME_BUF_SIZE bytes
+; (DEC_BUF lives at APP_BSS_BASE + 48 + FILENAME_BUF_SIZE, 4 bytes)
+NEG_BLKSIZE	 EQU APP_BSS_BASE + 52 + FILENAME_BUF_SIZE	; 2 bytes (negotiated block)
+OACK_END_PTR	 EQU NEG_BLKSIZE + 2		; 2 bytes (parser end ptr)
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS TFTP v0.2",0
+MSG_BANNER	DB "RTL8019AS TFTP v0.4",0
 MSG_GET_HDR	DB "GET ",0
 MSG_FROM_HOST	DB " from ",0
 MSG_DONE	DB "Done. ",0
@@ -1024,7 +1219,9 @@ MSG_HELP
 	DB "  host      TFTP server IPv4 (e.g. 192.168.7.1).",13,10
 	DB "  GET       fetch operation (only mode supported).",13,10
 	DB "  filename  remote file (saved locally with same name).",13,10
-	DB "  -y        overwrite local file without prompt.",13,10,0
+	DB "  -y        overwrite local file without prompt.",13,10,13,10
+	DB "RFC 2348 blksize=1428 is requested in the RRQ; servers",13,10
+	DB "that ignore options fall back to RFC 1350 512-byte blocks.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
@@ -1046,7 +1243,7 @@ LINE_END	DB 13,10,0
 TFTP_IMAGE_END
 
 RX_BUF_SIZE	EQU 1518
-TFTP_BUF_SIZE	EQU 32			; RRQ <= 17, ACK = 4
+TFTP_BUF_SIZE	EQU 128			; RRQ + blksize options ~40, room to spare
 
 	MODULE MAIN
 

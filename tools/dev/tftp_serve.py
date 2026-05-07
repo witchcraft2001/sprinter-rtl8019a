@@ -4,11 +4,12 @@ Minimal TFTP read-only server for stage 7 (TFTP) testing of the
 Sprinter RTL8019AS network kit.
 
 Serves files from a chosen directory over UDP/69. Supports
-RRQ in octet mode with the default 512-byte block size; ACK
-handling, single retransmit on timeout. Does NOT implement
-write requests, options, error retries beyond the basic cycle
-or RFC 2347 OACK; that's intentional -- the goal is a small,
-predictable target for the DSS-side TFTP client.
+RRQ in octet mode with the default 512-byte block size and
+RFC 2348 blksize negotiation (server replies with OACK and
+the accepted block size, clamped to 8..1468 bytes).  ACK
+handling has a single retransmit on timeout.  Does NOT
+implement write requests, retries beyond the basic cycle, or
+RFC 2349 / RFC 7440 windowsize.
 
 Usage:
     sudo python3 tools/dev/tftp_serve.py
@@ -32,14 +33,23 @@ OP_WRQ = 2
 OP_DATA = 3
 OP_ACK = 4
 OP_ERROR = 5
+OP_OACK = 6
 
-BLOCK_SIZE = 512
+DEFAULT_BLOCK_SIZE = 512
+MIN_BLOCK_SIZE = 8
+MAX_BLOCK_SIZE = 1468  # Ethernet MTU 1500 - IP(20) - UDP(8) - TFTP(4)
 ACK_TIMEOUT = 2.0
 
 
-def serve_file(client_addr, path):
-    """Send a file to client, one block per cycle, waiting for ACK."""
-    print(f"[serve] {client_addr[0]}:{client_addr[1]} GET {path}")
+def serve_file(client_addr, path, options):
+    """Send a file to client, one block per cycle, waiting for ACK.
+
+    `options` is a dict of accepted RFC 2347 options (lowercase keys
+    to string values).  If non-empty we send an OACK first and wait
+    for ACK block 0 before transmitting DATA blocks.
+    """
+    block_size = int(options.get("blksize", DEFAULT_BLOCK_SIZE))
+    print(f"[serve] {client_addr[0]}:{client_addr[1]} GET {path} blksize={block_size}")
     try:
         with open(path, "rb") as fh:
             data = fh.read()
@@ -52,10 +62,33 @@ def serve_file(client_addr, path):
     sock.bind(("", 0))
     sock.settimeout(ACK_TIMEOUT)
 
+    if options:
+        # Send OACK; expect ACK block=0 before starting DATA.
+        oack_payload = b""
+        for k, v in options.items():
+            oack_payload += k.encode("ascii") + b"\x00" + str(v).encode("ascii") + b"\x00"
+        oack = struct.pack(">H", OP_OACK) + oack_payload
+        for retry in range(3):
+            sock.sendto(oack, client_addr)
+            try:
+                ack, addr = sock.recvfrom(1024)
+                if addr != client_addr or len(ack) < 4:
+                    continue
+                op, n = struct.unpack(">HH", ack[:4])
+                if op == OP_ACK and n == 0:
+                    break
+            except socket.timeout:
+                print(f"[serve] OACK timeout retry={retry}")
+                continue
+        else:
+            print(f"[serve] giving up on OACK")
+            sock.close()
+            return
+
     block_no = 1
     pos = 0
     while True:
-        chunk = data[pos : pos + BLOCK_SIZE]
+        chunk = data[pos : pos + block_size]
         packet = struct.pack(">HH", OP_DATA, block_no) + chunk
         for retry in range(3):
             sock.sendto(packet, client_addr)
@@ -76,21 +109,49 @@ def serve_file(client_addr, path):
             sock.close()
             return
 
-        if len(chunk) < BLOCK_SIZE:
+        if len(chunk) < block_size:
             print(f"[serve] done, sent {pos + len(chunk)} bytes in {block_no} block(s)")
             sock.close()
             return
 
-        pos += BLOCK_SIZE
+        pos += block_size
         block_no = (block_no + 1) & 0xFFFF
 
 
 def parse_rrq(payload):
-    """Return (filename, mode) or raise ValueError on malformed packet."""
+    """Return (filename, mode, options) or raise ValueError on malformed packet.
+
+    `options` is a dict of negotiated/accepted RFC 2347 options keyed by
+    lowercase option name; only options we actually understand are
+    populated.  Currently only "blksize" (RFC 2348) is recognised.
+    """
     parts = payload.split(b"\x00")
-    if len(parts) < 3:
+    # The trailing \x00 makes the last element empty; drop it.
+    if parts and parts[-1] == b"":
+        parts = parts[:-1]
+    if len(parts) < 2:
         raise ValueError("malformed RRQ")
-    return parts[0].decode("latin-1"), parts[1].decode("latin-1").lower()
+    fname = parts[0].decode("latin-1")
+    mode = parts[1].decode("latin-1").lower()
+    options: dict[str, str] = {}
+    rest = parts[2:]
+    if len(rest) % 2 != 0:
+        raise ValueError("malformed RRQ options")
+    for i in range(0, len(rest), 2):
+        key = rest[i].decode("latin-1").lower()
+        val = rest[i + 1].decode("latin-1")
+        if key == "blksize":
+            try:
+                n = int(val)
+            except ValueError:
+                continue
+            if n < MIN_BLOCK_SIZE:
+                n = MIN_BLOCK_SIZE
+            if n > MAX_BLOCK_SIZE:
+                n = MAX_BLOCK_SIZE
+            options["blksize"] = str(n)
+        # silently ignore unknown options per RFC 2347
+    return fname, mode, options
 
 
 def main() -> int:
@@ -116,7 +177,7 @@ def main() -> int:
             opcode = struct.unpack(">H", packet[:2])[0]
             if opcode == OP_RRQ:
                 try:
-                    fname, mode = parse_rrq(packet[2:])
+                    fname, mode, options = parse_rrq(packet[2:])
                 except ValueError as exc:
                     print(f"[recv] {addr}: bad RRQ: {exc}")
                     continue
@@ -134,7 +195,7 @@ def main() -> int:
                     sock.sendto(err, addr)
                     continue
                 # Spawn (synchronous) transfer.
-                serve_file(addr, full)
+                serve_file(addr, full, options)
             elif opcode == OP_WRQ:
                 err = struct.pack(">HH", OP_ERROR, 2) + b"write not supported\x00"
                 sock.sendto(err, addr)
