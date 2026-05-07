@@ -1,8 +1,9 @@
 #!/bin/sh                                                                
 mkdir -p /tmp/wget-test                                                                                                       
 # скопируй туда любые файлы для проверки, например:          
-cp /Users/dmitry/dev/zx/sprinter/other/07BA-90CE/BIN/FFORMAT.TXT /tmp/wget-test/                                              
-# несколько разных размеров:                                                     
+cp /Users/dmitry/dev/zx/sprinter/other/07BA-90CE/BIN/FFORMAT.TXT /tmp/wget-test/
+cp /Users/dmitry/dev/zx/sprinter/other/07BA-90CE/DOCS/IM2.TXT /tmp/wget-test/
+# несколько разных размеров:    
 dd if=/dev/urandom of=/tmp/wget-test/2k.bin bs=1024 count=2                                                                   
 dd if=/dev/urandom of=/tmp/wget-test/24k.bin bs=1024 count=24                      
 dd if=/dev/urandom of=/tmp/wget-test/56k.bin bs=1024 count=56                                                                 

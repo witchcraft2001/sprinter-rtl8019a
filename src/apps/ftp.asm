@@ -86,6 +86,38 @@ START
 	JP	Z,USAGE_ERROR
 	LD	(HOST_PTR),HL
 
+	; positional 1: filename (required)
+	LD	B,1
+	CALL	@CMDL.GET_POSITIONAL
+	JP	C,USAGE_ERROR
+	LD	A,(HL)
+	OR	A
+	JP	Z,USAGE_ERROR
+	LD	(FILENAME_PTR),HL
+	CALL	STRLEN_FROM_HL
+	LD	(FILENAME_LEN),A
+
+	; -o output (optional, default = filename)
+	LD	A,'o'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_OUT
+	LD	(OUTPUT_PTR),HL
+	JR	.OUT_OK
+.NO_OUT
+	LD	HL,(FILENAME_PTR)
+	LD	(OUTPUT_PTR),HL
+.OUT_OK
+
+	; -y / --yes: force overwrite without prompt.
+	XOR	A
+	LD	(FORCE_FLAG),A
+	LD	A,'y'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_FORCE
+	LD	A,1
+	LD	(FORCE_FLAG),A
+.NO_FORCE
+
 	; Pull NET_IP / NET_MAC.
 	LD	HL,N_NET_IP
 	LD	DE,OUR_IP
@@ -223,6 +255,123 @@ START
 	LD	L,A
 	CALL	PRINT_DEC_HL
 	PRINT LINE_END
+
+	; --- Open output file (prompt-or-overwrite) ---
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+	CALL	OPEN_OUTPUT_FILE
+	JP	C,FILE_FAIL
+	LD	(OUT_FH),A
+
+	; --- Save control session ---
+	LD	DE,CTRL_BACKUP
+	CALL	@TCP.SAVE_CTX
+
+	; --- Set up data session: PASV_IP / PASV_PORT, MAC same.
+	LD	HL,PASV_IP
+	LD	DE,TCP_REMOTE_IP
+	LD	BC,4
+	LDIR
+	LD	A,(PASV_PORT_HI)
+	LD	(TCP_REMOTE_PORT_HI),A
+	LD	A,(PASV_PORT_LO)
+	LD	(TCP_REMOTE_PORT_LO),A
+	; Reset state for fresh open.
+	XOR	A
+	LD	(TCP_STATE),A
+
+	PRINTLN MSG_OPENING_DATA
+	CALL	@TCP.OPEN
+	JP	C,DATA_OPEN_FAIL
+
+	; --- Save data session, restore control to send RETR ---
+	LD	DE,DATA_BACKUP
+	CALL	@TCP.SAVE_CTX
+	LD	HL,CTRL_BACKUP
+	CALL	@TCP.RESTORE_CTX
+
+	; RETR <filename>
+	LD	HL,CMD_RETR
+	LD	BC,CMD_RETR_LEN
+	LD	DE,(FILENAME_PTR)
+	LD	A,(FILENAME_LEN)
+	CALL	SEND_CMD_ARG
+	JP	C,TCP_FAIL
+	CALL	READ_REPLY
+	JP	C,REPLY_FAIL
+	CALL	PRINT_REPLY
+	; Accept 1xx (preliminary "150 Opening...") or 2xx.
+	LD	A,(REPLY_CODE)
+	CP	'1'
+	JR	Z,.RETR_OK
+	CP	'2'
+	JR	Z,.RETR_OK
+	JP	REPLY_BAD
+.RETR_OK
+
+	; --- Save control, restore data ---
+	LD	DE,CTRL_BACKUP
+	CALL	@TCP.SAVE_CTX
+	LD	HL,DATA_BACKUP
+	CALL	@TCP.RESTORE_CTX
+
+	; --- Receive data into 4 KB buffer, flush to file ---
+	LD	HL,0
+	LD	(FTP_DATA_LEN),HL
+	LD	(BODY_TOTAL_LO),HL
+	LD	(BODY_TOTAL_HI),HL
+
+.DRXLP
+	CALL	@TCP.RECV
+	JR	NC,.DRX_HAVE
+	; CF=1: peer FIN or error.
+	LD	A,(TCP_STATE)
+	CP	3				; ST_CLOSE_WAIT
+	JP	NZ,DATA_RX_FAIL
+	; Drain trailing piggyback data if any.
+	LD	HL,(TCP_RX_DATA_LEN)
+	LD	A,H
+	OR	L
+	JR	Z,.DRX_DONE
+	CALL	APPEND_DATA
+.DRX_DONE
+	JR	.DATA_TRANSFER_DONE
+.DRX_HAVE
+	CALL	APPEND_DATA
+	JR	.DRXLP
+.DATA_TRANSFER_DONE
+
+	; Flush remaining buffered bytes to disk.
+	CALL	FLUSH_DATA
+	JP	C,FILE_FAIL
+
+	; Close output file.
+	LD	A,(OUT_FH)
+	CP	NO_HANDLE
+	JR	Z,.NOC
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+.NOC
+
+	; Close data TCP cleanly.
+	CALL	@TCP.CLOSE
+
+	; Restore control session.
+	LD	HL,CTRL_BACKUP
+	CALL	@TCP.RESTORE_CTX
+
+	; Read 226 (Transfer complete).
+	CALL	READ_REPLY
+	JR	C,.NO226
+	CALL	PRINT_REPLY
+.NO226
+
+	; Print transferred byte count.
+	PRINT MSG_DONE_PRE
+	CALL	PRINT_DEC_32
+	PRINTLN MSG_BYTES
 
 	; QUIT
 	LD	HL,CMD_QUIT
@@ -648,6 +797,265 @@ PARSE_DEC_BYTE_LOC
 
 
 ; ------------------------------------------------------
+; OPEN_OUTPUT_FILE: probe existence with DSS_OPEN_FILE in
+; read-only mode (DSS_CREATE_OVERWRITE does NOT signal an
+; error when the file already exists, so it cannot be used
+; as the existence test).  If the probe succeeds, close it
+; and either DELETE+CREATE silently (FORCE_FLAG) or prompt
+; the user first.  If the probe fails, the file does not
+; exist and we go straight to CREATE.
+;   Out: A = handle, CF=0 ok; CF=1 user declined / I/O error.
+; ------------------------------------------------------
+OPEN_OUTPUT_FILE
+	LD	HL,(OUTPUT_PTR)
+	LD	A,FA_READONLY
+	LD	C,DSS_OPEN_FILE
+	RST	DSS
+	JR	C,.CREATE_FRESH		; no such file -> just create
+	; File exists: close the probe handle.
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	; Confirm overwrite unless -y was given.
+	LD	A,(FORCE_FLAG)
+	OR	A
+	JR	NZ,.DO_DELETE
+	PRINT MSG_PROMPT_PRE
+	LD	HL,(OUTPUT_PTR)
+	LD	C,DSS_PCHARS
+	RST	DSS
+	PRINT MSG_PROMPT_POST
+	CALL	WAIT_YES_NO
+	JR	C,.USER_NO
+.DO_DELETE
+	LD	HL,(OUTPUT_PTR)
+	LD	C,DSS_DELETE
+	RST	DSS
+	; Ignore delete result (file may have race-disappeared).
+.CREATE_FRESH
+	LD	HL,(OUTPUT_PTR)
+	LD	A,FA_ARCHIVE
+	LD	C,DSS_CREATE_OVERWRITE
+	RST	DSS
+	RET
+.USER_NO
+	PRINTLN MSG_USER_NO
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_YES_NO: block on a key, accept Y/y -> CF=0; any
+; other key -> CF=1.  Closes the ISA window around the
+; DSS call.  Uses K_CLEAR + WAITKEY so any leftover key
+; (e.g. the Enter that launched the program) is discarded
+; and only a fresh keypress is accepted.
+; ------------------------------------------------------
+WAIT_YES_NO
+	CALL	@ISA.ISA_CLOSE
+	LD	B,DSS_WAITKEY		; subfunction: block until key
+	LD	C,DSS_K_CLEAR		; clear buffer first
+	RST	DSS
+	; A = ASCII code of the fresh key.
+	PUSH	AF
+	CALL	@ISA.ISA_OPEN
+	POP	AF
+	; Echo the typed character.
+	PUSH	AF
+	CALL	PUTCHAR
+	LD	A,13
+	CALL	PUTCHAR
+	LD	A,10
+	CALL	PUTCHAR
+	POP	AF
+	CP	'Y'
+	RET	Z
+	CP	'y'
+	RET	Z
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; PRINT_DEC_32: print 32-bit little-endian value built
+; from BODY_TOTAL_LO + BODY_TOTAL_HI.  Same algorithm as
+; WGET (long-division by 10).
+; ------------------------------------------------------
+PRINT_DEC_32
+	; Assemble 4-byte value at DEC32_WORK from possibly
+	; non-adjacent BODY_TOTAL_LO/HI.
+	LD	HL,(BODY_TOTAL_LO)
+	LD	(DEC32_WORK),HL
+	LD	HL,(BODY_TOTAL_HI)
+	LD	(DEC32_WORK + 2),HL
+	; Special-case zero.
+	LD	A,(DEC32_WORK)
+	LD	B,A
+	LD	A,(DEC32_WORK + 1)
+	OR	B
+	LD	B,A
+	LD	A,(DEC32_WORK + 2)
+	OR	B
+	LD	B,A
+	LD	A,(DEC32_WORK + 3)
+	OR	B
+	JR	NZ,.NZ
+	LD	A,'0'
+	JP	PUTCHAR
+.NZ
+	LD	B,0
+.LP
+	CALL	DIV32_10
+	ADD	A,'0'
+	PUSH	AF
+	INC	B
+	LD	A,(DEC32_WORK)
+	LD	C,A
+	LD	A,(DEC32_WORK + 1)
+	OR	C
+	LD	C,A
+	LD	A,(DEC32_WORK + 2)
+	OR	C
+	LD	C,A
+	LD	A,(DEC32_WORK + 3)
+	OR	C
+	JR	NZ,.LP
+.OUT
+	POP	AF
+	CALL	PUTCHAR
+	DJNZ	.OUT
+	RET
+
+
+DIV32_10
+	PUSH	BC
+	PUSH	DE
+	LD	HL,0
+	LD	B,32
+.LP
+	PUSH	HL
+	LD	HL,DEC32_WORK
+	SLA	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	POP	HL
+	ADC	HL,HL
+	LD	DE,10
+	OR	A
+	SBC	HL,DE
+	JR	NC,.SUB
+	ADD	HL,DE
+	JR	.NEXT
+.SUB
+	PUSH	HL
+	LD	HL,DEC32_WORK
+	SET	0,(HL)
+	POP	HL
+.NEXT
+	DJNZ	.LP
+	LD	A,L
+	POP	DE
+	POP	BC
+	RET
+
+
+; ------------------------------------------------------
+; STRLEN_FROM_HL: count bytes from (HL) until NUL.
+;   Out: A = length (capped at 255).  HL preserved.
+; ------------------------------------------------------
+STRLEN_FROM_HL
+	PUSH	HL
+	LD	B,0
+.LP
+	LD	A,(HL)
+	OR	A
+	JR	Z,.D
+	INC	HL
+	INC	B
+	JR	NZ,.LP
+.D
+	LD	A,B
+	POP	HL
+	RET
+
+
+; ------------------------------------------------------
+; APPEND_DATA: append TCP_RX_DATA_LEN bytes from
+; TCP_RX_DATA_PTR to FTP_DATA_BUF; flush to disk and
+; reset on overflow.  Updates BODY_TOTAL.
+; ------------------------------------------------------
+APPEND_DATA
+	LD	BC,(TCP_RX_DATA_LEN)
+	LD	A,B
+	OR	C
+	RET	Z
+	; Will (FTP_DATA_LEN + count) exceed FTP_DATA_BUF_SIZE?
+	LD	HL,(FTP_DATA_LEN)
+	ADD	HL,BC
+	LD	DE,FTP_DATA_BUF_SIZE
+	OR	A
+	SBC	HL,DE
+	JR	C,.NO_FLUSH
+	; Flush first.
+	CALL	FLUSH_DATA
+	RET	C
+.NO_FLUSH
+	; Copy chunk.
+	LD	HL,(TCP_RX_DATA_PTR)
+	LD	BC,(TCP_RX_DATA_LEN)
+	LD	DE,(FTP_DATA_LEN)
+	PUSH	HL
+	LD	HL,FTP_DATA_BUF
+	ADD	HL,DE
+	EX	DE,HL			; DE = dst, HL on stack = src
+	POP	HL			; HL = src
+	PUSH	BC			; save count for body counter
+	LDIR
+	POP	BC
+	; FTP_DATA_LEN += count
+	LD	HL,(FTP_DATA_LEN)
+	ADD	HL,BC
+	LD	(FTP_DATA_LEN),HL
+	; BODY_TOTAL += count
+	LD	HL,(BODY_TOTAL_LO)
+	ADD	HL,BC
+	LD	(BODY_TOTAL_LO),HL
+	RET	NC
+	LD	HL,(BODY_TOTAL_HI)
+	INC	HL
+	LD	(BODY_TOTAL_HI),HL
+	RET
+
+
+; ------------------------------------------------------
+; FLUSH_DATA: write FTP_DATA_BUF to OUT_FH and reset.
+;   Out: CF=0 ok, CF=1 DSS_WRITE error.
+; ------------------------------------------------------
+FLUSH_DATA
+	LD	HL,(FTP_DATA_LEN)
+	LD	A,H
+	OR	L
+	RET	Z
+	LD	D,H
+	LD	E,L
+	LD	HL,FTP_DATA_BUF
+	LD	A,(OUT_FH)
+	LD	C,DSS_WRITE
+	RST	DSS
+	JR	C,.ERR
+	LD	HL,0
+	LD	(FTP_DATA_LEN),HL
+	OR	A
+	RET
+.ERR
+	SCF
+	RET
+
+
+; ------------------------------------------------------
 ; PRINT_CHUNK: legacy debug helper -- print a chunk as
 ; raw text (used by stage-1-style banner dumps).  Kept
 ; here so callers in older code paths keep working.
@@ -816,6 +1224,33 @@ PASV_FAIL
 	CALL	@TCP.CLOSE
 	CALL	@ISA.ISA_CLOSE
 	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+DATA_OPEN_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_DATA_OPEN
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+DATA_RX_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_DATA_RX
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+FILE_FAIL
+	PRINT LINE_END
+	PRINTLN MSG_E_FILE
+	LD	A,(OUT_FH)
+	CP	NO_HANDLE
+	JR	Z,.NF
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+.NF
+	CALL	@ISA.ISA_CLOSE
+	LD	B,1
 	JP	@UTIL.EXIT_FAIL
 
 FAIL_NIC
@@ -1006,6 +1441,8 @@ CMD_PASV	DB "PASV"
 CMD_PASV_LEN	EQU $ - CMD_PASV
 CMD_QUIT	DB "QUIT"
 CMD_QUIT_LEN	EQU $ - CMD_QUIT
+CMD_RETR	DB "RETR "
+CMD_RETR_LEN	EQU $ - CMD_RETR
 DEFAULT_USER	DB "anonymous"
 DEFAULT_USER_LEN EQU $ - DEFAULT_USER
 DEFAULT_PASS	DB "anonymous@"
@@ -1033,9 +1470,23 @@ PASV_PORT_HI	EQU APP_BSS_BASE + 39		; 1
 PASV_PORT_LO	EQU APP_BSS_BASE + 40		; 1
 PASV_IP		EQU APP_BSS_BASE + 41		; 4
 FTP_SCRATCH	EQU APP_BSS_BASE + 48		; 16 (helper scratch)
+FILENAME_PTR	EQU APP_BSS_BASE + 56		; 2
+FILENAME_LEN	EQU APP_BSS_BASE + 58		; 1
+OUTPUT_PTR	EQU APP_BSS_BASE + 59		; 2
+OUT_FH		EQU APP_BSS_BASE + 61		; 1
+BODY_TOTAL_LO	EQU APP_BSS_BASE + 62		; 2
 ACCUM_BUF	EQU APP_BSS_BASE + 64		; ACCUM_BUF_SIZE
 REPLY_LINE	EQU ACCUM_BUF + ACCUM_BUF_SIZE	; REPLY_LINE_SIZE
 CMD_BUF		EQU REPLY_LINE + REPLY_LINE_SIZE ; CMD_BUF_SIZE
+CTRL_BACKUP	EQU CMD_BUF + CMD_BUF_SIZE	; TCP_CTX_SIZE
+DATA_BACKUP	EQU CTRL_BACKUP + TCP_CTX_SIZE	; TCP_CTX_SIZE
+BODY_TOTAL_HI	EQU DATA_BACKUP + TCP_CTX_SIZE	; 2
+FTP_DATA_LEN	EQU BODY_TOTAL_HI + 2		; 2
+DEC32_WORK	EQU FTP_DATA_LEN + 2		; 4 (PRINT_DEC_32 scratch)
+FORCE_FLAG	EQU DEC32_WORK + 4		; 1 (-y / --yes)
+
+NO_HANDLE	EQU 0xFF
+FTP_DATA_BUF_SIZE EQU 4096
 
 
 MSG_BANNER	DB "RTL8019AS FTP v0.1",0
@@ -1056,18 +1507,26 @@ MSG_E_BAD_REPLY	DB "[E] FTP server returned non-2xx.",0
 MSG_E_TCP_SEND	DB "[E] TCP send failed.",0
 MSG_E_PASV	DB "[E] could not parse PASV reply.",0
 MSG_PASV_HDR	DB "Data endpoint: ",0
-MSG_USAGE_ERR	DB "[E] usage: missing host",0
+MSG_OPENING_DATA DB "Opening data connection...",0
+MSG_DONE_PRE	DB "Done. ",0
+MSG_BYTES	DB " bytes received.",0
+MSG_E_DATA_OPEN	DB "[E] data connection failed.",0
+MSG_E_DATA_RX	DB "[E] data recv failed.",0
+MSG_E_FILE	DB "[E] file create/write failed.",0
+MSG_PROMPT_PRE	DB "Local file '",0
+MSG_PROMPT_POST	DB "' exists. Overwrite [Y/N]? ",0
+MSG_USER_NO	DB "Aborted by user.",0
+MSG_USAGE_ERR	DB "[E] usage: missing host or filename",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  FTP host filename [-u user] [-p pass] [-o output]",13,10
+	DB "  FTP host filename [-o output] [-y]",13,10
 	DB "  FTP /?",13,10,13,10
 	DB "  host       FTP server (IPv4 or hostname).",13,10
 	DB "  filename   remote file to download.",13,10
-	DB "  -u user    login (default anonymous).",13,10
-	DB "  -p pass    password (default anonymous@).",13,10
 	DB "  -o file    local output (default = remote name).",13,10
-	DB "Stage 1 build: connects to port 21 and prints",13,10
-	DB "the server banner only.",13,10,0
+	DB "  -y         overwrite local file without prompt.",13,10
+	DB "Anonymous login is used (USER anonymous /",13,10
+	DB "PASS anonymous@); auth-required servers are NYI.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
@@ -1093,7 +1552,8 @@ RX_BUF_SIZE	EQU 1518
 TX_BUF		EQU FTP_IMAGE_END
 RX_HDR		EQU TX_BUF + TCP_MAX_FRAME
 RX_BUF		EQU RX_HDR + 4
-FTP_BSS_END	EQU RX_BUF + RX_BUF_SIZE
+FTP_DATA_BUF	EQU RX_BUF + RX_BUF_SIZE
+FTP_BSS_END	EQU FTP_DATA_BUF + FTP_DATA_BUF_SIZE
 
 	ENDMODULE
 

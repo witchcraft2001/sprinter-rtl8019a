@@ -1,0 +1,1 @@
+sudo python3 -m pyftpdlib -p 21 -i 192.168.7.1 -d /tmp/wget-test -w

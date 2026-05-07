@@ -14,6 +14,7 @@ DSS                 EQU 0x10
 DSS_CURDISK         EQU 0x02
 DSS_CREATE_OVERWRITE EQU 0x0A
 DSS_CREATE_FILE     EQU 0x0B
+DSS_DELETE          EQU 0x0E
 DSS_OPEN_FILE       EQU 0x11
 DSS_CLOSE_FILE      EQU 0x12
 DSS_READ_FILE       EQU 0x13
@@ -26,14 +27,15 @@ DSS_CHDIR           EQU 0x1D
 DSS_CURDIR          EQU 0x1E
 DSS_SYSTIME         EQU 0x21
 DSS_SETTIME         EQU 0x22
+DSS_WAITKEY			EQU 0x30							; blocks; key returned in A
 DSS_SCANKEY			EQU 0x31
 DSS_ECHOKEY			EQU	0x32
+DSS_K_CLEAR			EQU 0x35							; B=subfn (e.g. WAITKEY) -> clear buf + run subfn
 DSS_SETMEM			EQU 0x38
 DSS_GETMEM			EQU 0x3D
 DSS_FREEMEM			EQU	0x3E
 DSS_EXIT            EQU 0x41
 DSS_ENVIRON         EQU 0x46							; environment variables (PAGE 2 @ 0xE400)
-DSS_WAITKEY			EQU 0x48
 
 ; ENVIRON sub-functions (selected by B):
 ENV_INIT			EQU 0xFF							; reset env table

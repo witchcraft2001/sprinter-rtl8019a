@@ -81,6 +81,16 @@ make image      # create distr/sprinter-rtl8019a.img FAT12 test floppy image
 make clean      # remove generated outputs
 ```
 
+**Mandatory: every code-changing iteration must end with `make package image`,
+not just `make build`.** The MAME test stand boots from
+`distr/sprinter-rtl8019a.img`, so a fresh `.EXE` in `build/` is invisible to
+the next test run until the floppy image is rebuilt. Treat the image as the
+deliverable that proves the change actually reaches the target. Use
+`make build` alone only for quick "does it assemble?" checks; before asking
+the user to retest in MAME (or before announcing a fix as ready), run
+`make package image` and confirm both `distr/*.zip` and `distr/*.img` are
+regenerated.
+
 The scripts must be tolerant while the project is being bootstrapped: apps
 listed in `tools/artifacts.sh` are skipped with a warning until their
 `src/apps/<name>.asm` entry point exists. Direct sjasmplus builds remain
