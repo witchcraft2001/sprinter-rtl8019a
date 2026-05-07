@@ -192,12 +192,13 @@ START
 	CALL	@TCP.SEND
 	JP	C,TCP_FAIL
 
-	; Init HTTP parser + body counter.
+	; Init HTTP parser + body counter + write buffer.
 	XOR	A
 	LD	(HSTATE),A
 	LD	HL,0
 	LD	(BODY_TOTAL_LO),HL
 	LD	(BODY_TOTAL_HI),HL
+	LD	(WGET_BUF_LEN),HL
 
 	; Receive loop.
 .RXLP
@@ -225,6 +226,10 @@ START
 	JR	Z,.DONE_RX
 	JR	.RXLP
 .DONE_RX
+
+	; Flush any buffered body bytes to disk.
+	CALL	FLUSH_BUF
+	JP	C,FILE_FAIL
 
 	; Close output file.
 	LD	A,(OUT_FH)
@@ -353,30 +358,91 @@ PROCESS_CHUNK
 	OR	C
 	RET	Z
 .WRITE_ALL
-	; Write BC bytes from (HL) to OUT_FH; accumulate
-	; BODY_TOTAL.
+	; Append BC bytes from (HL) to the in-RAM file buffer;
+	; the buffer is flushed to disk when full and at end
+	; of stream, drastically reducing per-segment DSS I/O.
+	JP	APPEND_TO_BUF
+
+
+; ------------------------------------------------------
+; APPEND_TO_BUF: append BC bytes from (HL) to WGET_FILE_BUF.
+; If the chunk would not fit, flush the current buffer
+; first, then copy.  On flush errors returns CF=1.
+; ------------------------------------------------------
+APPEND_TO_BUF
+	LD	A,B
+	OR	C
+	RET	Z
+	; Would (buf_len + chunk_len) exceed buf_size?
 	PUSH	HL
 	PUSH	BC
-	LD	A,(OUT_FH)
-	LD	D,B
-	LD	E,C
-	LD	C,DSS_WRITE
-	RST	DSS
+	LD	HL,(WGET_BUF_LEN)
+	ADD	HL,BC
+	LD	DE,WGET_FILE_BUF_SIZE
+	OR	A
+	SBC	HL,DE			; CF=1 if (buf_len + count) < size
+	JR	C,.FITS
+	; Doesn't fit: flush first.
+	CALL	FLUSH_BUF
+	JR	C,.FAIL
+.FITS
 	POP	BC
 	POP	HL
-	JP	C,FILE_FAIL_INSIDE
-	; BODY_TOTAL_LO += BC; if carry, BODY_TOTAL_HI++.
+	; Copy chunk into buffer at offset WGET_BUF_LEN.
+	LD	DE,(WGET_BUF_LEN)
 	PUSH	HL
+	LD	HL,WGET_FILE_BUF
+	ADD	HL,DE
+	EX	DE,HL			; DE = dst, HL = ?
+	POP	HL			; HL = src
+	PUSH	BC			; save count for body counter
+	LDIR
+	POP	BC
+	; buf_len += count
+	LD	HL,(WGET_BUF_LEN)
+	ADD	HL,BC
+	LD	(WGET_BUF_LEN),HL
+	; body_total += count (32-bit)
 	LD	HL,(BODY_TOTAL_LO)
 	ADD	HL,BC
 	LD	(BODY_TOTAL_LO),HL
-	POP	HL
-	RET	NC
-	PUSH	HL
+	JR	NC,.NOC
 	LD	HL,(BODY_TOTAL_HI)
 	INC	HL
 	LD	(BODY_TOTAL_HI),HL
+.NOC
+	OR	A
+	RET
+.FAIL
+	POP	BC
 	POP	HL
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; FLUSH_BUF: write the accumulated buffer to OUT_FH and
+; reset the fill counter.  No-op when the buffer is empty.
+;   Out: CF=0 ok; CF=1 DSS_WRITE error.
+; ------------------------------------------------------
+FLUSH_BUF
+	LD	HL,(WGET_BUF_LEN)
+	LD	A,H
+	OR	L
+	RET	Z
+	LD	D,H
+	LD	E,L			; DE = byte count
+	LD	HL,WGET_FILE_BUF
+	LD	A,(OUT_FH)
+	LD	C,DSS_WRITE
+	RST	DSS
+	JR	C,.ERR
+	LD	HL,0
+	LD	(WGET_BUF_LEN),HL
+	OR	A
+	RET
+.ERR
+	SCF
 	RET
 
 
@@ -452,14 +518,6 @@ HDR_TRANSITION
 	LD	(HSTATE),A
 	RET
 .IN_BYTE	DB 0
-
-
-FILE_FAIL_INSIDE
-	; Pop two return addresses (PROCESS_CHUNK's caller and
-	; PROCESS_CHUNK itself) before jumping to FILE_FAIL.
-	POP	HL			; caller's saved HL
-	POP	BC			; caller's saved BC
-	JP	FILE_FAIL
 
 
 FILE_FAIL
@@ -966,9 +1024,10 @@ DEC_BUF		EQU APP_BSS_BASE + 33		; 6
 HOST_BUF	EQU APP_BSS_BASE + 64		; HOST_BUF_SIZE
 PATH_BUF	EQU HOST_BUF + HOST_BUF_SIZE	; PATH_BUF_SIZE
 REQUEST_BUF	EQU PATH_BUF + PATH_BUF_SIZE	; REQUEST_BUF_SIZE
+WGET_BUF_LEN	EQU REQUEST_BUF + REQUEST_BUF_SIZE	; 2 bytes
 
 
-MSG_BANNER	DB "RTL8019AS WGET v0.1.3",0
+MSG_BANNER	DB "RTL8019AS WGET v0.2",0
 MSG_RESOLVED_PRE DB "Resolved ",0
 MSG_TO		DB " -> ",0
 MSG_PORT	DB " port ",0
@@ -1019,7 +1078,12 @@ RX_BUF_SIZE	EQU 1518
 TX_BUF		EQU WGET_IMAGE_END
 RX_HDR		EQU TX_BUF + TCP_MAX_FRAME
 RX_BUF		EQU RX_HDR + 4
-WGET_BSS_END	EQU RX_BUF + RX_BUF_SIZE
+; 8 KB write-coalescing buffer placed in directly-addressable
+; RAM after the RX area; flushed to disk on overflow and at
+; end of stream to amortise DSS_WRITE per-call overhead.
+WGET_FILE_BUF_SIZE EQU 8192
+WGET_FILE_BUF	EQU RX_BUF + RX_BUF_SIZE
+WGET_BSS_END	EQU WGET_FILE_BUF + WGET_FILE_BUF_SIZE
 
 	ENDMODULE
 

@@ -275,8 +275,9 @@ BUILD_SYN
 	LD	A,TF_SYN
 	LD	(DE),A
 	INC	DE
-	; window = 1024 (BE)
-	LD	A,0x04
+	; window = 4096 (BE) -- lets the peer pipeline more
+	; segments before waiting for an ACK.
+	LD	A,0x10
 	LD	(DE),A
 	INC	DE
 	XOR	A
@@ -353,8 +354,8 @@ BUILD_ACK
 	LD	A,TF_ACK
 	LD	(DE),A
 	INC	DE
-	; window
-	LD	A,0x04
+	; window = 4096
+	LD	A,0x10
 	LD	(DE),A
 	INC	DE
 	XOR	A
@@ -990,7 +991,7 @@ BUILD_DATA
 	LD	A,TF_PSH | TF_ACK
 	LD	(DE),A
 	INC	DE
-	LD	A,0x04			; window hi
+	LD	A,0x10			; window hi (4096)
 	LD	(DE),A
 	INC	DE
 	XOR	A
