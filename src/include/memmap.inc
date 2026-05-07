@@ -108,6 +108,11 @@ TCP_TX_LEN		EQU 0xAA20	; 2 bytes (last TX segment size)
 TCP_RX_DATA_PTR		EQU 0xAA22	; 2 bytes (-> data inside RX_BUF)
 TCP_RX_DATA_LEN		EQU 0xAA24	; 2 bytes (data byte count)
 
+; Total per-session TCP state size; copied wholesale by
+; TCP.SAVE_CTX / TCP.RESTORE_CTX so apps can multiplex
+; multiple sessions sequentially (FTP control + data).
+TCP_CTX_SIZE		EQU 0xAA26 - 0xAA00	; 38 bytes
+
 ; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + MSS(536)
 ; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF
 ; region to at least this.

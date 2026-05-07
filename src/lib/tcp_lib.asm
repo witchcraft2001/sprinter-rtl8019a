@@ -87,6 +87,34 @@ F_CANCEL		EQU 5
 
 
 ; ------------------------------------------------------
+; SAVE_CTX: copy the entire single-session TCP state into
+; a 38-byte caller-supplied buffer.  Combined with
+; RESTORE_CTX this lets apps swap between multiple logical
+; sessions (e.g. FTP control + data) without paying for a
+; full multi-session lib refactor.
+;   In:  DE = destination buffer (>= TCP_CTX_SIZE bytes).
+;   Out: DE advanced past the saved state.
+; ------------------------------------------------------
+SAVE_CTX
+	LD	HL,TCP_STATE
+	LD	BC,TCP_CTX_SIZE
+	LDIR
+	RET
+
+
+; ------------------------------------------------------
+; RESTORE_CTX: opposite of SAVE_CTX -- write the buffer
+; back into the live TCP state.
+;   In:  HL = source buffer.
+; ------------------------------------------------------
+RESTORE_CTX
+	LD	DE,TCP_STATE
+	LD	BC,TCP_CTX_SIZE
+	LDIR
+	RET
+
+
+; ------------------------------------------------------
 ; OPEN: 3-way handshake.
 ; ------------------------------------------------------
 OPEN
