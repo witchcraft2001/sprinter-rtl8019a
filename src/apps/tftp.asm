@@ -44,6 +44,8 @@ EXE_VERSION		EQU 1
 	DEFINE USE_NETENV
 	DEFINE USE_RESOLVE
 	DEFINE USE_CMDL
+	DEFINE USE_FILE
+	DEFINE USE_UTIL_PRINT_DEC_32
 	DEFINE CMDLINE_AT_LARGE
 
 ARP_TIMEOUT_MS	EQU 3000
@@ -140,6 +142,16 @@ START
 	XOR	A
 	LD	(DE),A
 
+	; -y / --yes: force overwrite without prompt.
+	XOR	A
+	LD	(FORCE_FLAG),A
+	LD	A,'y'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_FORCE
+	LD	A,1
+	LD	(FORCE_FLAG),A
+.NO_FORCE
+
 	; Pull NET_IP / NET_MAC from env (populated by NETCFG -i).
 	LD	HL,N_NET_IP
 	LD	DE,OUR_IP
@@ -177,7 +189,8 @@ START
 	LD	(SERVER_PORT_HI),A
 	LD	(SERVER_PORT_LO),A
 	LD	HL,0
-	LD	(TOTAL_BYTES),HL
+	LD	(TOTAL_BYTES_LO),HL
+	LD	(TOTAL_BYTES_HI),HL
 
 	; Banner: "GET FILENAME from HOST"
 	PRINT LINE_END
@@ -202,11 +215,10 @@ START
 	CALL	WAIT_FOR_ARP_REPLY
 	JP	C,ARP_TIMEOUT
 
-	; Open output file.
+	; Open output file (prompt-or-overwrite via @FILE.OPEN_OUTPUT).
 	LD	HL,FILENAME_BUF
-	LD	A,FA_ARCHIVE
-	LD	C,DSS_CREATE_OVERWRITE
-	RST	DSS
+	LD	A,(FORCE_FLAG)
+	CALL	@FILE.OPEN_OUTPUT
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
 
@@ -245,11 +257,15 @@ START
 	LD	C,DSS_WRITE
 	RST	DSS
 	JP	C,FILE_FAIL
-	; Accumulate total bytes.
+	; Accumulate total bytes (32-bit add: TOTAL_BYTES += DATA_LEN).
 	LD	HL,(DATA_LEN)
-	LD	BC,(TOTAL_BYTES)
+	LD	BC,(TOTAL_BYTES_LO)
 	ADD	HL,BC
-	LD	(TOTAL_BYTES),HL
+	LD	(TOTAL_BYTES_LO),HL
+	LD	HL,(TOTAL_BYTES_HI)
+	LD	BC,0
+	ADC	HL,BC				; propagate carry from low add
+	LD	(TOTAL_BYTES_HI),HL
 .NO_WRITE
 
 	; Send ACK for current block.
@@ -294,8 +310,9 @@ START
 	LD	(OUT_FH),A
 .NOCLOSE
 	PRINT MSG_DONE
-	LD	HL,(TOTAL_BYTES)
-	CALL	PRINT_DEC_HL
+	LD	HL,(TOTAL_BYTES_LO)
+	LD	DE,(TOTAL_BYTES_HI)
+	CALL	@UTIL.PRINT_DEC_32
 	PRINTLN MSG_BYTES_RECV
 
 	CALL	@ISA.ISA_CLOSE
@@ -478,63 +495,6 @@ TICK_AND_CHECK_KEY
 .NO_KEY
 	CALL	@ISA.ISA_OPEN
 	OR	A
-	RET
-
-
-; ------------------------------------------------------
-; PRINT_DEC_HL: print HL as unsigned decimal, no leading zeros.
-; Trashes A, BC, DE.
-; ------------------------------------------------------
-PRINT_DEC_HL
-	PUSH	HL
-	LD	A,H
-	OR	L
-	JR	NZ,.NZ
-	LD	A,'0'
-	CALL	PUTCHAR
-	POP	HL
-	RET
-.NZ
-	LD	B,0			; B = digit count
-.LP
-	LD	A,H
-	OR	L
-	JR	Z,.PRT
-	PUSH	BC			; DIV_HL_10 trashes BC
-	CALL	DIV_HL_10
-	POP	BC
-	ADD	A,'0'
-	PUSH	AF
-	INC	B
-	JR	.LP
-.PRT
-	LD	A,B
-	OR	A
-	JR	Z,.DONE
-.OUTL
-	POP	AF
-	CALL	PUTCHAR
-	DJNZ	.OUTL
-.DONE
-	POP	HL
-	RET
-
-DIV_HL_10
-	LD	BC,0
-	LD	DE,16
-.LP
-	ADD	HL,HL
-	RL	C
-	LD	A,C
-	CP	10
-	JR	C,.NS
-	SUB	10
-	LD	C,A
-	INC	L
-.NS
-	DEC	E
-	JR	NZ,.LP
-	LD	A,C
 	RET
 
 
@@ -954,7 +914,7 @@ PRINT_DEC_A
 	POP	HL,DE,BC,AF
 	RET
 
-DEC_BUF		EQU APP_BSS_BASE + 44 + FILENAME_BUF_SIZE	; 4 bytes scratch for PRINT_DEC_A
+DEC_BUF		EQU APP_BSS_BASE + 48 + FILENAME_BUF_SIZE	; 4 bytes scratch for PRINT_DEC_A
 
 
 PUTCHAR
@@ -1021,18 +981,20 @@ SERVER_PORT_HI	 EQU APP_BSS_BASE + 22		; 1 byte
 SERVER_PORT_LO	 EQU APP_BSS_BASE + 23		; 1 byte
 EXPECTED_BLOCK	 EQU APP_BSS_BASE + 24		; 2 bytes
 DATA_LEN	 EQU APP_BSS_BASE + 26		; 2 bytes
-TOTAL_BYTES	 EQU APP_BSS_BASE + 28		; 2 bytes
-RRQ_LEN		 EQU APP_BSS_BASE + 30		; 2 bytes
-IP_TOTAL_LEN	 EQU APP_BSS_BASE + 32		; 2 bytes
-UDP_LEN		 EQU APP_BSS_BASE + 34		; 2 bytes
-OUT_FH		 EQU APP_BSS_BASE + 36		; 1 byte (set to NO_HANDLE at startup)
-CANCELLED	 EQU APP_BSS_BASE + 37		; 1 byte
-TARGET_HOST_PTR	 EQU APP_BSS_BASE + 38		; 2 bytes (-> argv token)
-TFTP_PAYLOAD_PTR EQU APP_BSS_BASE + 38		; 2 bytes
-TFTP_PAYLOAD_LEN EQU APP_BSS_BASE + 40		; 2 bytes
-TFTP_DST_PORT_HI EQU APP_BSS_BASE + 42		; 1 byte
-TFTP_DST_PORT_LO EQU APP_BSS_BASE + 43		; 1 byte
-FILENAME_BUF	 EQU APP_BSS_BASE + 44		; FILENAME_BUF_SIZE bytes
+TOTAL_BYTES_LO	 EQU APP_BSS_BASE + 28		; 2 bytes (32-bit accumulator, low word)
+TOTAL_BYTES_HI	 EQU APP_BSS_BASE + 30		; 2 bytes (high word)
+RRQ_LEN		 EQU APP_BSS_BASE + 32		; 2 bytes
+IP_TOTAL_LEN	 EQU APP_BSS_BASE + 34		; 2 bytes
+UDP_LEN		 EQU APP_BSS_BASE + 36		; 2 bytes
+OUT_FH		 EQU APP_BSS_BASE + 38		; 1 byte (set to NO_HANDLE at startup)
+CANCELLED	 EQU APP_BSS_BASE + 39		; 1 byte
+FORCE_FLAG	 EQU APP_BSS_BASE + 40		; 1 byte (-y / --yes)
+TARGET_HOST_PTR	 EQU APP_BSS_BASE + 42		; 2 bytes (-> argv token; reused below)
+TFTP_PAYLOAD_PTR EQU APP_BSS_BASE + 42		; 2 bytes
+TFTP_PAYLOAD_LEN EQU APP_BSS_BASE + 44		; 2 bytes
+TFTP_DST_PORT_HI EQU APP_BSS_BASE + 46		; 1 byte
+TFTP_DST_PORT_LO EQU APP_BSS_BASE + 47		; 1 byte
+FILENAME_BUF	 EQU APP_BSS_BASE + 48		; FILENAME_BUF_SIZE bytes
 
 
 ; ------- messages -------
@@ -1054,11 +1016,12 @@ MSG_E_NO_DNS1	DB "[E] NET_DNS1 not set; pass an IPv4 literal or run NETCFG/IFUP 
 MSG_E_NO_GW	DB "[E] DNS server is off-subnet but NET_GW is not set.",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  TFTP host GET filename",13,10
+	DB "  TFTP host GET filename [-y]",13,10
 	DB "  TFTP /?",13,10,13,10
 	DB "  host      TFTP server IPv4 (e.g. 192.168.7.1).",13,10
 	DB "  GET       fetch operation (only mode supported).",13,10
-	DB "  filename  remote file (saved locally with same name).",13,10,0
+	DB "  filename  remote file (saved locally with same name).",13,10
+	DB "  -y        overwrite local file without prompt.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
@@ -1074,6 +1037,7 @@ LINE_END	DB 13,10,0
 	INCLUDE "arp_lib.asm"
 	INCLUDE "resolve_lib.asm"
 	INCLUDE "dns_lib.asm"
+	INCLUDE "file_lib.asm"
 
 
 TFTP_IMAGE_END

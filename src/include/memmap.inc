@@ -22,6 +22,9 @@
 ; util.asm: 4-byte hex-print scratch.
 UTIL_HBUF		EQU 0xA000
 
+; util.asm: 4-byte scratch for PRINT_DEC_32 (long-division work).
+UTIL_DEC32_SCRATCH	EQU 0xA004
+
 ; rtl8019.asm: 10-byte register snapshot scratch.
 RTL_REG_SNAPSHOT	EQU 0xA010
 

@@ -312,6 +312,104 @@ CHECKSUM
 ;   EXIT_OK    Print "RESULT OK", exit B=0.
 ;   EXIT_FAIL  In: B = exit code. Print "RESULT FAIL", exit.
 ; ------------------------------------------------------
+	IFDEF USE_UTIL_PRINT_DEC_32
+; ------------------------------------------------------
+; PRINT_DEC_32: print 32-bit value as unsigned decimal,
+; no leading zeros, via DSS_PUTCHAR.
+;   In:  HL = low word, DE = high word
+;   Out: trashes A,BC,DE,HL.
+; ------------------------------------------------------
+PRINT_DEC_32
+	; Stash value into UTIL_DEC32_SCRATCH (LE order).
+	LD	(UTIL_DEC32_SCRATCH),HL
+	LD	(UTIL_DEC32_SCRATCH + 2),DE
+	; Special-case zero.
+	LD	A,(UTIL_DEC32_SCRATCH)
+	LD	B,A
+	LD	A,(UTIL_DEC32_SCRATCH + 1)
+	OR	B
+	LD	B,A
+	LD	A,(UTIL_DEC32_SCRATCH + 2)
+	OR	B
+	LD	B,A
+	LD	A,(UTIL_DEC32_SCRATCH + 3)
+	OR	B
+	JR	NZ,.NZ
+	LD	A,'0'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	RET
+.NZ
+	LD	B,0			; digit count
+.LP
+	CALL	.DIV32_10
+	ADD	A,'0'
+	PUSH	AF
+	INC	B
+	; Test value zero.
+	LD	A,(UTIL_DEC32_SCRATCH)
+	LD	C,A
+	LD	A,(UTIL_DEC32_SCRATCH + 1)
+	OR	C
+	LD	C,A
+	LD	A,(UTIL_DEC32_SCRATCH + 2)
+	OR	C
+	LD	C,A
+	LD	A,(UTIL_DEC32_SCRATCH + 3)
+	OR	C
+	JR	NZ,.LP
+.OUT
+	POP	AF
+	PUSH	BC
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	BC
+	DJNZ	.OUT
+	RET
+
+; .DIV32_10: divide 32-bit LE value at UTIL_DEC32_SCRATCH
+; by 10 in place; A = remainder.  Standard MSB-first long
+; division.  Preserves B (digit counter).
+.DIV32_10
+	PUSH	BC
+	PUSH	DE
+	LD	HL,0			; remainder
+	LD	B,32
+.DLP
+	; Shift the 32-bit value left by 1, MSB -> carry.
+	PUSH	HL
+	LD	HL,UTIL_DEC32_SCRATCH
+	SLA	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	POP	HL
+	; remainder = remainder*2 + carry
+	ADC	HL,HL
+	; If remainder >= 10, subtract 10 and set quotient bit.
+	LD	DE,10
+	OR	A
+	SBC	HL,DE
+	JR	NC,.DSUB
+	ADD	HL,DE
+	JR	.DNEXT
+.DSUB
+	PUSH	HL
+	LD	HL,UTIL_DEC32_SCRATCH
+	SET	0,(HL)
+	POP	HL
+.DNEXT
+	DJNZ	.DLP
+	LD	A,L
+	POP	DE
+	POP	BC
+	RET
+	ENDIF
+
+
 	IFDEF USE_UTIL_EXIT
 EXIT
 	DSS_EXEC DSS_EXIT
