@@ -88,6 +88,31 @@ RESOLVE_DEST_PTR	EQU 0xA926	; 2 bytes (caller's output IP buffer)
 ; least this many bytes so the resolver can build a query.
 RESOLVE_MAX_FRAME	EQU 320
 
+; tcp_lib: single-session TCP state.  Active only in apps
+; that pull tcp_lib (WGET, future FTP).  Sequence numbers
+; stored in network (big-endian) byte order to simplify
+; wire-format reads/writes.
+TCP_STATE		EQU 0xAA00	; 1 byte (CLOSED/SYN_SENT/...)
+TCP_REMOTE_IP		EQU 0xAA01	; 4 bytes (set by caller)
+TCP_REMOTE_MAC		EQU 0xAA05	; 6 bytes (next-hop, caller ARPs)
+TCP_REMOTE_PORT_HI	EQU 0xAA0B	; 1 byte (BE)
+TCP_REMOTE_PORT_LO	EQU 0xAA0C	; 1 byte (BE)
+TCP_LOCAL_PORT_HI	EQU 0xAA0D	; 1 byte (BE)
+TCP_LOCAL_PORT_LO	EQU 0xAA0E	; 1 byte (BE)
+TCP_SND_NXT		EQU 0xAA10	; 4 bytes (BE)
+TCP_SND_UNA		EQU 0xAA14	; 4 bytes (BE)
+TCP_RCV_NXT		EQU 0xAA18	; 4 bytes (BE)
+TCP_TIMEOUT_LEFT	EQU 0xAA1C	; 2 bytes
+TCP_LAST_FAIL		EQU 0xAA1E	; 1 byte
+TCP_TX_LEN		EQU 0xAA20	; 2 bytes (last TX segment size)
+TCP_RX_DATA_PTR		EQU 0xAA22	; 2 bytes (-> data inside RX_BUF)
+TCP_RX_DATA_LEN		EQU 0xAA24	; 2 bytes (data byte count)
+
+; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + MSS(536)
+; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF
+; region to at least this.
+TCP_MAX_FRAME		EQU 600
+
 ; ----- Per-app private BSS (0xB000+) ---------------------
 
 ; Each app lays out its own scratch starting at this base.

@@ -27,6 +27,7 @@ BUILD_APPS=(
   ifup
   ntp
   nslookup
+  wget
 )
 
 # Text/documentation files copied to the distribution root.
