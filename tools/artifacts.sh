@@ -15,6 +15,7 @@ DIST_DIR_NAME="SPRTL"
 BUILD_APPS=(
   hello
   nicinfo
+  isaprobe
   nicram
   niclb
   nictx
