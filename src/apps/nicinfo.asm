@@ -19,6 +19,8 @@ EXE_VERSION		EQU 1
 	INCLUDE "dss.inc"
 	INCLUDE "rtl8019.inc"		; pure EQUs (also pulls isa.inc)
 
+	DEFINE USE_UTIL_EXIT_NO_NIC	; fast-fail "no NIC" path
+
 	MODULE MAIN
 
 	ORG 0x8080
@@ -54,6 +56,14 @@ START
 	LD	(@ISA.ISA_SLOT),A
 
 	CALL	@ISA.ISA_OPEN
+
+	; Scan candidate I/O bases and print which respond.
+	; Sets ZF=1 (i.e. CF=0 from internal CP) if the default
+	; base 0x300 is among the responders.  Anything else is
+	; reported but not used -- the rest of the driver assumes
+	; the default base is wired up in rtl8019.inc.
+	CALL	SCAN_BASES
+	JP	C,SCAN_FAIL
 
 	; [N1] RESET
 	PRINT MSG_N1
@@ -201,6 +211,188 @@ PROM_FAIL
 	PRINTLN MSG_RESULT_FAIL
 	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NIC_ERR
+
+SCAN_FAIL
+	; The default base 0x300 did not respond.  Either the card
+	; is missing entirely or it is jumpered to one of the
+	; alternates -- which one (if any) the user can read off the
+	; "Scan:" line above.  The driver is currently hard-wired to
+	; 0x300, so we cannot continue here either way.
+	PRINTLN MSG_E_SCAN
+	PRINTLN MSG_RESULT_FAIL
+	CALL	@ISA.ISA_CLOSE
+	DSS_RETURN EX_NO_HW
+
+
+; ------------------------------------------------------
+; SCAN_BASES: probe each candidate I/O base and print one
+; line of the form
+;   "Scan: 300=ok 320=- 340=- 360=-"
+; (or "no" instead of "-" if a probe fails after starting
+; to write -- not currently distinguished, both are "-").
+;
+; Out: CF=0 if the default base 0x300 responded; CF=1 if
+;      0x300 did not respond (the caller's normal flow
+;      cannot continue because the rest of the driver is
+;      hard-wired to 0x300).  Other bases that responded
+;      are still printed in the table, so a user who has
+;      jumpered the card to e.g. 0x320 still sees a clue.
+; Trashes A,BC,DE,HL.
+; ------------------------------------------------------
+SCAN_BASES
+	PRINT MSG_SCAN_HDR
+	XOR	A
+	LD	(.AT_300),A
+	LD	(.SEEN),A
+	LD	HL,SCAN_TABLE
+.LP
+	; Read entry into DE; advance HL.  HL is the table cursor.
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	INC	HL
+	LD	A,D
+	OR	E
+	JR	Z,.DONE
+	; Every 8 entries: line break + small indent for readability.
+	LD	A,(.SEEN)
+	OR	A
+	JR	Z,.NO_BREAK
+	AND	0x07
+	JR	NZ,.NO_BREAK
+	PUSH	HL
+	PUSH	DE
+	PRINT LINE_END
+	PRINT MSG_SCAN_INDENT
+	POP	DE
+	POP	HL
+.NO_BREAK
+	LD	A,(.SEEN)
+	INC	A
+	LD	(.SEEN),A
+	; Save cursor + entry across DSS calls.  RST DSS does NOT
+	; preserve IX/IY (and may not preserve all GP regs); the
+	; stack is the only safe stash.
+	PUSH	HL			; cursor
+	PUSH	DE			; window addr
+	; Print "<I/O base>=" by stripping the ISA window high byte.
+	LD	A,D
+	SUB	HIGH ISA_BASE_A
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,E
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,'='
+	CALL	PUTCHAR
+	; Probe at the saved window addr.
+	POP	DE
+	PUSH	DE			; keep it for the 0x300 check
+	LD	H,D
+	LD	L,E
+	CALL	PROBE_AT_HL
+	JR	C,.MISS
+	PRINT MSG_SCAN_OK
+	POP	DE			; window addr just probed
+	LD	A,D
+	CP	HIGH (ISA_BASE_A + 0x300)
+	JR	NZ,.AFTER
+	LD	A,E
+	CP	LOW (ISA_BASE_A + 0x300)
+	JR	NZ,.AFTER
+	LD	A,1
+	LD	(.AT_300),A
+.AFTER
+	POP	HL			; restore cursor
+	JR	.LP
+.MISS
+	POP	DE			; discard saved window addr
+	PRINT MSG_SCAN_NO
+	POP	HL			; restore cursor
+	JR	.LP
+.DONE
+	PRINT LINE_END
+	LD	A,(.AT_300)
+	OR	A
+	RET	NZ			; CF=0, default base ok
+	SCF
+	RET
+.AT_300	DB 0
+.SEEN	DB 0
+
+
+; ------------------------------------------------------
+; PROBE_AT_HL: presence probe at window address HL (HL =
+; e.g. 0xC300 for I/O base 0x300).  Same idea as
+; @RTL.PROBE_PRESENT but parameterized so we can test
+; alternate bases without rebuilding the driver.
+;
+; Layout used: HL+0 = CR, HL+3 = BNRY (R/W), HL+4 = TPSR (W).
+; The two-port write/read trick defeats the ISA-bus latch:
+; an absent card retains the last byte driven onto the
+; bus, so a same-port round-trip falsely looks like a hit.
+; We write to BNRY, clobber via TPSR, then read BNRY back.
+;
+; Out: CF=0 chip responding at this base; CF=1 absent.
+; Trashes A.  HL preserved.
+; ------------------------------------------------------
+PROBE_AT_HL
+	PUSH	HL
+	; Stop the chip on this candidate base.
+	LD	A,CR_PAGE0_STOP
+	LD	(HL),A			; CR
+	INC	HL
+	INC	HL
+	INC	HL			; HL -> BNRY
+	; Round 1: BNRY=0xAA, clobber bus via TPSR=0x55, read BNRY.
+	LD	A,0xAA
+	LD	(HL),A
+	INC	HL			; HL -> TPSR
+	LD	A,0x55
+	LD	(HL),A
+	DEC	HL			; HL -> BNRY
+	LD	A,(HL)
+	CP	0xAA
+	JR	NZ,.MISS
+	; Round 2: invert.
+	LD	A,0x55
+	LD	(HL),A
+	INC	HL
+	LD	A,0xAA
+	LD	(HL),A
+	DEC	HL
+	LD	A,(HL)
+	CP	0x55
+	JR	NZ,.MISS
+	POP	HL
+	OR	A
+	RET
+.MISS
+	POP	HL
+	SCF
+	RET
+
+
+; Full 16-entry NE2000 / RTL8019AS jumperless candidate
+; set, 32-byte stride.  All within Sprinter's 14-bit ISA
+; window (PORT_ISA=0 maps I/O 0x0000..0x3FFF to memory
+; 0xC000..0xFFFF), so no window remap is needed.
+SCAN_TABLE
+	DW ISA_BASE_A + 0x200
+	DW ISA_BASE_A + 0x220
+	DW ISA_BASE_A + 0x240
+	DW ISA_BASE_A + 0x260
+	DW ISA_BASE_A + 0x280
+	DW ISA_BASE_A + 0x2A0
+	DW ISA_BASE_A + 0x2C0
+	DW ISA_BASE_A + 0x2E0
+	DW ISA_BASE_A + 0x300
+	DW ISA_BASE_A + 0x320
+	DW ISA_BASE_A + 0x340
+	DW ISA_BASE_A + 0x360
+	DW ISA_BASE_A + 0x380
+	DW ISA_BASE_A + 0x3A0
+	DW ISA_BASE_A + 0x3C0
+	DW ISA_BASE_A + 0x3E0
+	DW 0
 
 
 ; ------------------------------------------------------
@@ -379,6 +571,15 @@ MSG_E_RESET	DB "[E01] RESET timeout",0
 MSG_E_PROM	DB "[E03] PROM read failed",0
 MSG_W_SIG	DB "[W01] PROM[0E..0F] != 57 57 (NE2000 signature mismatch)",0
 MSG_W_NO_ID	DB "[W02] ID mismatch but MAC plausible -- continuing",0
+MSG_SCAN_HDR	DB "Scan: ",0
+MSG_SCAN_INDENT	DB "      ",0
+MSG_SCAN_OK	DB "ok ",0
+MSG_SCAN_NO	DB "-- ",0
+MSG_E_SCAN	DB "[E04] no chip at default I/O base 0x300.",13,10
+		DB "      If the Scan line shows another base responding, the card",13,10
+		DB "      is jumpered there but the driver is currently hard-wired",13,10
+		DB "      to 0x300 -- rejumper the card or wait for RTL_IOBASE",13,10
+		DB "      override support.  Otherwise the card is missing.",0
 LINE_END	DB 13,10,0
 
 	ENDMODULE

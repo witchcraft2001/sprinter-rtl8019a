@@ -410,6 +410,13 @@ PRINT_DEC_32
 	ENDIF
 
 
+	; USE_UTIL_EXIT_NO_NIC implies USE_UTIL_EXIT (it tail-calls EXIT_FAIL).
+	IFDEF USE_UTIL_EXIT_NO_NIC
+	IFNDEF USE_UTIL_EXIT
+	DEFINE USE_UTIL_EXIT
+	ENDIF
+	ENDIF
+
 	IFDEF USE_UTIL_EXIT
 EXIT
 	DSS_EXEC DSS_EXIT
@@ -428,6 +435,27 @@ EXIT_FAIL
 	DSS_EXEC DSS_EXIT
 _EXIT_S_OK	DB "RESULT OK",13,10,0
 _EXIT_S_FAIL	DB "RESULT FAIL",13,10,0
+	ENDIF
+
+	IFDEF USE_UTIL_EXIT_NO_NIC
+; ------------------------------------------------------
+; EXIT_NO_NIC: print a clear "card not detected" line
+; (followed by RESULT FAIL) and exit with EX_NO_HW.
+; Caller must have the ISA window CURRENTLY OPEN (entered
+; via @ISA.ISA_OPEN) -- this helper closes it before any
+; DSS_PCHARS, since DSS uses MMU page 3 which the ISA
+; window occupies.
+; Requires: @ISA.ISA_CLOSE, EX_NO_HW (rtl8019.inc).
+; ------------------------------------------------------
+EXIT_NO_NIC
+	CALL	@ISA.ISA_CLOSE
+	LD	HL,_EXIT_S_NO_NIC
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	B,EX_NO_HW
+	JR	EXIT_FAIL
+_EXIT_S_NO_NIC	DB 13,10,"[E] RTL8019AS not detected at I/O base 0x300.",13,10
+		DB     "    Card missing, wrong base, or ISA bus not driven.",13,10,0
 	ENDIF
 
 	ENDMODULE

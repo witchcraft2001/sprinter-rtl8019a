@@ -143,6 +143,51 @@ ID0_RAW		DB 0
 ID1_RAW		DB 0
 
 ; ------------------------------------------------------
+; PROBE_PRESENT: fast-fail "is the chip there at all?"
+; check.  Writes a pattern to BNRY (page 0 R/W reg 0x03),
+; then writes a DIFFERENT pattern to TPSR (page 0 W-only
+; reg 0x04) to clobber the ISA data bus, then reads BNRY.
+; If a chip is present, BNRY still holds the first pattern
+; (it has its own latch).  If no chip, the read returns
+; the value last driven onto the bus (the TPSR write) -- a
+; floating ISA bus retains the last written byte for many
+; microseconds, so a same-port write/read round-trip is
+; NOT a reliable presence test on its own.  The two-port
+; trick defeats this.
+;
+; BNRY is not restored: callers must follow with RTL.RESET
+; + RTL.INIT_NORMAL (or _LOOPBACK), which rewrite BNRY.
+;
+; Out: CF=0 -> chip responding; CF=1 -> no chip.
+; Trashes A.
+; ------------------------------------------------------
+PROBE_PRESENT
+	LD	A,CR_PAGE0_STOP
+	LD	(RTL_CR_A),A
+	; Round 1: BNRY=0xAA, clobber bus via TPSR=0x55, read BNRY.
+	LD	A,0xAA
+	LD	(RTL_BNRY_A),A
+	LD	A,0x55
+	LD	(RTL_TPSR_A),A
+	LD	A,(RTL_BNRY_A)
+	CP	0xAA
+	JR	NZ,.ABSENT
+	; Round 2: invert (BNRY=0x55, clobber via TPSR=0xAA).
+	LD	A,0x55
+	LD	(RTL_BNRY_A),A
+	LD	A,0xAA
+	LD	(RTL_TPSR_A),A
+	LD	A,(RTL_BNRY_A)
+	CP	0x55
+	JR	NZ,.ABSENT
+	OR	A			; CF=0
+	RET
+.ABSENT
+	SCF
+	RET
+
+
+; ------------------------------------------------------
 ; Snapshot 10 useful registers into REG_SNAPSHOT in the same
 ; order the diagnostic line prints them:
 ;   [0] CR      page 0, offs 0x00
