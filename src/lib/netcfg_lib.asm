@@ -150,23 +150,26 @@ APPLY_DEFAULTS
 	LD	DE,DNS2
 	LD	BC,4
 	LDIR
-	LD	HL,.D_NTP
-	LD	DE,NTP
-	LD	BC,13			; "pool.ntp.org" + null
-	LDIR
-	LD	A,3
-	LD	(TZ),A
+	; NTP defaults to empty string (no host).  NETCFG/print and
+	; NTP.EXE treat "(not set)" as "user did not supply".
 	XOR	A
+	LD	(NTP),A
+	LD	(TZ),A
 	LD	(DHCP_MODE),A
 	RET
 
-.D_MAC		DB 0x02, 0x80, 0x19, 0x11, 0x22, 0x33
-.D_IP		DB 192, 168, 7, 2
-.D_NETMASK	DB 255, 255, 255, 0
-.D_GATEWAY	DB 192, 168, 7, 1
-.D_DNS1		DB 1, 1, 1, 1
-.D_DNS2		DB 8, 8, 8, 8
-.D_NTP		DB "pool.ntp.org",0
+; Hardcoded defaults applied BEFORE NET.CFG parsing.  If NET.CFG
+; sets a key, the parsed value overwrites the default.  We use
+; 0.0.0.0 / 00:00:00:00:00:00 (and an empty NTP host) so that a
+; missing-from-NET.CFG field shows up as "(not set)" in NETCFG
+; output and as an `[E]` "not set" diagnostic in apps that need
+; that field, instead of a misleading magic test-stand value.
+.D_MAC		DB 0, 0, 0, 0, 0, 0
+.D_IP		DB 0, 0, 0, 0
+.D_NETMASK	DB 0, 0, 0, 0
+.D_GATEWAY	DB 0, 0, 0, 0
+.D_DNS1		DB 0, 0, 0, 0
+.D_DNS2		DB 0, 0, 0, 0
 
 
 ; ------------------------------------------------------
@@ -399,11 +402,17 @@ PARSE_IPV4_LINE
 	INC	HL
 	JR	.LP
 .DONE
-	; Copy TMP_IP -> caller's dest.
+	; Copy TMP_IP -> caller's dest, preserving HL (the parse
+	; cursor in NET.CFG) so SKIP_TO_NEXT_LINE keeps walking the
+	; right buffer.  Earlier code blindly LD HL,.TMP_IP before
+	; LDIR, which left HL pointing into the scratch slot and
+	; broke parsing of every line after the first IPv4 key.
 	POP	DE
+	PUSH	HL
 	LD	HL,.TMP_IP
 	LD	BC,4
 	LDIR
+	POP	HL
 	JP	SKIP_TO_NEXT_LINE
 .BAD
 	POP	DE
@@ -445,10 +454,14 @@ PARSE_MAC_LINE
 	INC	HL
 	JR	.LP
 .DONE
+	; Preserve HL (parse cursor in NET.CFG) across the LDIR
+	; from the scratch slot.  Same bug as PARSE_IPV4_LINE.
 	POP	DE
+	PUSH	HL
 	LD	HL,.TMP_MAC
 	LD	BC,6
 	LDIR
+	POP	HL
 	JP	SKIP_TO_NEXT_LINE
 .BAD
 	POP	DE

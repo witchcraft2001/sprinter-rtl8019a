@@ -25,6 +25,7 @@ EXE_VERSION	EQU 1
 	INCLUDE "macro.inc"
 	INCLUDE "dss.inc"
 	INCLUDE "memmap.inc"
+	INCLUDE "rtl8019.inc"		; for PROM read fallback
 
 	DEFINE USE_NETCFG_LOAD
 	DEFINE USE_UTIL_EXIT
@@ -329,6 +330,12 @@ DO_INIT
 	PRINTLN MSG_INITIALIZING
 	CALL	@NETCFG.LOAD
 	JP	C,.MISS
+	; If NET.CFG had no RTL_MAC= line (or it was empty), the MAC
+	; field is all-zero -- read the PROM and use that.  Failure
+	; is non-fatal: we leave MAC zero and SETENV_MAC will delete
+	; the env var, so apps that need a MAC will fail with a clear
+	; "[E4] N_NET_MAC not set" diagnostic.
+	CALL	FILL_MAC_FROM_PROM
 	; Always push MAC, NTP, TZ.
 	LD	HL,N_NET_MAC
 	LD	IX,@NETCFG.OUR_MAC
@@ -395,6 +402,85 @@ DO_INIT
 
 
 ; ------------------------------------------------------
+; FILL_MAC_FROM_PROM: if the parsed MAC field is all zero
+; (no RTL_MAC line in NET.CFG), find the chip on ISA slot
+; 1 or 0, read 32 bytes of PROM, detect direct vs doubled
+; layout (each byte aliased twice in 16-bit-mode PROM read),
+; and copy bytes 0..5 of the resulting MAC into NETCFG's
+; OUR_MAC field.  Failure is silent.
+; ------------------------------------------------------
+FILL_MAC_FROM_PROM
+	; Already configured?  Skip.
+	LD	HL,@NETCFG.OUR_MAC
+	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	INC	HL
+	OR	(HL)
+	INC	HL
+	OR	(HL)
+	INC	HL
+	OR	(HL)
+	INC	HL
+	OR	(HL)
+	RET	NZ
+	; Find chip on slot 1, fall back to slot 0.
+	LD	A,1
+	LD	(@ISA.ISA_SLOT),A
+	CALL	@ISA.ISA_OPEN
+	CALL	@RTL.PROBE_PRESENT
+	JR	NC,.HAVE_CHIP
+	CALL	@ISA.ISA_CLOSE
+	XOR	A
+	LD	(@ISA.ISA_SLOT),A
+	CALL	@ISA.ISA_OPEN
+	CALL	@RTL.PROBE_PRESENT
+	JR	NC,.HAVE_CHIP
+	CALL	@ISA.ISA_CLOSE
+	RET				; no chip anywhere; silently leave MAC zero
+.HAVE_CHIP
+	CALL	@RTL.RESET
+	JR	C,.CLOSE
+	; DCR = 0x48: 8-bit data path, FIFO threshold 8 (mandatory
+	; per spec; MAME post-reset DCR is 0x04 which is unsafe).
+	LD	A,DCR_INIT
+	LD	(RTL_DCR_A),A
+	; Reuse NETCFG_LOAD_BUF as the 32-byte PROM scratch.  By
+	; this point NET.CFG has already been parsed so the buffer
+	; is no longer needed.
+	LD	HL,NETCFG_LOAD_BUF
+	CALL	@RTL.READ_PROM
+	JR	C,.CLOSE
+	; Detect doubled layout: PROM[0]==PROM[1].
+	LD	HL,NETCFG_LOAD_BUF
+	LD	A,(HL)
+	INC	HL
+	CP	(HL)
+	JR	NZ,.DIRECT
+	; Doubled: copy PROM[0,2,4,6,8,10] -> OUR_MAC.
+	LD	HL,NETCFG_LOAD_BUF
+	LD	DE,@NETCFG.OUR_MAC
+	LD	B,6
+.DBL_LP
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	INC	HL
+	INC	DE
+	DJNZ	.DBL_LP
+	JR	.CLOSE
+.DIRECT
+	; Direct: PROM[0..5] -> OUR_MAC.
+	LD	HL,NETCFG_LOAD_BUF
+	LD	DE,@NETCFG.OUR_MAC
+	LD	BC,6
+	LDIR
+.CLOSE
+	CALL	@ISA.ISA_CLOSE
+	RET
+
+
+; ------------------------------------------------------
 ; DELETE_VAR: SETENV "<NAME>=" to remove the entry.
 ;   In: HL = ASCIIZ name.
 ; ------------------------------------------------------
@@ -417,9 +503,22 @@ DELETE_VAR
 ; ------------------------------------------------------
 ; SETENV_IPV4: build "NAME=A.B.C.D" in SET_BUF, SETENV.
 ;   In: HL = ASCIIZ name; IX = 4-byte IP.
+;   If the IP is 0.0.0.0 (i.e. not configured by NET.CFG and
+;   not pre-loaded with a default), DELETE the env var instead
+;   of publishing "0.0.0.0", so DO_SHOW marks the field as
+;   "<not set>" and downstream apps see N_NET_x missing.
 ;   Trashes A, BC, DE, HL.
 ; ------------------------------------------------------
 SETENV_IPV4
+	; Check for all-zero IP.
+	LD	A,(IX+0)
+	OR	(IX+1)
+	OR	(IX+2)
+	OR	(IX+3)
+	JR	NZ,.NONZERO
+	; Zero IP -> delete the var.  HL still = name.
+	JP	DELETE_VAR
+.NONZERO
 	LD	DE,SET_BUF
 	CALL	COPY_ASCIIZ
 	DEC	DE			; back over NUL
@@ -454,8 +553,18 @@ SETENV_IPV4
 ; ------------------------------------------------------
 ; SETENV_MAC: build "NAME=aa:bb:cc:dd:ee:ff" then SETENV.
 ;   In: HL = name; IX = 6-byte MAC.
+;   All-zero MAC -> delete env var (treat as "not configured").
 ; ------------------------------------------------------
 SETENV_MAC
+	LD	A,(IX+0)
+	OR	(IX+1)
+	OR	(IX+2)
+	OR	(IX+3)
+	OR	(IX+4)
+	OR	(IX+5)
+	JR	NZ,.NONZERO
+	JP	DELETE_VAR
+.NONZERO
 	LD	DE,SET_BUF
 	CALL	COPY_ASCIIZ
 	DEC	DE
@@ -486,8 +595,12 @@ SETENV_MAC
 ; ------------------------------------------------------
 ; SETENV_STR: build "NAME=value" using ASCIIZ source at IX.
 ;   In: HL = name; IX = ASCIIZ value.
+;   Empty value -> delete the env var (treat as "not set").
 ; ------------------------------------------------------
 SETENV_STR
+	LD	A,(IX+0)
+	OR	A
+	JP	Z,DELETE_VAR
 	LD	DE,SET_BUF
 	CALL	COPY_ASCIIZ
 	DEC	DE
@@ -724,4 +837,6 @@ SHOW_VAL_BUF	EQU APP_BSS_BASE + 290		; GETENV destination, 256 bytes
 
 	; netcfg_lib pulls UTIL helpers transitively; include before util.asm.
 	INCLUDE "netcfg_lib.asm"
+	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
+	INCLUDE "rtl8019.asm"
