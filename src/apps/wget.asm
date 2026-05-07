@@ -245,8 +245,7 @@ START
 
 	; Print summary.
 	PRINT MSG_DONE_PRE
-	LD	HL,(BODY_TOTAL_LO)
-	CALL	PRINT_DEC_HL
+	CALL	PRINT_DEC_32
 	PRINTLN MSG_BYTES
 
 	CALL	@ISA.ISA_CLOSE
@@ -923,6 +922,98 @@ DIV_HL_10
 	RET
 
 
+; ------------------------------------------------------
+; PRINT_DEC_32: print BODY_TOTAL (32-bit LE) as decimal.
+; ------------------------------------------------------
+PRINT_DEC_32
+	; Copy 4 bytes BODY_TOTAL_LO..HI into scratch.
+	LD	HL,BODY_TOTAL_LO
+	LD	DE,DEC32_WORK
+	LD	BC,4
+	LDIR
+	; Special-case zero.
+	LD	A,(DEC32_WORK)
+	LD	B,A
+	LD	A,(DEC32_WORK + 1)
+	OR	B
+	LD	B,A
+	LD	A,(DEC32_WORK + 2)
+	OR	B
+	LD	B,A
+	LD	A,(DEC32_WORK + 3)
+	OR	B
+	JR	NZ,.NZ
+	LD	A,'0'
+	JP	PUTCHAR
+.NZ
+	LD	B,0			; digit count
+.LP
+	CALL	DIV32_10
+	ADD	A,'0'
+	PUSH	AF
+	INC	B
+	; Test value zero.
+	LD	A,(DEC32_WORK)
+	LD	C,A
+	LD	A,(DEC32_WORK + 1)
+	OR	C
+	LD	C,A
+	LD	A,(DEC32_WORK + 2)
+	OR	C
+	LD	C,A
+	LD	A,(DEC32_WORK + 3)
+	OR	C
+	JR	NZ,.LP
+.OUT
+	POP	AF
+	CALL	PUTCHAR
+	DJNZ	.OUT
+	RET
+
+
+; ------------------------------------------------------
+; DIV32_10: 32-bit LE value at DEC32_WORK /= 10; A = rem.
+; Standard MSB-first long division algorithm.
+; ------------------------------------------------------
+DIV32_10
+	PUSH	BC
+	PUSH	DE
+	LD	HL,0			; remainder
+	LD	B,32
+.LP
+	; Shift the 32-bit value left by 1, MSB -> carry.
+	PUSH	HL
+	LD	HL,DEC32_WORK
+	SLA	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	POP	HL
+	; remainder = remainder*2 + carry
+	ADC	HL,HL
+	; If remainder >= 10, subtract 10 and set quotient bit.
+	LD	DE,10
+	OR	A
+	SBC	HL,DE
+	JR	NC,.SUB
+	ADD	HL,DE
+	JR	.NEXT
+.SUB
+	PUSH	HL
+	LD	HL,DEC32_WORK
+	SET	0,(HL)
+	POP	HL
+.NEXT
+	DJNZ	.LP
+	LD	A,L
+	POP	DE
+	POP	BC
+	RET
+
+
 PRINT_DEC_A
 	PUSH	AF,BC,DE,HL
 	LD	C,A
@@ -1025,9 +1116,10 @@ HOST_BUF	EQU APP_BSS_BASE + 64		; HOST_BUF_SIZE
 PATH_BUF	EQU HOST_BUF + HOST_BUF_SIZE	; PATH_BUF_SIZE
 REQUEST_BUF	EQU PATH_BUF + PATH_BUF_SIZE	; REQUEST_BUF_SIZE
 WGET_BUF_LEN	EQU REQUEST_BUF + REQUEST_BUF_SIZE	; 2 bytes
+DEC32_WORK	EQU WGET_BUF_LEN + 2			; 4 bytes (PRINT_DEC_32 scratch)
 
 
-MSG_BANNER	DB "RTL8019AS WGET v0.2",0
+MSG_BANNER	DB "RTL8019AS WGET v0.2.1",0
 MSG_RESOLVED_PRE DB "Resolved ",0
 MSG_TO		DB " -> ",0
 MSG_PORT	DB " port ",0
