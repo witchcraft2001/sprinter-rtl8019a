@@ -31,6 +31,7 @@ EXE_VERSION		EQU 1
 	DEFINE USE_CMDL
 	DEFINE USE_RESOLVE
 	DEFINE USE_TCP
+	DEFINE USE_FILE
 	DEFINE CMDLINE_AT_LARGE
 
 ARP_TIMEOUT_MS	EQU 3000
@@ -259,7 +260,9 @@ START
 	; --- Open output file (prompt-or-overwrite) ---
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
-	CALL	OPEN_OUTPUT_FILE
+	LD	HL,(OUTPUT_PTR)
+	LD	A,(FORCE_FLAG)
+	CALL	@FILE.OPEN_OUTPUT
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
 
@@ -792,85 +795,6 @@ PARSE_DEC_BYTE_LOC
 .BAD
 	POP	DE
 	POP	BC
-	SCF
-	RET
-
-
-; ------------------------------------------------------
-; OPEN_OUTPUT_FILE: probe existence with DSS_OPEN_FILE in
-; read-only mode (DSS_CREATE_OVERWRITE does NOT signal an
-; error when the file already exists, so it cannot be used
-; as the existence test).  If the probe succeeds, close it
-; and either DELETE+CREATE silently (FORCE_FLAG) or prompt
-; the user first.  If the probe fails, the file does not
-; exist and we go straight to CREATE.
-;   Out: A = handle, CF=0 ok; CF=1 user declined / I/O error.
-; ------------------------------------------------------
-OPEN_OUTPUT_FILE
-	LD	HL,(OUTPUT_PTR)
-	LD	A,FA_READONLY
-	LD	C,DSS_OPEN_FILE
-	RST	DSS
-	JR	C,.CREATE_FRESH		; no such file -> just create
-	; File exists: close the probe handle.
-	LD	C,DSS_CLOSE_FILE
-	RST	DSS
-	; Confirm overwrite unless -y was given.
-	LD	A,(FORCE_FLAG)
-	OR	A
-	JR	NZ,.DO_DELETE
-	PRINT MSG_PROMPT_PRE
-	LD	HL,(OUTPUT_PTR)
-	LD	C,DSS_PCHARS
-	RST	DSS
-	PRINT MSG_PROMPT_POST
-	CALL	WAIT_YES_NO
-	JR	C,.USER_NO
-.DO_DELETE
-	LD	HL,(OUTPUT_PTR)
-	LD	C,DSS_DELETE
-	RST	DSS
-	; Ignore delete result (file may have race-disappeared).
-.CREATE_FRESH
-	LD	HL,(OUTPUT_PTR)
-	LD	A,FA_ARCHIVE
-	LD	C,DSS_CREATE_OVERWRITE
-	RST	DSS
-	RET
-.USER_NO
-	PRINTLN MSG_USER_NO
-	SCF
-	RET
-
-
-; ------------------------------------------------------
-; WAIT_YES_NO: block on a key, accept Y/y -> CF=0; any
-; other key -> CF=1.  Closes the ISA window around the
-; DSS call.  Uses K_CLEAR + WAITKEY so any leftover key
-; (e.g. the Enter that launched the program) is discarded
-; and only a fresh keypress is accepted.
-; ------------------------------------------------------
-WAIT_YES_NO
-	CALL	@ISA.ISA_CLOSE
-	LD	B,DSS_WAITKEY		; subfunction: block until key
-	LD	C,DSS_K_CLEAR		; clear buffer first
-	RST	DSS
-	; A = ASCII code of the fresh key.
-	PUSH	AF
-	CALL	@ISA.ISA_OPEN
-	POP	AF
-	; Echo the typed character.
-	PUSH	AF
-	CALL	PUTCHAR
-	LD	A,13
-	CALL	PUTCHAR
-	LD	A,10
-	CALL	PUTCHAR
-	POP	AF
-	CP	'Y'
-	RET	Z
-	CP	'y'
-	RET	Z
 	SCF
 	RET
 
@@ -1513,9 +1437,6 @@ MSG_BYTES	DB " bytes received.",0
 MSG_E_DATA_OPEN	DB "[E] data connection failed.",0
 MSG_E_DATA_RX	DB "[E] data recv failed.",0
 MSG_E_FILE	DB "[E] file create/write failed.",0
-MSG_PROMPT_PRE	DB "Local file '",0
-MSG_PROMPT_POST	DB "' exists. Overwrite [Y/N]? ",0
-MSG_USER_NO	DB "Aborted by user.",0
 MSG_USAGE_ERR	DB "[E] usage: missing host or filename",0
 MSG_HELP
 	DB "Usage:",13,10
@@ -1541,6 +1462,7 @@ LINE_END	DB 13,10,0
 	INCLUDE "resolve_lib.asm"
 	INCLUDE "dns_lib.asm"
 	INCLUDE "tcp_lib.asm"
+	INCLUDE "file_lib.asm"
 
 
 FTP_IMAGE_END

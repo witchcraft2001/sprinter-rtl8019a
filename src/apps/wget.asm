@@ -33,6 +33,7 @@ EXE_VERSION		EQU 1
 	DEFINE USE_CMDL
 	DEFINE USE_RESOLVE
 	DEFINE USE_TCP
+	DEFINE USE_FILE
 	DEFINE CMDLINE_AT_LARGE
 
 ARP_TIMEOUT_MS	EQU 3000
@@ -95,6 +96,16 @@ START
 	; Default: derive from path basename.
 	CALL	DERIVE_OUTPUT
 .OUT_DONE
+
+	; -y / --yes: force overwrite without prompt.
+	XOR	A
+	LD	(FORCE_FLAG),A
+	LD	A,'y'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_FORCE
+	LD	A,1
+	LD	(FORCE_FLAG),A
+.NO_FORCE
 
 	; Pull NET_IP, NET_MAC.
 	LD	HL,N_NET_IP
@@ -176,13 +187,12 @@ START
 	JP	C,TCP_OPEN_FAIL
 	PRINTLN MSG_CONNECTED
 
-	; Open output file.
+	; Open output file (prompt-or-overwrite via @FILE.OPEN_OUTPUT).
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
 	LD	HL,(OUTPUT_PTR)
-	LD	A,FA_ARCHIVE
-	LD	C,DSS_CREATE_OVERWRITE
-	RST	DSS
+	LD	A,(FORCE_FLAG)
+	CALL	@FILE.OPEN_OUTPUT
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
 
@@ -1112,6 +1122,7 @@ HSTATE		EQU APP_BSS_BASE + 28		; 1 (HTTP header state)
 BODY_TOTAL_LO	EQU APP_BSS_BASE + 29		; 2
 BODY_TOTAL_HI	EQU APP_BSS_BASE + 31		; 2
 DEC_BUF		EQU APP_BSS_BASE + 33		; 6
+FORCE_FLAG	EQU APP_BSS_BASE + 39		; 1 (-y / --yes)
 HOST_BUF	EQU APP_BSS_BASE + 64		; HOST_BUF_SIZE
 PATH_BUF	EQU HOST_BUF + HOST_BUF_SIZE	; PATH_BUF_SIZE
 REQUEST_BUF	EQU PATH_BUF + PATH_BUF_SIZE	; REQUEST_BUF_SIZE
@@ -1141,10 +1152,11 @@ MSG_BYTES	DB " bytes received.",0
 MSG_USAGE_ERR	DB "[E] usage: missing or invalid URL",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  WGET url [-o output]",13,10
+	DB "  WGET url [-o output] [-y]",13,10
 	DB "  WGET /?",13,10,13,10
 	DB "  url     http://host[:port][/path]",13,10
-	DB "  -o file write body to <file> (default: derived from URL).",13,10,0
+	DB "  -o file write body to <file> (default: derived from URL).",13,10
+	DB "  -y      overwrite local file without prompt.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
@@ -1159,6 +1171,7 @@ LINE_END	DB 13,10,0
 	INCLUDE "resolve_lib.asm"
 	INCLUDE "dns_lib.asm"
 	INCLUDE "tcp_lib.asm"
+	INCLUDE "file_lib.asm"
 
 
 WGET_IMAGE_END
