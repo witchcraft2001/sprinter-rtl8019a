@@ -45,25 +45,30 @@ EXE_HEADER
 START
 	PRINTLN MSG_BANNER
 
-	; [N0] BASE=0300
-	PRINT MSG_N0
-	LD	HL,RTL_BASE
-	CALL	@UTIL.PRINT_HEX_HL
-	PRINT LINE_END
-
-	; ISA slot 1 (matches MAME -isa1 rtl8019as).
+	; Try to find the chip on slot 1, then slot 0; INIT_BASE
+	; populates RTL_BASE_PTR and leaves ISA OPEN on success.
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
-
-	CALL	@ISA.ISA_OPEN
-
-	; Scan candidate I/O bases and print which respond.
-	; Sets ZF=1 (i.e. CF=0 from internal CP) if the default
-	; base 0x300 is among the responders.  Anything else is
-	; reported but not used -- the rest of the driver assumes
-	; the default base is wired up in rtl8019.inc.
-	CALL	SCAN_BASES
+	CALL	@RTL.INIT_BASE
 	JP	C,SCAN_FAIL
+
+	; [N0] SLOT=N BASE=NNNN  -- where the chip actually lives.
+	PRINT MSG_N0
+	LD	A,(@ISA.ISA_SLOT)
+	ADD	A,'0'
+	CALL	PUTCHAR
+	PRINT MSG_N0_BASE
+	LD	HL,(RTL_BASE_PTR)
+	LD	A,H
+	SUB	HIGH ISA_BASE_A
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,L
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+
+	; Diagnostic scan of all 16 candidate bases on the active
+	; slot.  RTL_BASE_PTR is already set by INIT_BASE.
+	CALL	SCAN_BASES
 
 	; [N1] RESET
 	PRINT MSG_N1
@@ -71,19 +76,16 @@ START
 	JP	C,RESET_FAIL
 	PRINTLN MSG_OK
 
-	; Mandatory: DCR=0x48 (8-bit, FIFO threshold 8). MAME's
-	; device_reset leaves DCR=0x04 which is unsafe for packet
-	; RAM access; PROM read at address 0 happens to work either
-	; way, but follow the rule from AGENTS.md unconditionally.
-	LD	A,DCR_INIT
-	LD	(RTL_DCR_A),A
+	; Mandatory: DCR=0x48 via the runtime base.
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_DCR_OFF),DCR_INIT
 
 	; [N2] CR=xx ISR=xx
 	PRINT MSG_N2
-	LD	A,(RTL_CR_A)
+	LD	A,(IX+RTL_CR_OFF)
 	CALL	@UTIL.PRINT_HEX_A
 	PRINT MSG_ISR_EQ
-	LD	A,(RTL_ISR_A)
+	LD	A,(IX+RTL_ISR_OFF)
 	CALL	@UTIL.PRINT_HEX_A
 	PRINT LINE_END
 
@@ -549,7 +551,8 @@ REG_NAMES
 
 ; ------- messages -------
 MSG_BANNER	DB "RTL8019AS NICINFO v0.1",0
-MSG_N0		DB "[N0] BASE=",0
+MSG_N0		DB "[N0] SLOT=",0
+MSG_N0_BASE	DB " BASE=",0
 MSG_N1		DB "[N1] RESET ",0
 MSG_OK		DB "OK",0
 MSG_N2		DB "[N2] CR=",0

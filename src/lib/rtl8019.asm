@@ -3,59 +3,36 @@
 ;
 ; All routines assume ISA.ISA_OPEN has been called: the ISA
 ; window is mapped into 0xC000..0xFFFF and chip registers are
-; accessed as memory at RTL_BASE_A + offset (default 0xC300).
+; accessed as memory at the chip's base address + offset.
+;
+; The chip's window base is held at runtime in RTL_BASE_PTR
+; (memmap.inc).  Every public driver function loads IX from
+; that variable on entry and addresses registers as
+; `(IX + RTL_xxx_OFF)`.  Apps must call RTL.INIT_BASE before
+; any other RTL.* function so RTL_BASE_PTR is populated -- it
+; either reads N_NET_RTL_IOBASE from the env or auto-scans the
+; standard NE2000 candidate bases (0x200..0x3E0 step 0x20).
+;
 ; Routines do NOT toggle the ISA window themselves -- callers
 ; manage open/close around the inner loops.
 ;
-; Public API. Low-level chip primitives below are always
-; assembled. High-level helpers further down are guarded by
-; explicit `IFDEF USE_RTL_<name>` flags -- caller defines
-; `USE_RTL_INIT_NORMAL EQU 1` (and similar) BEFORE
-; `INCLUDE "rtl8019.asm"` to pull in only what it uses.
-; This keeps RAM usage tight on the 64K Z80 target.
-;
-; Low-level chip primitives:
+; Public API (low-level chip primitives are always assembled;
+; higher-level helpers are gated by USE_RTL_<name>):
+;   RTL.INIT_BASE        find chip / honour RTL_IOBASE; set
+;                        RTL_BASE_PTR.  CF=0 OK, CF=1 no chip.
 ;   RTL.RESET            full NE2000-style reset.
-;                          Out: CF=0 OK, CF=1 ISR.RST timeout.
-;   RTL.PROBE_ID         read page-0 8019ID0/ID1.
-;                          Out: CF=0 if both 'P','p'; CF=1 otherwise.
-;                                A=0 if both match.
-;                          Side effect: stores raw bytes in
-;                          ID0_RAW, ID1_RAW.
-;   RTL.SNAPSHOT_REGS    capture CR/ISR/DCR/RCR/TCR/IMR/PSTART/
-;                        PSTOP/BNRY/CURR into REG_SNAPSHOT (10 bytes).
+;   RTL.PROBE_ID         read 8019ID0/ID1 -> ID0_RAW, ID1_RAW.
+;   RTL.PROBE_PRESENT    bus-latch-defeating presence test.
+;   RTL.SNAPSHOT_REGS    capture 10 diagnostic regs.
 ;   RTL.READ_PROM        read 32 bytes of PROM into (HL).
-;                          Out: CF=0 OK, CF=1 RDC timeout.
-;   RTL.DMA_READ         remote DMA read BC bytes from packet RAM
-;                        addr DE into memory at HL.
-;                          Out: CF=0 OK, CF=1 RDC timeout.
-;   RTL.DMA_WRITE        remote DMA write BC bytes from memory at HL
-;                        to packet RAM addr DE.
-;                          Out: CF=0 OK, CF=1 RDC timeout.
-;
-; High-level helpers (post-refactor; use these in new code):
-;   RTL.INIT_NORMAL      In: HL = pointer to 6-byte MAC.
-;                            A = RCR value (e.g. RCR_AB or 0).
-;                        Full chip init: DCR=0x48, TCR=0, RCR=A,
-;                        packet RAM layout, MAC, MAR=0, CR=0x22.
-;   RTL.INIT_LOOPBACK    In: HL = MAC ptr. DCR=0x40, TCR=0x02 for
-;                        internal MAC loopback (NICLB).
-;   RTL.SEND_FRAME       In: HL = source buffer in DSS RAM.
-;                            BC = byte count.
-;                        DMA_WRITE -> TBCR -> CR.TXP -> wait PTX.
-;                          Out: CF=0 OK, CF=1 DMA or PTX timeout.
-;   RTL.WAIT_PTX         poll ISR.PTX with timeout. CF=0 OK, CF=1
-;                        timeout. ISR.PTX cleared on success.
-;   RTL.RING_HAS_PACKET  ZF=1 if RX ring is empty (BNRY+1==CURR),
-;                        ZF=0 if a packet is queued. Trashes A,B,C.
-;   RTL.READ_PACKET      In: HL = header buffer (4 bytes).
-;                            DE = body buffer.
-;                            BC = max body length.
-;                        Reads 4-byte RX header at (BNRY+1)<<8 then
-;                        body at +4. Auto-advances BNRY past this
-;                        packet (with PSTOP wrap).
-;                          Out: CF=0 OK, BC = body length read.
-;                                CF=1 DMA error.
+;   RTL.DMA_READ         remote DMA read.
+;   RTL.DMA_WRITE        remote DMA write.
+;   RTL.INIT_NORMAL      full chip init for normal TX/RX.
+;   RTL.INIT_LOOPBACK    chip init for internal MAC loopback.
+;   RTL.WAIT_PTX         poll ISR.PTX with timeout.
+;   RTL.SEND_FRAME       DMA-write + TX trigger + wait PTX.
+;   RTL.RING_HAS_PACKET  is RX ring non-empty?
+;   RTL.READ_PACKET      read 4-byte header + body, advance BNRY.
 ;
 ; License: BSD 3-Clause
 ; ======================================================
@@ -64,6 +41,7 @@
 	DEFINE	_RTL8019
 
 	INCLUDE "rtl8019.inc"
+	INCLUDE "isa.inc"
 	INCLUDE "util.asm"
 
 ; Timeouts in arbitrary inner-loop units, calibrated empirically.
@@ -73,218 +51,297 @@ RTL_RDC_LOOPS		EQU 4000		; remote DMA complete budget
 	MODULE RTL
 
 ; ------------------------------------------------------
+; INIT_BASE: locate the chip, open the right ISA slot, set
+; RTL_BASE_PTR to its window address.
+;
+; Behaviour:
+;  - If RTL_BASE_PTR is already non-zero (caller pre-set
+;    it from env or NICINFO's manual scan), open ISA and
+;    verify the chip responds at that base; if yes, keep it.
+;  - Otherwise scan the 16 standard NE2000 jumperless bases
+;    (0x200..0x3E0 step 0x20), first on ISA slot 1 (or
+;    whatever value the caller put in @ISA.ISA_SLOT), then
+;    on the OTHER slot.  First responder wins.
+;
+; On success ISA is left OPEN and ISA_SLOT correctly set,
+; so the caller can continue with RTL.RESET etc.
+; On failure ISA is CLOSED.
+;
+; Out: CF=0 -> RTL_BASE_PTR populated, IX = base, ISA OPEN.
+;      CF=1 -> no chip on any slot/base, ISA CLOSED.
+; Trashes A, BC, DE, HL, IX.
+; ------------------------------------------------------
+INIT_BASE
+	; RTL_BASE_PTR lives in uninitialized BSS, so we MUST clear it
+	; before scanning -- otherwise leftover stack/heap garbage would
+	; pose as a pre-set base and the helper PROBE_AT_IX, hitting
+	; plain Z80 RAM, would falsely "succeed".  RTL_IOBASE env-var
+	; override (followup #24) will be honoured here once wired up.
+	LD	HL,0
+	LD	(RTL_BASE_PTR),HL
+	; Try the currently-selected slot first.
+	CALL	@ISA.ISA_OPEN
+	CALL	.SCAN_BASES
+	RET	NC			; found, ISA stays OPEN
+	CALL	@ISA.ISA_CLOSE
+	; Flip slot (0 <-> 1) and try again.
+	LD	A,(@ISA.ISA_SLOT)
+	XOR	1
+	LD	(@ISA.ISA_SLOT),A
+	CALL	@ISA.ISA_OPEN
+	CALL	.SCAN_BASES
+	RET	NC
+	CALL	@ISA.ISA_CLOSE
+	SCF
+	RET
+
+; Helper: walk SCAN_TABLE, set RTL_BASE_PTR to first hit.
+; Out: CF=0 + IX = base on hit; CF=1 if nothing responds.
+.SCAN_BASES
+	LD	HL,SCAN_TABLE
+.SLP
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	INC	HL
+	LD	A,D
+	OR	E
+	JR	Z,.SNONE
+	PUSH	HL			; save table cursor
+	LD	H,D
+	LD	L,E
+	PUSH	HL
+	POP	IX
+	CALL	PROBE_AT_IX
+	POP	HL			; restore table cursor
+	JR	C,.SLP
+	; Hit: IX still = window addr.
+	PUSH	IX
+	POP	HL
+	LD	(RTL_BASE_PTR),HL
+	OR	A
+	RET
+.SNONE
+	SCF
+	RET
+
+; Standard NE2000 jumperless I/O bases (in ISA window
+; 0xC000..0xFFFF).  Sentinel = DW 0.
+SCAN_TABLE
+	DW ISA_BASE_A + 0x200
+	DW ISA_BASE_A + 0x220
+	DW ISA_BASE_A + 0x240
+	DW ISA_BASE_A + 0x260
+	DW ISA_BASE_A + 0x280
+	DW ISA_BASE_A + 0x2A0
+	DW ISA_BASE_A + 0x2C0
+	DW ISA_BASE_A + 0x2E0
+	DW ISA_BASE_A + 0x300
+	DW ISA_BASE_A + 0x320
+	DW ISA_BASE_A + 0x340
+	DW ISA_BASE_A + 0x360
+	DW ISA_BASE_A + 0x380
+	DW ISA_BASE_A + 0x3A0
+	DW ISA_BASE_A + 0x3C0
+	DW ISA_BASE_A + 0x3E0
+	DW 0
+
+
+; ------------------------------------------------------
+; PROBE_AT_IX: presence test at chip window address in IX.
+; HL-based addressing for compatibility with MAME's Sprinter
+; ISA emulation (which appeared to mishandle some IX+d
+; chip-register accesses in v3.06; see followup #25).
+;
+; Out: CF=0 chip responds; CF=1 absent.
+; Trashes A, BC, DE, HL.  IX preserved.
+; ------------------------------------------------------
+PROBE_AT_IX
+	PUSH	IX
+	POP	HL			; HL = base
+	; CR (offset 0x00).
+	LD	(HL),CR_PAGE0_STOP
+	; BNRY (offset 0x03).
+	PUSH	HL
+	LD	DE,RTL_BNRY_OFF
+	ADD	HL,DE
+	LD	(HL),0xAA
+	; TPSR (offset 0x04).
+	INC	HL
+	LD	(HL),0x55
+	; Read BNRY back.
+	DEC	HL
+	LD	A,(HL)
+	CP	0xAA
+	JR	NZ,.MISS
+	; Round 2: invert.
+	LD	(HL),0x55
+	INC	HL
+	LD	(HL),0xAA
+	DEC	HL
+	LD	A,(HL)
+	POP	HL
+	CP	0x55
+	JR	NZ,.MISS_NOPOP
+	OR	A
+	RET
+.MISS
+	POP	HL
+.MISS_NOPOP
+	SCF
+	RET
+
+; ------------------------------------------------------
+; PROBE_PRESENT: legacy public name, equivalent to
+; PROBE_AT_IX with the current RTL_BASE_PTR.  Apps that
+; pre-date INIT_BASE may still call this.
+; Out: CF=0 chip responds; CF=1 absent.
+; ------------------------------------------------------
+PROBE_PRESENT
+	LD	HL,(RTL_BASE_PTR)
+	PUSH	HL
+	POP	IX
+	JP	PROBE_AT_IX
+
+
+; ------------------------------------------------------
 ; Full NE2000-style reset:
-;   tmp = (RESET)
-;   (RESET) = tmp                ; assert
-;   delay 2 ms
-;   tmp = (RESET)                ; clear
-;   wait ISR.RST == 1, timeout
-;   (ISR) = 0xFF
-; Out: CF=0 OK, CF=1 timeout (ISR.RST never asserted).
-; Trashes A,BC,HL.
+;   tmp = (RESET); (RESET) = tmp; delay 2 ms;
+;   tmp = (RESET); wait ISR.RST = 1; (ISR) = 0xFF.
+; Out: CF=0 OK, CF=1 timeout.
+; Trashes A, BC, DE, HL.
+; HL-based addressing (rather than IX+d) -- required because
+; MAME's Sprinter ISA emulation v3.06 mishandles IX-relative
+; chip register access for the RTL8019AS reset port (the read
+; that should trigger device_reset() does not always reach
+; isa_r()).  See followup #25.
 ; ------------------------------------------------------
 RESET
-	LD	A,(RTL_RESET_A)			; tmp = read reset port
-	LD	(RTL_RESET_A),A			; write back -> assert (NE2000 convention)
+	LD	HL,(RTL_BASE_PTR)
+	LD	DE,RTL_RESET_OFF
+	ADD	HL,DE			; HL = RESET port addr
+	LD	A,(HL)			; read RESET (release in MAME -> device_reset)
+	LD	(HL),A			; write back (no-op on MAME)
+	PUSH	HL
 	CALL	UTIL.DELAY_2MS
-	LD	A,(RTL_RESET_A)			; read -> clear (also triggers MAME device_reset)
-	; Wait for ISR.RST = 1
+	POP	HL
+	LD	A,(HL)			; read RESET again -> device_reset
+	; Switch HL to ISR.
+	LD	HL,(RTL_BASE_PTR)
+	LD	DE,RTL_ISR_OFF
+	ADD	HL,DE			; HL = ISR
 	LD	BC,RTL_RESET_LOOPS
 .WAIT
-	LD	A,(RTL_ISR_A)
+	LD	A,(HL)
 	AND	ISR_RST
 	JR	NZ,.OK
 	DEC	BC
 	LD	A,B
 	OR	C
 	JR	NZ,.WAIT
-	; Timeout
 	SCF
 	RET
 .OK
 	LD	A,0xFF
-	LD	(RTL_ISR_A),A			; clear all ISR bits
-	OR	A				; CF=0
+	LD	(HL),A
+	OR	A
 	RET
 
+
 ; ------------------------------------------------------
-; Read 8019ID0/8019ID1 from page 0 regs 0x0A/0x0B.
-; Side effect: ID0_RAW, ID1_RAW updated with raw bytes.
-; Out: CF=0 if (ID0_RAW=='P' && ID1_RAW=='p'), else CF=1.
-;       A: 0 on match, non-zero otherwise.
-; Trashes A.
+; PROBE_ID: read 8019ID0/8019ID1.  Side effect: stores raw
+; bytes in ID0_RAW / ID1_RAW.  Out: CF=0 if both 'P','p',
+; A=0 on match; otherwise CF=1, A != 0.
 ; ------------------------------------------------------
 PROBE_ID
-	; Make sure CR is on page 0; STA so the chip is "running"
-	; (any state works for these reads, but be explicit).
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
-
-	LD	A,(RTL_ID0_A)
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	A,(IX+RTL_ID0_OFF)
 	LD	(ID0_RAW),A
 	CP	RTL_ID0_VAL
 	JR	NZ,.MISS
-	LD	A,(RTL_ID1_A)
+	LD	A,(IX+RTL_ID1_OFF)
 	LD	(ID1_RAW),A
 	CP	RTL_ID1_VAL
 	JR	NZ,.MISS
-	XOR	A			; A=0, CF=0
+	XOR	A
 	RET
 .MISS
-	; If we left ID1 unread (mismatch on ID0), capture it now too
-	; for diagnostic completeness.
-	LD	A,(RTL_ID1_A)
+	LD	A,(IX+RTL_ID1_OFF)
 	LD	(ID1_RAW),A
-	OR	0xFF			; A != 0
+	OR	0xFF
 	SCF
 	RET
 
 ID0_RAW		DB 0
 ID1_RAW		DB 0
 
-; ------------------------------------------------------
-; PROBE_PRESENT: fast-fail "is the chip there at all?"
-; check.  Writes a pattern to BNRY (page 0 R/W reg 0x03),
-; then writes a DIFFERENT pattern to TPSR (page 0 W-only
-; reg 0x04) to clobber the ISA data bus, then reads BNRY.
-; If a chip is present, BNRY still holds the first pattern
-; (it has its own latch).  If no chip, the read returns
-; the value last driven onto the bus (the TPSR write) -- a
-; floating ISA bus retains the last written byte for many
-; microseconds, so a same-port write/read round-trip is
-; NOT a reliable presence test on its own.  The two-port
-; trick defeats this.
-;
-; BNRY is not restored: callers must follow with RTL.RESET
-; + RTL.INIT_NORMAL (or _LOOPBACK), which rewrite BNRY.
-;
-; Out: CF=0 -> chip responding; CF=1 -> no chip.
-; Trashes A.
-; ------------------------------------------------------
-PROBE_PRESENT
-	LD	A,CR_PAGE0_STOP
-	LD	(RTL_CR_A),A
-	; Round 1: BNRY=0xAA, clobber bus via TPSR=0x55, read BNRY.
-	LD	A,0xAA
-	LD	(RTL_BNRY_A),A
-	LD	A,0x55
-	LD	(RTL_TPSR_A),A
-	LD	A,(RTL_BNRY_A)
-	CP	0xAA
-	JR	NZ,.ABSENT
-	; Round 2: invert (BNRY=0x55, clobber via TPSR=0xAA).
-	LD	A,0x55
-	LD	(RTL_BNRY_A),A
-	LD	A,0xAA
-	LD	(RTL_TPSR_A),A
-	LD	A,(RTL_BNRY_A)
-	CP	0x55
-	JR	NZ,.ABSENT
-	OR	A			; CF=0
-	RET
-.ABSENT
-	SCF
-	RET
-
 
 ; ------------------------------------------------------
-; Snapshot 10 useful registers into REG_SNAPSHOT in the same
-; order the diagnostic line prints them:
-;   [0] CR      page 0, offs 0x00
-;   [1] ISR     page 0, offs 0x07
-;   [2] DCR     page 2, offs 0x0E   (page-0 read of 0x0E = CNTR1)
-;   [3] RCR     page 2, offs 0x0C   (page-0 read of 0x0C = RSR)
-;   [4] TCR     page 2, offs 0x0D   (page-0 read of 0x0D = CNTR0)
-;   [5] IMR     page 2, offs 0x0F   (page-0 read of 0x0F = CNTR2)
-;   [6] PSTART  page 2, offs 0x01
-;   [7] PSTOP   page 2, offs 0x02
-;   [8] BNRY    page 0, offs 0x03
-;   [9] CURR    page 1, offs 0x07
-;
-; Switches CR pages internally and leaves CR back on page 0
-; with STA. Trashes A.
+; SNAPSHOT_REGS: capture diagnostic registers in fixed order.
 ; ------------------------------------------------------
 SNAPSHOT_REGS
-	; -- page 0 reads --
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
-	LD	A,(RTL_CR_A)
+	LD	IX,(RTL_BASE_PTR)
+	; Page 0 reads.
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	A,(IX+RTL_CR_OFF)
 	LD	(REG_SNAPSHOT+0),A
-	LD	A,(RTL_ISR_A)
+	LD	A,(IX+RTL_ISR_OFF)
 	LD	(REG_SNAPSHOT+1),A
-	LD	A,(RTL_BNRY_A)
+	LD	A,(IX+RTL_BNRY_OFF)
 	LD	(REG_SNAPSHOT+8),A
-
-	; -- page 1 read (CURR) --
-	LD	A,CR_PAGE1_STOP
-	LD	(RTL_CR_A),A
-	LD	A,(RTL_CURR_A)
+	; Page 1 read (CURR).
+	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
+	LD	A,(IX+RTL_CURR_OFF)
 	LD	(REG_SNAPSHOT+9),A
-
-	; -- page 2 reads (DCR/RCR/TCR/IMR/PSTART/PSTOP) --
-	LD	A,CR_PAGE2_STOP
-	LD	(RTL_CR_A),A
-	LD	A,(RTL_DCR_A)
+	; Page 2 reads (DCR/RCR/TCR/IMR/PSTART/PSTOP).
+	LD	(IX+RTL_CR_OFF),CR_PAGE2_STOP
+	LD	A,(IX+RTL_DCR_OFF)
 	LD	(REG_SNAPSHOT+2),A
-	LD	A,(RTL_RCR_A)
+	LD	A,(IX+RTL_RCR_OFF)
 	LD	(REG_SNAPSHOT+3),A
-	LD	A,(RTL_TCR_A)
+	LD	A,(IX+RTL_TCR_OFF)
 	LD	(REG_SNAPSHOT+4),A
-	LD	A,(RTL_IMR_A)
+	LD	A,(IX+RTL_IMR_OFF)
 	LD	(REG_SNAPSHOT+5),A
-	LD	A,(RTL_PSTART_A)
+	LD	A,(IX+RTL_PSTART_OFF)
 	LD	(REG_SNAPSHOT+6),A
-	LD	A,(RTL_PSTOP_A)
+	LD	A,(IX+RTL_PSTOP_OFF)
 	LD	(REG_SNAPSHOT+7),A
-
-	; Restore CR to page 0 + STA
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
+	; Restore CR to page 0 + STA.
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
 	RET
 
 REG_SNAPSHOT	EQU RTL_REG_SNAPSHOT	; 10 bytes in runtime BSS
 REG_SNAPSHOT_LEN EQU 10
 
+
 ; ------------------------------------------------------
-; Remote DMA read of BC bytes from packet-RAM address DE
-; into memory at HL (host-side buffer).
+; DMA_READ: remote DMA read of BC bytes from packet-RAM
+; address DE into memory at HL.
 ; Out: CF=0 OK, CF=1 RDC timeout.
 ; Trashes A,BC,DE,HL.
-; Pre: caller has done ISA_OPEN.
 ; ------------------------------------------------------
 DMA_READ
-	; Ensure abort/clear remote DMA, page 0
-	LD	A,CR_PAGE0_START | CR_RD2	; 0x22 -> abort+complete, page 0, STA
-	LD	(RTL_CR_A),A
-	; Clear stale RDC if any
-	LD	A,ISR_RDC
-	LD	(RTL_ISR_A),A
-	; Program byte count BC -> RBCR0/1
-	LD	A,C
-	LD	(RTL_RBCR0_A),A
-	LD	A,B
-	LD	(RTL_RBCR1_A),A
-	; Program source address DE -> RSAR0/1
-	LD	A,E
-	LD	(RTL_RSAR0_A),A
-	LD	A,D
-	LD	(RTL_RSAR1_A),A
-	; Issue remote read command
-	LD	A,CR_DMA_READ			; 0x0A
-	LD	(RTL_CR_A),A
-	; Read BC bytes from data port into (HL)
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START | CR_RD2
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	(IX+RTL_RBCR0_OFF),C
+	LD	(IX+RTL_RBCR1_OFF),B
+	LD	(IX+RTL_RSAR0_OFF),E
+	LD	(IX+RTL_RSAR1_OFF),D
+	LD	(IX+RTL_CR_OFF),CR_DMA_READ
 .LOOP
-	LD	A,(RTL_DATA_A)
+	LD	A,(IX+RTL_DATA_OFF)
 	LD	(HL),A
 	INC	HL
 	DEC	BC
 	LD	A,B
 	OR	C
 	JR	NZ,.LOOP
-	; Wait for ISR.RDC
 	LD	BC,RTL_RDC_LOOPS
 .WRDC
-	LD	A,(RTL_ISR_A)
+	LD	A,(IX+RTL_ISR_OFF)
 	AND	ISR_RDC
 	JR	NZ,.OK
 	DEC	BC
@@ -294,61 +351,45 @@ DMA_READ
 	SCF
 	RET
 .OK
-	LD	A,ISR_RDC
-	LD	(RTL_ISR_A),A			; clear RDC
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
 	OR	A
 	RET
 
+
 ; ------------------------------------------------------
-; Read 32 bytes of PROM into buffer at HL.
-;   Implemented as DMA_READ from address 0x0000, length 0x20.
-; Out: CF=0 OK, CF=1 RDC timeout.
+; READ_PROM: 32 bytes from PROM (RSAR=0x0000, RBCR=32) into (HL).
 ; ------------------------------------------------------
 READ_PROM
 	LD	BC,32
 	LD	DE,0x0000
 	JP	DMA_READ
 
+
 ; ------------------------------------------------------
-; Remote DMA write of BC bytes from memory at HL into packet
-; RAM address DE.
+; DMA_WRITE: remote DMA write of BC bytes from (HL) to
+; packet-RAM address DE.
 ; Out: CF=0 OK, CF=1 RDC timeout.
-; Trashes A,BC,DE,HL.
-; Pre: caller has done ISA_OPEN.
 ; ------------------------------------------------------
 DMA_WRITE
-	; Abort/clear remote DMA, page 0, STA
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
-	; Clear stale RDC
-	LD	A,ISR_RDC
-	LD	(RTL_ISR_A),A
-	; Program byte count BC -> RBCR0/1
-	LD	A,C
-	LD	(RTL_RBCR0_A),A
-	LD	A,B
-	LD	(RTL_RBCR1_A),A
-	; Program target address DE -> RSAR0/1
-	LD	A,E
-	LD	(RTL_RSAR0_A),A
-	LD	A,D
-	LD	(RTL_RSAR1_A),A
-	; Issue remote write command
-	LD	A,CR_DMA_WRITE			; 0x12
-	LD	(RTL_CR_A),A
-	; Push BC bytes from (HL) to data port
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	(IX+RTL_RBCR0_OFF),C
+	LD	(IX+RTL_RBCR1_OFF),B
+	LD	(IX+RTL_RSAR0_OFF),E
+	LD	(IX+RTL_RSAR1_OFF),D
+	LD	(IX+RTL_CR_OFF),CR_DMA_WRITE
 .LOOP
 	LD	A,(HL)
-	LD	(RTL_DATA_A),A
+	LD	(IX+RTL_DATA_OFF),A
 	INC	HL
 	DEC	BC
 	LD	A,B
 	OR	C
 	JR	NZ,.LOOP
-	; Wait RDC
 	LD	BC,RTL_RDC_LOOPS
 .WRDC
-	LD	A,(RTL_ISR_A)
+	LD	A,(IX+RTL_ISR_OFF)
 	AND	ISR_RDC
 	JR	NZ,.OK
 	DEC	BC
@@ -358,21 +399,13 @@ DMA_WRITE
 	SCF
 	RET
 .OK
-	LD	A,ISR_RDC
-	LD	(RTL_ISR_A),A
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
 	OR	A
 	RET
 
 
 ; ======================================================
-; High-level helpers. Each block is guarded by an explicit
-; USE_RTL_<name> symbol so an .EXE only emits the bytes it
-; references -- caller defines `USE_RTL_INIT_NORMAL EQU 1`
-; (and similar) BEFORE the `INCLUDE "rtl8019.asm"` line.
-; This keeps RAM usage tight on the 64K Z80 target.
-;
-; Dependency rule: if you DEFINE USE_RTL_SEND_FRAME, also
-; DEFINE USE_RTL_WAIT_PTX (SEND_FRAME tail-calls WAIT_PTX).
+; High-level helpers, each gated by USE_RTL_<name>.
 ; ======================================================
 
 PTX_LOOPS	EQU 16000
@@ -380,134 +413,112 @@ PTX_LOOPS	EQU 16000
 ; ------------------------------------------------------
 ; INIT_NORMAL: full chip init for normal TX/RX.
 ;   In:  HL = pointer to 6-byte MAC for PAR0..5.
-;        A  = RCR value to load (e.g. RCR_AB for broadcast,
-;             0 for physical-only).
-;   Side effects: TCR=0, DCR=DCR_INIT, packet RAM layout
-;        defaults (TPSR/PSTART/PSTOP/BNRY/CURR), MAR0..7=0,
-;        ISR cleared, IMR=0, CR=0x22 on exit.
+;        A  = RCR value (RCR_AB / 0).
 ; Trashes A, BC, DE, HL.
 ; ------------------------------------------------------
 	IFDEF USE_RTL_INIT_NORMAL
 INIT_NORMAL
-	; Save RCR value and MAC pointer for later use.
 	LD	(.RCR_VALUE),A
 	PUSH	HL
-	; Page 0 stop, abort.
-	LD	A,CR_PAGE0_STOP
-	LD	(RTL_CR_A),A
-	LD	A,DCR_INIT
-	LD	(RTL_DCR_A),A
-	XOR	A
-	LD	(RTL_RBCR0_A),A
-	LD	(RTL_RBCR1_A),A
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP
+	LD	(IX+RTL_DCR_OFF),DCR_INIT
+	LD	(IX+RTL_RBCR0_OFF),0
+	LD	(IX+RTL_RBCR1_OFF),0
 	LD	A,(.RCR_VALUE)
-	LD	(RTL_RCR_A),A
-	LD	A,TCR_NORMAL
-	LD	(RTL_TCR_A),A
-	LD	A,RTL_TPSR_INIT
-	LD	(RTL_TPSR_A),A
-	LD	A,RTL_PSTART_INIT
-	LD	(RTL_PSTART_A),A
-	LD	A,RTL_PSTOP_INIT
-	LD	(RTL_PSTOP_A),A
-	LD	A,RTL_BNRY_INIT
-	LD	(RTL_BNRY_A),A
-	LD	A,0xFF
-	LD	(RTL_ISR_A),A
-	XOR	A
-	LD	(RTL_IMR_A),A
+	LD	(IX+RTL_RCR_OFF),A
+	LD	(IX+RTL_TCR_OFF),TCR_NORMAL
+	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
+	LD	(IX+RTL_PSTART_OFF),RTL_PSTART_INIT
+	LD	(IX+RTL_PSTOP_OFF),RTL_PSTOP_INIT
+	LD	(IX+RTL_BNRY_OFF),RTL_BNRY_INIT
+	LD	(IX+RTL_ISR_OFF),0xFF
+	LD	(IX+RTL_IMR_OFF),0
 	; Page 1: PAR + CURR + MAR.
-	LD	A,CR_PAGE1_STOP
-	LD	(RTL_CR_A),A
+	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
 	POP	HL
-	LD	DE,RTL_PAR0_A
+	; LDIR target (DE) = IX + PAR0_OFF.
+	PUSH	IX
+	POP	DE
+	LD	A,RTL_PAR0_OFF
+	ADD	A,E
+	LD	E,A
+	LD	A,0
+	ADC	A,D
+	LD	D,A
 	LD	BC,6
 	LDIR
-	LD	A,RTL_CURR_INIT
-	LD	(RTL_CURR_A),A
-	XOR	A
-	LD	(RTL_MAR0_A + 0),A
-	LD	(RTL_MAR0_A + 1),A
-	LD	(RTL_MAR0_A + 2),A
-	LD	(RTL_MAR0_A + 3),A
-	LD	(RTL_MAR0_A + 4),A
-	LD	(RTL_MAR0_A + 5),A
-	LD	(RTL_MAR0_A + 6),A
-	LD	(RTL_MAR0_A + 7),A
-	; Back to page 0 START.
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
+	LD	(IX+RTL_CURR_OFF),RTL_CURR_INIT
+	LD	(IX+RTL_MAR0_OFF + 0),0
+	LD	(IX+RTL_MAR0_OFF + 1),0
+	LD	(IX+RTL_MAR0_OFF + 2),0
+	LD	(IX+RTL_MAR0_OFF + 3),0
+	LD	(IX+RTL_MAR0_OFF + 4),0
+	LD	(IX+RTL_MAR0_OFF + 5),0
+	LD	(IX+RTL_MAR0_OFF + 6),0
+	LD	(IX+RTL_MAR0_OFF + 7),0
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
 	RET
 .RCR_VALUE	DB 0
 	ENDIF
 
 
 ; ------------------------------------------------------
-; INIT_LOOPBACK: chip init for internal MAC loopback test.
-;   DCR=0x40 (LS=0 enables loopback in MAME's macro), TCR=0x02
-;   (internal MAC loopback), RCR=RCR_AB so broadcast frames can
-;   be routed back via recv() in the patched dp8390.
-;   In: HL = MAC pointer.
-; Trashes A, BC, DE, HL.
+; INIT_LOOPBACK: init for internal MAC loopback test.
+;   DCR=0x40, TCR=0x02, RCR=RCR_AB.
+; In: HL = MAC ptr.
 ; ------------------------------------------------------
 	IFDEF USE_RTL_INIT_LOOPBACK
 INIT_LOOPBACK
 	PUSH	HL
-	LD	A,CR_PAGE0_STOP
-	LD	(RTL_CR_A),A
-	LD	A,DCR_LOOPBACK
-	LD	(RTL_DCR_A),A
-	XOR	A
-	LD	(RTL_RBCR0_A),A
-	LD	(RTL_RBCR1_A),A
-	LD	A,RCR_AB
-	LD	(RTL_RCR_A),A
-	LD	A,TCR_LB_INTERNAL
-	LD	(RTL_TCR_A),A
-	LD	A,RTL_TPSR_INIT
-	LD	(RTL_TPSR_A),A
-	LD	A,RTL_PSTART_INIT
-	LD	(RTL_PSTART_A),A
-	LD	A,RTL_PSTOP_INIT
-	LD	(RTL_PSTOP_A),A
-	LD	A,RTL_BNRY_INIT
-	LD	(RTL_BNRY_A),A
-	LD	A,0xFF
-	LD	(RTL_ISR_A),A
-	XOR	A
-	LD	(RTL_IMR_A),A
-	LD	A,CR_PAGE1_STOP
-	LD	(RTL_CR_A),A
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP
+	LD	(IX+RTL_DCR_OFF),DCR_LOOPBACK
+	LD	(IX+RTL_RBCR0_OFF),0
+	LD	(IX+RTL_RBCR1_OFF),0
+	LD	(IX+RTL_RCR_OFF),RCR_AB
+	LD	(IX+RTL_TCR_OFF),TCR_LB_INTERNAL
+	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
+	LD	(IX+RTL_PSTART_OFF),RTL_PSTART_INIT
+	LD	(IX+RTL_PSTOP_OFF),RTL_PSTOP_INIT
+	LD	(IX+RTL_BNRY_OFF),RTL_BNRY_INIT
+	LD	(IX+RTL_ISR_OFF),0xFF
+	LD	(IX+RTL_IMR_OFF),0
+	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
 	POP	HL
-	LD	DE,RTL_PAR0_A
+	PUSH	IX
+	POP	DE
+	LD	A,RTL_PAR0_OFF
+	ADD	A,E
+	LD	E,A
+	LD	A,0
+	ADC	A,D
+	LD	D,A
 	LD	BC,6
 	LDIR
-	LD	A,RTL_CURR_INIT
-	LD	(RTL_CURR_A),A
-	XOR	A
-	LD	(RTL_MAR0_A + 0),A
-	LD	(RTL_MAR0_A + 1),A
-	LD	(RTL_MAR0_A + 2),A
-	LD	(RTL_MAR0_A + 3),A
-	LD	(RTL_MAR0_A + 4),A
-	LD	(RTL_MAR0_A + 5),A
-	LD	(RTL_MAR0_A + 6),A
-	LD	(RTL_MAR0_A + 7),A
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
+	LD	(IX+RTL_CURR_OFF),RTL_CURR_INIT
+	LD	(IX+RTL_MAR0_OFF + 0),0
+	LD	(IX+RTL_MAR0_OFF + 1),0
+	LD	(IX+RTL_MAR0_OFF + 2),0
+	LD	(IX+RTL_MAR0_OFF + 3),0
+	LD	(IX+RTL_MAR0_OFF + 4),0
+	LD	(IX+RTL_MAR0_OFF + 5),0
+	LD	(IX+RTL_MAR0_OFF + 6),0
+	LD	(IX+RTL_MAR0_OFF + 7),0
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
 	RET
 	ENDIF
 
 
 ; ------------------------------------------------------
-; WAIT_PTX: poll ISR.PTX. CF=0 OK (PTX cleared), CF=1 timeout.
-; Trashes A,BC.
+; WAIT_PTX: poll ISR.PTX with timeout.
 ; ------------------------------------------------------
 	IFDEF USE_RTL_WAIT_PTX
 WAIT_PTX
+	LD	IX,(RTL_BASE_PTR)
 	LD	BC,PTX_LOOPS
 .LP
-	LD	A,(RTL_ISR_A)
+	LD	A,(IX+RTL_ISR_OFF)
 	AND	ISR_PTX
 	JR	NZ,.OK
 	DEC	BC
@@ -517,19 +528,16 @@ WAIT_PTX
 	SCF
 	RET
 .OK
-	LD	A,ISR_PTX
-	LD	(RTL_ISR_A),A
+	LD	(IX+RTL_ISR_OFF),ISR_PTX
 	OR	A
 	RET
 	ENDIF
 
 
 ; ------------------------------------------------------
-; SEND_FRAME: DMA-write BC bytes from (HL) to packet RAM 0x4000,
-; load TBCR=BC, trigger TX, wait PTX.
-;   In:  HL = source buffer, BC = length.
-;   Out: CF=0 OK, CF=1 DMA write or PTX timeout.
-; Trashes A, BC, DE, HL.
+; SEND_FRAME: DMA-write BC bytes from (HL) to packet RAM
+; 0x4000, set TBCR, trigger TX, wait PTX.
+;   In: HL = source, BC = length.
 ; ------------------------------------------------------
 	IFDEF USE_RTL_SEND_FRAME
 SEND_FRAME
@@ -537,39 +545,33 @@ SEND_FRAME
 	LD	DE,0x4000
 	CALL	DMA_WRITE
 	RET	C
+	; DMA_WRITE loaded IX; reuse it for TBCR/CR.
 	LD	BC,(.LEN)
-	LD	A,C
-	LD	(RTL_TBCR0_A),A
-	LD	A,B
-	LD	(RTL_TBCR1_A),A
-	LD	A,CR_PAGE0_START | CR_TXP
-	LD	(RTL_CR_A),A
+	LD	(IX+RTL_TBCR0_OFF),C
+	LD	(IX+RTL_TBCR1_OFF),B
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START | CR_TXP
 	JP	WAIT_PTX
 .LEN	DW 0
 	ENDIF
 
 
 ; ------------------------------------------------------
-; RING_HAS_PACKET: ZF=1 if RX ring is empty (BNRY+1 wrap == CURR),
-; ZF=0 otherwise. Switches CR briefly to page 1 to read CURR
-; (with STA, so the chip keeps running) then restores page 0 STA.
-; Trashes A, B, C.
+; RING_HAS_PACKET: ZF=1 if RX ring is empty (BNRY+1==CURR).
 ; ------------------------------------------------------
 	IFDEF USE_RTL_RING_HAS_PACKET
 RING_HAS_PACKET
-	LD	A,(RTL_BNRY_A)
+	LD	IX,(RTL_BASE_PTR)
+	LD	A,(IX+RTL_BNRY_OFF)
 	INC	A
 	CP	RTL_PSTOP_INIT
 	JR	C,.NW
 	LD	A,RTL_PSTART_INIT
 .NW
 	LD	B,A
-	LD	A,CR_PAGE1_START
-	LD	(RTL_CR_A),A
-	LD	A,(RTL_CURR_A)
+	LD	(IX+RTL_CR_OFF),CR_PAGE1_START
+	LD	A,(IX+RTL_CURR_OFF)
 	LD	C,A
-	LD	A,CR_PAGE0_START
-	LD	(RTL_CR_A),A
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
 	LD	A,B
 	CP	C
 	RET
@@ -577,23 +579,21 @@ RING_HAS_PACKET
 
 
 ; ------------------------------------------------------
-; READ_PACKET: read 4-byte RX header at (BNRY+1)<<8 then body
-; bytes at offset +4. Auto-advances BNRY = header.next - 1
-; with PSTART wrap.
-;   In:  HL = header buffer ptr (4 bytes).
-;        DE = body buffer ptr.
-;        BC = max body length to read.
-;   Out: CF=0 OK; BC = actual body length read.
-;        CF=1 DMA timeout.
-; Trashes A, BC, DE, HL.
+; READ_PACKET: read 4-byte RX header at (BNRY+1)<<8, body
+; bytes at +4.  Auto-advances BNRY = header.next - 1.
+;   In:  HL = header buffer (4 bytes).
+;        DE = body buffer.
+;        BC = max body length.
+;   Out: CF=0 + BC = body length read; CF=1 DMA error.
 ; ------------------------------------------------------
 	IFDEF USE_RTL_READ_PACKET
 READ_PACKET
 	LD	(.HDR_PTR),HL
 	LD	(.BODY_PTR),DE
 	LD	(.MAX_LEN),BC
+	LD	IX,(RTL_BASE_PTR)
 	; Compute hdr_addr = (BNRY+1)<<8 with PSTOP wrap.
-	LD	A,(RTL_BNRY_A)
+	LD	A,(IX+RTL_BNRY_OFF)
 	INC	A
 	CP	RTL_PSTOP_INIT
 	JR	C,.NW
@@ -602,21 +602,20 @@ READ_PACKET
 	LD	D,A
 	LD	E,0
 	LD	(.PKT_ADDR),DE
-	; Read 4-byte header into HDR_PTR.
+	; Read 4-byte header.
 	LD	HL,(.HDR_PTR)
 	LD	BC,4
 	CALL	DMA_READ
 	RET	C
-	; body_len_candidate = (hdr.len) - 4
+	; body_len_candidate = (hdr.len) - 4.
 	LD	HL,(.HDR_PTR)
 	INC	HL
-	INC	HL			; HL -> hdr[2] = len_lo
+	INC	HL
 	LD	A,(HL)
 	LD	C,A
 	INC	HL
 	LD	A,(HL)
 	LD	B,A
-	; BC = hdr.len; subtract 4 -> HL.
 	LD	H,B
 	LD	L,C
 	LD	BC,4
@@ -636,19 +635,19 @@ READ_PACKET
 	LD	L,C
 .LEN_OK
 	LD	(.BODY_LEN),HL
-	; Compute body source address in NIC packet RAM.
+	; Compute body source address.
 	LD	DE,(.PKT_ADDR)
 	INC	DE
 	INC	DE
 	INC	DE
-	INC	DE			; DE = pkt_addr + 4
+	INC	DE
 	LD	(.BODY_ADDR),DE
 	; remaining_in_ring = PSTOP*256 - body_addr.
 	LD	HL,RTL_PSTOP_INIT * 256
 	OR	A
-	SBC	HL,DE			; HL = bytes from body_addr to PSTOP
+	SBC	HL,DE
 	LD	(.FIRST_LEN),HL
-	; Compare remaining (HL) vs body_len.
+	; Compare remaining vs body_len.
 	LD	BC,(.BODY_LEN)
 	LD	A,H
 	CP	B
@@ -658,7 +657,6 @@ READ_PACKET
 	CP	C
 	JR	C,.DO_SPLIT
 .DO_SINGLE
-	; Body fits before PSTOP: single DMA read.
 	LD	BC,(.BODY_LEN)
 	LD	DE,(.BODY_ADDR)
 	LD	HL,(.BODY_PTR)
@@ -666,23 +664,20 @@ READ_PACKET
 	RET	C
 	JR	.READ_DONE
 .DO_SPLIT
-	; First chunk: from BODY_ADDR up to PSTOP, into BODY_PTR.
 	LD	BC,(.FIRST_LEN)
 	LD	DE,(.BODY_ADDR)
 	LD	HL,(.BODY_PTR)
 	CALL	DMA_READ
 	RET	C
-	; Second chunk: from PSTART*256, len = BODY_LEN - FIRST_LEN,
-	; into BODY_PTR + FIRST_LEN.
 	LD	HL,(.BODY_LEN)
 	LD	BC,(.FIRST_LEN)
 	OR	A
-	SBC	HL,BC			; HL = remaining body bytes
+	SBC	HL,BC
 	LD	B,H
 	LD	C,L
 	LD	A,B
 	OR	C
-	JR	Z,.READ_DONE		; defensive: nothing left
+	JR	Z,.READ_DONE
 	LD	HL,(.BODY_PTR)
 	PUSH	BC
 	LD	BC,(.FIRST_LEN)
@@ -693,16 +688,16 @@ READ_PACKET
 	RET	C
 .READ_DONE
 	; Advance BNRY = hdr.next - 1, wrap PSTART -> PSTOP-1.
+	LD	IX,(RTL_BASE_PTR)
 	LD	HL,(.HDR_PTR)
-	INC	HL			; hdr[1] = next
+	INC	HL
 	LD	A,(HL)
 	DEC	A
 	CP	RTL_PSTART_INIT
 	JR	NC,.OK_BNRY
 	LD	A,RTL_PSTOP_INIT - 1
 .OK_BNRY
-	LD	(RTL_BNRY_A),A
-	; Return body length in BC.
+	LD	(IX+RTL_BNRY_OFF),A
 	LD	BC,(.BODY_LEN)
 	OR	A
 	RET

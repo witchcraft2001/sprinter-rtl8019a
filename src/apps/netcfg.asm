@@ -424,27 +424,18 @@ FILL_MAC_FROM_PROM
 	INC	HL
 	OR	(HL)
 	RET	NZ
-	; Find chip on slot 1, fall back to slot 0.
+	; INIT_BASE handles ISA slot 1 then 0 and base auto-scan;
+	; on success ISA stays open with the right slot/base set.
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
-	CALL	@ISA.ISA_OPEN
-	CALL	@RTL.PROBE_PRESENT
-	JR	NC,.HAVE_CHIP
-	CALL	@ISA.ISA_CLOSE
-	XOR	A
-	LD	(@ISA.ISA_SLOT),A
-	CALL	@ISA.ISA_OPEN
-	CALL	@RTL.PROBE_PRESENT
-	JR	NC,.HAVE_CHIP
-	CALL	@ISA.ISA_CLOSE
-	RET				; no chip anywhere; silently leave MAC zero
-.HAVE_CHIP
+	CALL	@RTL.INIT_BASE
+	RET	C			; no chip; silently leave MAC zero
 	CALL	@RTL.RESET
 	JR	C,.CLOSE
-	; DCR = 0x48: 8-bit data path, FIFO threshold 8 (mandatory
-	; per spec; MAME post-reset DCR is 0x04 which is unsafe).
-	LD	A,DCR_INIT
-	LD	(RTL_DCR_A),A
+	; Set DCR=0x48 directly via the new IX-relative base.
+	; (RTL_BASE_PTR is already populated by INIT_BASE.)
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_DCR_OFF),DCR_INIT
 	; Reuse NETCFG_LOAD_BUF as the 32-byte PROM scratch.  By
 	; this point NET.CFG has already been parsed so the buffer
 	; is no longer needed.

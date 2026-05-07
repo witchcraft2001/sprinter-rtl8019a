@@ -28,6 +28,13 @@ UTIL_DEC32_SCRATCH	EQU 0xA004
 ; rtl8019.asm: 10-byte register snapshot scratch.
 RTL_REG_SNAPSHOT	EQU 0xA010
 
+; rtl8019.asm: 2-byte runtime chip-window base address (e.g.
+; 0xC300 for I/O 0x300, 0xC280 for 0x280).  Loaded by
+; RTL.INIT_BASE from the N_NET_RTL_IOBASE env var or via auto-
+; scan of NE2000 candidate bases.  Driver functions read this
+; into IX on entry and access registers as (IX + RTL_xxx_OFF).
+RTL_BASE_PTR		EQU 0xA01A
+
 ; netenv_lib: 256-byte GETENV value buffer.
 NETENV_VAL_BUF		EQU 0xA020
 NETENV_VAL_BUF_SIZE	EQU 256

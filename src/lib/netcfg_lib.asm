@@ -276,9 +276,14 @@ PARSE
 	CALL	MATCH_DHCP
 	JR	NZ,.IP_NUM
 	; DHCP mode -- mark and skip the rest of the line.
+	; Must be CALL + JP .LINE, NOT JP SKIP_TO_NEXT_LINE: the
+	; latter's RET would return out of PARSE entirely (since
+	; we entered PARSE via CALL), leaving every key after
+	; IP=DHCP (NTP, TZ, RTL_MAC, ...) unparsed.
 	LD	A,1
 	LD	(DHCP_MODE),A
-	JP	SKIP_TO_NEXT_LINE
+	CALL	SKIP_TO_NEXT_LINE
+	JP	.LINE
 .IP_NUM
 	LD	DE,OUR_IP
 	CALL	PARSE_IPV4_LINE

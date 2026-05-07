@@ -15,48 +15,88 @@
 
 	INCLUDE "isa.inc"		; brings in ISA_BASE_A
 
-; -- I/O base on the ISA bus (jumper-selectable; MAME exposes
-; 0x300/0x320/0x340/0x360). The corresponding memory address
-; in the Sprinter ISA window is RTL_BASE_A.
+; -- I/O base on the ISA bus (jumper-selectable; standard NE2000
+; jumperless candidates: 0x200..0x3E0 in 32-byte steps).  The
+; chip's actual base is held at runtime in RTL_BASE_PTR (memmap),
+; loaded from N_NET_RTL_IOBASE env var or auto-scanned.  Driver
+; functions read RTL_BASE_PTR into IX on entry and address all
+; registers as `(IX + RTL_xxx_OFF)`.  The legacy *_A absolute
+; symbols below remain for backward compat (used by a couple of
+; apps that pre-date the runtime base) but new code should use
+; the *_OFF offsets.
 RTL_BASE	EQU 0x300
-RTL_BASE_A	EQU ISA_BASE_A + RTL_BASE	; 0xC300 by default
+RTL_BASE_A	EQU ISA_BASE_A + RTL_BASE	; 0xC300 default
 
-; -- Register window (page-selected via CR.PS) ---------------------
-RTL_CR_A	EQU RTL_BASE_A + 0x00	; Command Register
-RTL_DATA_A	EQU RTL_BASE_A + 0x10	; 8-bit remote DMA data port
-RTL_RESET_A	EQU RTL_BASE_A + 0x1F	; Reset (write asserts, read clears)
+; -- Register offsets (relative to chip I/O base) ------------------
+RTL_CR_OFF	EQU 0x00	; Command Register
+RTL_DATA_OFF	EQU 0x10	; 8-bit remote DMA data port
+RTL_RESET_OFF	EQU 0x1F	; Reset (write asserts, read clears)
 
-; -- Page 0 register addresses (CR.PS = 00) ----------------------------
-RTL_PSTART_A	EQU RTL_BASE_A + 0x01	; W: RX ring start page
-RTL_PSTOP_A	EQU RTL_BASE_A + 0x02	; W: RX ring stop  page
-RTL_BNRY_A	EQU RTL_BASE_A + 0x03	; R/W: RX boundary page
-RTL_TPSR_A	EQU RTL_BASE_A + 0x04	; W: TX page start
-RTL_TBCR0_A	EQU RTL_BASE_A + 0x05	; W: TX byte count low
-RTL_TBCR1_A	EQU RTL_BASE_A + 0x06	; W: TX byte count high
-RTL_ISR_A	EQU RTL_BASE_A + 0x07	; R/W: Interrupt Status (write-1-clear)
-RTL_RSAR0_A	EQU RTL_BASE_A + 0x08	; W: Remote DMA start lo
-RTL_RSAR1_A	EQU RTL_BASE_A + 0x09	; W: Remote DMA start hi
-RTL_RBCR0_A	EQU RTL_BASE_A + 0x0A	; W: Remote DMA byte cnt lo / R: 8019ID0 'P'
-RTL_RBCR1_A	EQU RTL_BASE_A + 0x0B	; W: Remote DMA byte cnt hi / R: 8019ID1 'p'
-RTL_RCR_A	EQU RTL_BASE_A + 0x0C	; W: Receive Configuration
-RTL_TCR_A	EQU RTL_BASE_A + 0x0D	; W: Transmit Configuration
-RTL_DCR_A	EQU RTL_BASE_A + 0x0E	; W: Data Configuration
-RTL_IMR_A	EQU RTL_BASE_A + 0x0F	; W: Interrupt Mask
+; -- Page 0 register offsets (CR.PS = 00) ----------------------------
+RTL_PSTART_OFF	EQU 0x01	; W: RX ring start page
+RTL_PSTOP_OFF	EQU 0x02	; W: RX ring stop  page
+RTL_BNRY_OFF	EQU 0x03	; R/W: RX boundary page
+RTL_TPSR_OFF	EQU 0x04	; W: TX page start
+RTL_TBCR0_OFF	EQU 0x05	; W: TX byte count low
+RTL_TBCR1_OFF	EQU 0x06	; W: TX byte count high
+RTL_ISR_OFF	EQU 0x07	; R/W: Interrupt Status
+RTL_RSAR0_OFF	EQU 0x08	; W: Remote DMA start lo
+RTL_RSAR1_OFF	EQU 0x09	; W: Remote DMA start hi
+RTL_RBCR0_OFF	EQU 0x0A	; W: Remote DMA byte cnt lo / R: 8019ID0 'P'
+RTL_RBCR1_OFF	EQU 0x0B	; W: Remote DMA byte cnt hi / R: 8019ID1 'p'
+RTL_RCR_OFF	EQU 0x0C	; W: Receive Configuration
+RTL_TCR_OFF	EQU 0x0D	; W: Transmit Configuration
+RTL_DCR_OFF	EQU 0x0E	; W: Data Configuration
+RTL_IMR_OFF	EQU 0x0F	; W: Interrupt Mask
 
 ; Page 0 ID-register aliases (read-only on RTL8019AS).
-RTL_ID0_A	EQU RTL_RBCR0_A
-RTL_ID1_A	EQU RTL_RBCR1_A
+RTL_ID0_OFF	EQU RTL_RBCR0_OFF
+RTL_ID1_OFF	EQU RTL_RBCR1_OFF
 
-; -- Page 1 register addresses (CR.PS = 01) ----------------------------
-RTL_PAR0_A	EQU RTL_BASE_A + 0x01
-RTL_PAR1_A	EQU RTL_BASE_A + 0x02
-RTL_PAR2_A	EQU RTL_BASE_A + 0x03
-RTL_PAR3_A	EQU RTL_BASE_A + 0x04
-RTL_PAR4_A	EQU RTL_BASE_A + 0x05
-RTL_PAR5_A	EQU RTL_BASE_A + 0x06
-RTL_CURR_A	EQU RTL_BASE_A + 0x07
-RTL_MAR0_A	EQU RTL_BASE_A + 0x08
-RTL_MAR7_A	EQU RTL_BASE_A + 0x0F
+; -- Page 1 register offsets (CR.PS = 01) --------------------------
+RTL_PAR0_OFF	EQU 0x01
+RTL_PAR1_OFF	EQU 0x02
+RTL_PAR2_OFF	EQU 0x03
+RTL_PAR3_OFF	EQU 0x04
+RTL_PAR4_OFF	EQU 0x05
+RTL_PAR5_OFF	EQU 0x06
+RTL_CURR_OFF	EQU 0x07
+RTL_MAR0_OFF	EQU 0x08
+RTL_MAR7_OFF	EQU 0x0F
+
+; -- Backward-compat absolute addresses (default base 0x300) --------
+; These resolve to fixed memory addresses; do NOT use them in
+; newly-written driver code.  Kept to avoid touching apps that
+; only reference one or two of them as a side note.
+RTL_CR_A	EQU RTL_BASE_A + RTL_CR_OFF
+RTL_DATA_A	EQU RTL_BASE_A + RTL_DATA_OFF
+RTL_RESET_A	EQU RTL_BASE_A + RTL_RESET_OFF
+RTL_PSTART_A	EQU RTL_BASE_A + RTL_PSTART_OFF
+RTL_PSTOP_A	EQU RTL_BASE_A + RTL_PSTOP_OFF
+RTL_BNRY_A	EQU RTL_BASE_A + RTL_BNRY_OFF
+RTL_TPSR_A	EQU RTL_BASE_A + RTL_TPSR_OFF
+RTL_TBCR0_A	EQU RTL_BASE_A + RTL_TBCR0_OFF
+RTL_TBCR1_A	EQU RTL_BASE_A + RTL_TBCR1_OFF
+RTL_ISR_A	EQU RTL_BASE_A + RTL_ISR_OFF
+RTL_RSAR0_A	EQU RTL_BASE_A + RTL_RSAR0_OFF
+RTL_RSAR1_A	EQU RTL_BASE_A + RTL_RSAR1_OFF
+RTL_RBCR0_A	EQU RTL_BASE_A + RTL_RBCR0_OFF
+RTL_RBCR1_A	EQU RTL_BASE_A + RTL_RBCR1_OFF
+RTL_RCR_A	EQU RTL_BASE_A + RTL_RCR_OFF
+RTL_TCR_A	EQU RTL_BASE_A + RTL_TCR_OFF
+RTL_DCR_A	EQU RTL_BASE_A + RTL_DCR_OFF
+RTL_IMR_A	EQU RTL_BASE_A + RTL_IMR_OFF
+RTL_ID0_A	EQU RTL_BASE_A + RTL_ID0_OFF
+RTL_ID1_A	EQU RTL_BASE_A + RTL_ID1_OFF
+RTL_PAR0_A	EQU RTL_BASE_A + RTL_PAR0_OFF
+RTL_PAR1_A	EQU RTL_BASE_A + RTL_PAR1_OFF
+RTL_PAR2_A	EQU RTL_BASE_A + RTL_PAR2_OFF
+RTL_PAR3_A	EQU RTL_BASE_A + RTL_PAR3_OFF
+RTL_PAR4_A	EQU RTL_BASE_A + RTL_PAR4_OFF
+RTL_PAR5_A	EQU RTL_BASE_A + RTL_PAR5_OFF
+RTL_CURR_A	EQU RTL_BASE_A + RTL_CURR_OFF
+RTL_MAR0_A	EQU RTL_BASE_A + RTL_MAR0_OFF
+RTL_MAR7_A	EQU RTL_BASE_A + RTL_MAR7_OFF
 
 ; -- CR (Command Register) bits ------------------------------------
 CR_STP		EQU 0x01	; Stop
