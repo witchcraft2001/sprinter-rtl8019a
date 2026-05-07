@@ -3,9 +3,10 @@
 ; Sends an NTPv3 client query to a numeric IPv4 server,
 ; receives the reply, prints the server's transmit time.
 ;
-; v0.1 (this commit): network round-trip + raw NTP timestamp.
-; v0.2 (next): convert NTP epoch to YYYY-MM-DD HH:MM:SS (UTC).
-; v0.3 (next): apply NET_TZ for local time + optional DSS_SETTIME.
+; v0.1: network round-trip + raw NTP timestamp.
+; v0.2: convert NTP epoch to YYYY-MM-DD HH:MM:SS (UTC).
+; v0.3 (current): apply NET_TZ for local time and write the
+;       result back to the DSS clock via DSS_SETTIME.
 ;
 ; Usage:
 ;   NTP server-ipv4
@@ -195,7 +196,22 @@ START
 	PRINT MSG_TZ_POST
 	PRINT LINE_END
 
+	; Push the local Y/M/D/H/M/S into the DSS clock.  DSS_SETTIME
+	; computes DOW itself; we only supply the date and time.
 	CALL	@ISA.ISA_CLOSE
+	CALL	SET_DSS_CLOCK
+	JR	C,.SETTIME_FAIL
+	PRINTLN MSG_CLOCK_SET
+	JP	@UTIL.EXIT_OK
+.SETTIME_FAIL
+	; A = DSS error code on entry.
+	PUSH	AF
+	PRINT MSG_CLOCK_FAIL_PRE
+	POP	AF
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+	; Date/time print already succeeded -- treat clock-set
+	; failure as a soft warning, not a network error.
 	JP	@UTIL.EXIT_OK
 
 
@@ -993,6 +1009,33 @@ MOD_HL_400
 ; PRINT_DATE: format YYYY-MM-DD HH:MM:SS from BSS fields.
 ; Trashes everything.
 ; ------------------------------------------------------
+; ------------------------------------------------------
+; SET_DSS_CLOCK: push (YEAR, MONTH, DAY, HOUR, MIN, SEC)
+; into the DSS RTC via syscall #22 (DSS_SETTIME).  DSS
+; computes day-of-week itself, so we do not pass C.
+;   Out: CF=0 ok; CF=1 + A = DSS error code.
+; ------------------------------------------------------
+SET_DSS_CLOCK
+	LD	A,(DAY)
+	LD	D,A
+	LD	A,(MONTH)
+	LD	E,A
+	; IX = YEAR (load via PUSH/POP since LD IX,(addr) is allowed
+	; by Z80 but PUSH/POP through HL is shorter).
+	LD	HL,(YEAR)
+	PUSH	HL
+	POP	IX
+	LD	A,(HOUR)
+	LD	H,A
+	LD	A,(MIN)
+	LD	L,A
+	LD	A,(SEC)
+	LD	B,A
+	LD	C,DSS_SETTIME
+	RST	DSS
+	RET
+
+
 PRINT_DATE
 	LD	HL,(YEAR)
 	CALL	PRINT_DEC4
@@ -1248,7 +1291,7 @@ TZ_HOURS	EQU APP_BSS_BASE + 64		; 1
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS NTP v0.1",0
+MSG_BANNER	DB "RTL8019AS NTP v0.3",0
 MSG_QUERY	DB "Querying NTP at ",0
 MSG_FROM	DB " from ",0
 MSG_STRATUM	DB "Reply: stratum=",0
@@ -1258,6 +1301,8 @@ MSG_UTC		DB "UTC time:   ",0
 MSG_LOCAL	DB "Local time: ",0
 MSG_TZ_PRE	DB " (TZ ",0
 MSG_TZ_POST	DB ")",0
+MSG_CLOCK_SET	DB "DSS clock updated.",0
+MSG_CLOCK_FAIL_PRE DB "[W] DSS_SETTIME failed: code=0x",0
 MSG_REGS	DB "REGS ",0
 MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
 MSG_E_RESET	DB "[E100] RESET timeout",0
