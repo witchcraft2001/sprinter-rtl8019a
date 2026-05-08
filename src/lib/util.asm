@@ -410,6 +410,264 @@ PRINT_DEC_32
 	ENDIF
 
 
+	; USE_UTIL_TPUT implies USE_UTIL_PRINT_DEC_32 (used to format the
+	; bytes / seconds / KB/s numbers).
+	IFDEF USE_UTIL_TPUT
+	IFNDEF USE_UTIL_PRINT_DEC_32
+	DEFINE USE_UTIL_PRINT_DEC_32
+	ENDIF
+	ENDIF
+
+	IFDEF USE_UTIL_TPUT
+; ------------------------------------------------------
+; TPUT_NOW: read DSS_SYSTIME and return the wall-clock time
+; as 24-bit seconds-of-day.
+;   Out: B = high 8 bits, HL = low 16 bits.
+; Trashes A, BC, DE, HL.  IX preserved (DSS_SYSTIME clobbers IX).
+; ------------------------------------------------------
+TPUT_NOW
+	PUSH	IX
+	LD	C,DSS_SYSTIME
+	RST	DSS
+	; H = hours, L = minutes, B = seconds.
+	PUSH	BC			; stash sec
+	PUSH	HL			; stash hr/min
+	; Acc (24-bit at UTIL_DEC32_SCRATCH) = 0.
+	XOR	A
+	LD	(UTIL_DEC32_SCRATCH + 0),A
+	LD	(UTIL_DEC32_SCRATCH + 1),A
+	LD	(UTIL_DEC32_SCRATCH + 2),A
+	; Acc += hours * 3600.
+	POP	DE			; D = hours, E = minutes
+	PUSH	DE
+	LD	A,D
+	OR	A
+	JR	Z,.SKIP_HH
+	LD	B,A
+.HH_LP
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	LD	DE,3600
+	ADD	HL,DE
+	LD	(UTIL_DEC32_SCRATCH),HL
+	JR	NC,.NCHH
+	LD	A,(UTIL_DEC32_SCRATCH + 2)
+	INC	A
+	LD	(UTIL_DEC32_SCRATCH + 2),A
+.NCHH
+	DJNZ	.HH_LP
+.SKIP_HH
+	; Acc += minutes * 60.
+	POP	DE			; D = hours, E = minutes
+	LD	A,E
+	OR	A
+	JR	Z,.SKIP_MM
+	LD	B,A
+.MM_LP
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	LD	DE,60
+	ADD	HL,DE
+	LD	(UTIL_DEC32_SCRATCH),HL
+	JR	NC,.NCMM
+	LD	A,(UTIL_DEC32_SCRATCH + 2)
+	INC	A
+	LD	(UTIL_DEC32_SCRATCH + 2),A
+.NCMM
+	DJNZ	.MM_LP
+.SKIP_MM
+	; Acc += seconds.
+	POP	BC			; B = seconds
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	LD	D,0
+	LD	E,B
+	ADD	HL,DE
+	LD	(UTIL_DEC32_SCRATCH),HL
+	JR	NC,.NCSS
+	LD	A,(UTIL_DEC32_SCRATCH + 2)
+	INC	A
+	LD	(UTIL_DEC32_SCRATCH + 2),A
+.NCSS
+	; Return: B = high, HL = low.
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	LD	A,(UTIL_DEC32_SCRATCH + 2)
+	LD	B,A
+	POP	IX
+	RET
+
+; ------------------------------------------------------
+; TPUT_START: capture the current SOD into UTIL_TPUT_START.
+; Call once just before the transfer begins.
+; Trashes A, BC, DE, HL.  IX preserved.
+; ------------------------------------------------------
+TPUT_START
+	CALL	TPUT_NOW
+	LD	(UTIL_TPUT_START),HL
+	LD	A,B
+	LD	(UTIL_TPUT_START + 2),A
+	RET
+
+; ------------------------------------------------------
+; TPUT_REPORT: print transfer summary line.
+;   In: DE:HL = bytes transferred (DE = high word, HL = low).
+;   Output (one of):
+;     "  <bytes> bytes in <secs> sec, <K> KB/s\n"
+;     "  <bytes> bytes in 0 sec\n"     (when elapsed == 0)
+; Trashes everything.
+; ------------------------------------------------------
+TPUT_REPORT
+	; Save bytes argument across TPUT_NOW (which clobbers DEHL).
+	PUSH	DE
+	PUSH	HL
+	; Compute current SOD (B:HL).
+	CALL	TPUT_NOW
+	; elapsed = current - start (24-bit).
+	LD	DE,(UTIL_TPUT_START)
+	LD	A,L
+	SUB	E
+	LD	L,A
+	LD	A,H
+	SBC	A,D
+	LD	H,A
+	LD	A,(UTIL_TPUT_START + 2)
+	LD	E,A
+	LD	A,B
+	SBC	A,E
+	LD	B,A
+	JR	NC,.NO_WRAP
+	; current < start: clock crossed midnight, add 86400 (0x015180).
+	LD	DE,0x5180
+	ADD	HL,DE
+	LD	A,B
+	ADC	A,1
+	LD	B,A
+.NO_WRAP
+	; B:HL = elapsed seconds.  Save.
+	LD	(UTIL_TPUT_ELAPSED),HL
+	LD	A,B
+	LD	(UTIL_TPUT_ELAPSED + 2),A
+
+	; --- compute KB/s = (bytes >> 10) / elapsed (16-bit / 16-bit) ---
+	; Bytes are still on the stack at top of frame: top = lo, then hi.
+	POP	HL			; HL = bytes_lo
+	POP	DE			; DE = bytes_hi
+	PUSH	DE			; push bytes back for printing later
+	PUSH	HL
+	; KB = bytes >> 10.  Shift right 8 first (drop low byte): bits 8..23
+	; live in (HL_high, DE_low).  Then shift right 2 more.
+	LD	L,H			; HL_lo  = bytes bits  8..15
+	LD	H,E			; HL_hi  = bytes bits 16..23
+	; If bytes > 64 MB (DE_high non-zero), cap KB at 0xFFFF -- no real
+	; transfer in this kit reaches 64 MB and the math saturates anyway.
+	LD	A,D
+	OR	A
+	JR	Z,.KB_OK
+	LD	HL,0xFFFF
+.KB_OK
+	SRL	H
+	RR	L
+	SRL	H
+	RR	L			; HL = KB
+	; Throughput = KB / elapsed.  Skip if elapsed > 65535 (>18 h, never)
+	; or elapsed == 0 (transfer < 1 sec resolution).
+	LD	A,(UTIL_TPUT_ELAPSED + 2)
+	OR	A
+	JR	NZ,.RATE_ZERO
+	LD	DE,(UTIL_TPUT_ELAPSED)
+	LD	A,D
+	OR	E
+	JR	Z,.RATE_ZERO
+	; Cap KB to fit unsigned-16: divide produces a 16-bit quotient.
+	CALL	DIV16_HL_BY_DE		; HL = KB/elapsed
+	JR	.SAVE_RATE
+.RATE_ZERO
+	LD	HL,0
+.SAVE_RATE
+	LD	(UTIL_TPUT_RATE),HL
+
+	; --- print "  <bytes> bytes in " ---
+	LD	HL,_TPUT_S_PREFIX
+	LD	C,DSS_PCHARS
+	RST	DSS
+	POP	HL			; bytes_lo
+	POP	DE			; bytes_hi
+	CALL	PRINT_DEC_32
+	LD	HL,_TPUT_S_BYTES_IN
+	LD	C,DSS_PCHARS
+	RST	DSS
+
+	; --- print elapsed seconds ---
+	LD	HL,(UTIL_TPUT_ELAPSED)
+	LD	A,(UTIL_TPUT_ELAPSED + 2)
+	LD	E,A
+	LD	D,0
+	CALL	PRINT_DEC_32
+	LD	HL,_TPUT_S_SEC
+	LD	C,DSS_PCHARS
+	RST	DSS
+
+	; --- print ", <KB/s> KB/s" only if rate is non-zero ---
+	LD	A,(UTIL_TPUT_ELAPSED + 0)
+	LD	B,A
+	LD	A,(UTIL_TPUT_ELAPSED + 1)
+	OR	B
+	LD	B,A
+	LD	A,(UTIL_TPUT_ELAPSED + 2)
+	OR	B
+	JR	Z,.NL_ONLY
+	LD	HL,_TPUT_S_COMMA
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	HL,(UTIL_TPUT_RATE)
+	LD	DE,0
+	CALL	PRINT_DEC_32
+	LD	HL,_TPUT_S_KBS
+	LD	C,DSS_PCHARS
+	RST	DSS
+.NL_ONLY
+	LD	HL,_TPUT_S_NL
+	LD	C,DSS_PCHARS
+	RST	DSS
+	RET
+
+; ------------------------------------------------------
+; DIV16_HL_BY_DE: HL = HL / DE, BC = HL mod DE.
+; In:  HL dividend, DE divisor (must be > 0).
+; Out: HL = quotient, BC = remainder, DE preserved.
+; Trashes: A, BC, flags.
+; ------------------------------------------------------
+DIV16_HL_BY_DE
+	LD	BC,0
+	LD	A,16
+.LP
+	ADD	HL,HL
+	RL	C
+	RL	B
+	PUSH	HL
+	LD	H,B
+	LD	L,C
+	OR	A
+	SBC	HL,DE
+	JR	C,.NOSUB
+	LD	B,H
+	LD	C,L
+	POP	HL
+	INC	L			; ADD HL,HL above set bit0=0, so INC sets it
+	JR	.NEXT
+.NOSUB
+	POP	HL
+.NEXT
+	DEC	A
+	JR	NZ,.LP
+	RET
+
+_TPUT_S_PREFIX		DB "  ",0
+_TPUT_S_BYTES_IN	DB " bytes in ",0
+_TPUT_S_SEC		DB " sec",0
+_TPUT_S_COMMA		DB ", ",0
+_TPUT_S_KBS		DB " KB/s",0
+_TPUT_S_NL		DB 13,10,0
+	ENDIF
+
+
 	; USE_UTIL_EXIT_NO_NIC implies USE_UTIL_EXIT (it tail-calls EXIT_FAIL).
 	IFDEF USE_UTIL_EXIT_NO_NIC
 	IFNDEF USE_UTIL_EXIT
