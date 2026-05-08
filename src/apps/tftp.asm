@@ -197,6 +197,7 @@ START
 	LD	HL,0
 	LD	(TOTAL_BYTES_LO),HL
 	LD	(TOTAL_BYTES_HI),HL
+	LD	(TFTP_BUF_LEN),HL
 	; Default block size (RFC 1350) -- overwritten by an OACK
 	; reply if the server accepts our blksize=1428 option.
 	LD	HL,TFTP_BLOCK_DEFAULT
@@ -288,17 +289,14 @@ START
 	JP	.BLOCK_LOOP
 
 .NOT_OACK
-	; Write data to file.
+	; Append data to the disk-write buffer (FLUSH_BUF auto-fires when
+	; the buffer fills, so we still ACK the server promptly per block).
 	LD	BC,(DATA_LEN)
 	LD	A,B
 	OR	C
 	JR	Z,.NO_WRITE
 	LD	HL,RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 4
-	LD	A,(OUT_FH)
-	LD	D,B
-	LD	E,C
-	LD	C,DSS_WRITE
-	RST	DSS
+	CALL	APPEND_TO_BUF
 	JP	C,FILE_FAIL
 	; Accumulate total bytes (32-bit add: TOTAL_BYTES += DATA_LEN).
 	LD	HL,(DATA_LEN)
@@ -343,6 +341,9 @@ START
 	JP	.BLOCK_LOOP
 
 .DONE
+	; Flush any tail bytes still in the disk-write buffer.
+	CALL	FLUSH_BUF
+	JP	C,FILE_FAIL
 	; Close file.
 	LD	A,(OUT_FH)
 	CP	NO_HANDLE
@@ -611,6 +612,80 @@ BUILD_ACK_PAYLOAD
 	LD	A,L
 	LD	(DE),A
 	INC	DE
+	RET
+
+
+; ------------------------------------------------------
+; APPEND_TO_BUF: append BC bytes from (HL) to TFTP_FILE_BUF.
+; Auto-flushes when the chunk would not fit.
+;   Out: CF=0 ok; CF=1 if a flush write failed.
+; Trashes A,BC,DE,HL.
+; ------------------------------------------------------
+APPEND_TO_BUF
+	LD	A,B
+	OR	C
+	RET	Z
+	; Will (buf_len + chunk_len) exceed buffer size?
+	PUSH	HL
+	PUSH	BC
+	LD	HL,(TFTP_BUF_LEN)
+	ADD	HL,BC
+	LD	DE,TFTP_FILE_BUF_SIZE
+	OR	A
+	SBC	HL,DE			; CF=1 if (buf_len + count) < size
+	JR	C,.FITS
+	; Doesn't fit -- flush first.
+	CALL	FLUSH_BUF
+	JR	C,.FAIL
+.FITS
+	POP	BC
+	POP	HL
+	; Copy chunk into the buffer at offset TFTP_BUF_LEN.
+	LD	DE,(TFTP_BUF_LEN)
+	PUSH	HL
+	LD	HL,TFTP_FILE_BUF
+	ADD	HL,DE
+	EX	DE,HL
+	POP	HL
+	PUSH	BC
+	LDIR
+	POP	BC
+	; buf_len += count
+	LD	HL,(TFTP_BUF_LEN)
+	ADD	HL,BC
+	LD	(TFTP_BUF_LEN),HL
+	OR	A
+	RET
+.FAIL
+	POP	BC
+	POP	HL
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; FLUSH_BUF: write the accumulated TFTP_FILE_BUF to OUT_FH and
+; reset the fill counter.  No-op on an empty buffer.
+;   Out: CF=0 ok; CF=1 DSS_WRITE error.
+; ------------------------------------------------------
+FLUSH_BUF
+	LD	HL,(TFTP_BUF_LEN)
+	LD	A,H
+	OR	L
+	RET	Z
+	LD	D,H
+	LD	E,L			; DE = byte count
+	LD	HL,TFTP_FILE_BUF
+	LD	A,(OUT_FH)
+	LD	C,DSS_WRITE
+	RST	DSS
+	JR	C,.ERR
+	LD	HL,0
+	LD	(TFTP_BUF_LEN),HL
+	OR	A
+	RET
+.ERR
+	SCF
 	RET
 
 
@@ -1199,6 +1274,7 @@ FILENAME_BUF	 EQU APP_BSS_BASE + 48		; FILENAME_BUF_SIZE bytes
 ; (DEC_BUF lives at APP_BSS_BASE + 48 + FILENAME_BUF_SIZE, 4 bytes)
 NEG_BLKSIZE	 EQU APP_BSS_BASE + 52 + FILENAME_BUF_SIZE	; 2 bytes (negotiated block)
 OACK_END_PTR	 EQU NEG_BLKSIZE + 2		; 2 bytes (parser end ptr)
+TFTP_BUF_LEN	 EQU OACK_END_PTR + 2		; 2 bytes (current fill of TFTP_FILE_BUF)
 
 
 ; ------- messages -------
@@ -1250,6 +1326,7 @@ TFTP_IMAGE_END
 
 RX_BUF_SIZE	EQU 1518
 TFTP_BUF_SIZE	EQU 128			; RRQ + blksize options ~40, room to spare
+TFTP_FILE_BUF_SIZE EQU 8192		; coalesce DSS_WRITE calls (#19)
 
 	MODULE MAIN
 
@@ -1257,7 +1334,8 @@ TX_BUF		EQU TFTP_IMAGE_END
 RX_HDR		EQU TX_BUF + 1518	; max ETH frame (RRQ/ACK fits, DATA up to 558)
 RX_BUF		EQU RX_HDR + 4
 TFTP_BUF	EQU RX_BUF + RX_BUF_SIZE
-TFTP_BSS_END	EQU TFTP_BUF + TFTP_BUF_SIZE
+TFTP_FILE_BUF	EQU TFTP_BUF + TFTP_BUF_SIZE
+TFTP_BSS_END	EQU TFTP_FILE_BUF + TFTP_FILE_BUF_SIZE
 
 	ENDMODULE
 

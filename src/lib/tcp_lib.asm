@@ -59,6 +59,19 @@
 
 OPEN_TIMEOUT_MS		EQU 5000
 
+; Receive window advertised in every outgoing SYN/ACK/DATA segment.
+; 8 KB lets the peer pipeline ~14 MSS=536 segments before needing
+; an ACK; the chip's ~14.5 KB RX ring tolerates that burst with
+; headroom.  Going much higher risks RX-ring overflow on slow drains.
+TCP_RECV_WIN_HI		EQU 0x20		; 8192 = 0x2000
+TCP_RECV_WIN_LO		EQU 0x00
+
+; Delayed-ACK threshold (RFC 1122 allows up to 2 segments unacked).
+; We are slightly more aggressive (4) because the chip RX ring is
+; large and the link is local; we still flush an ACK immediately
+; whenever the ring drains, so the peer never waits for long.
+TCP_ACK_THRESH		EQU 4
+
 ETH_TYPE_IPV4		EQU 0x0800
 IP_HDR_LEN		EQU 20
 IP_PROTO_TCP		EQU 6
@@ -120,6 +133,7 @@ RESTORE_CTX
 OPEN
 	XOR	A
 	LD	(TCP_LAST_FAIL),A
+	LD	(RECV_UNACKED),A
 	; Pick random local port in the ephemeral range
 	; 0xC000..0xFFFF.  Each invocation gets a fresh port so
 	; back-to-back runs don't collide on the server side.
@@ -303,15 +317,15 @@ BUILD_SYN
 	LD	A,TF_SYN
 	LD	(DE),A
 	INC	DE
-	; window = 4096 (BE) -- lets the peer pipeline more
-	; segments before waiting for an ACK.
-	LD	A,0x10
+	; advertised window (BE) -- see TCP_RECV_WIN_HI/LO at top.
+	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
-	XOR	A
+	LD	A,TCP_RECV_WIN_LO
 	LD	(DE),A
 	INC	DE
 	; checksum placeholder (0)
+	XOR	A
 	LD	(DE),A
 	INC	DE
 	LD	(DE),A
@@ -382,14 +396,15 @@ BUILD_ACK
 	LD	A,TF_ACK
 	LD	(DE),A
 	INC	DE
-	; window = 4096
-	LD	A,0x10
+	; advertised window (BE)
+	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
-	XOR	A
+	LD	A,TCP_RECV_WIN_LO
 	LD	(DE),A
 	INC	DE
 	; csum placeholder
+	XOR	A
 	LD	(DE),A
 	INC	DE
 	LD	(DE),A
@@ -883,7 +898,27 @@ RECV
 	LD	A,ST_CLOSE_WAIT
 	LD	(TCP_STATE),A
 .NO_FIN
-	; Send ACK back.
+	; Decide whether to ACK this segment now.  Force ACK on FIN
+	; (state == CLOSE_WAIT here).  Otherwise apply delayed-ACK:
+	; bump the unacked counter and skip the ACK so long as more
+	; packets remain in the chip's RX ring AND the counter is
+	; still below TCP_ACK_THRESH.  Drain-or-threshold flushes
+	; the cumulative ACK -- the peer's send window then advances.
+	LD	A,(TCP_STATE)
+	CP	ST_CLOSE_WAIT
+	JR	Z,.SEND_ACK
+	LD	A,(RECV_UNACKED)
+	INC	A
+	LD	(RECV_UNACKED),A
+	CP	TCP_ACK_THRESH
+	JR	NC,.SEND_ACK
+	CALL	@RTL.RING_HAS_PACKET
+	JR	Z,.SEND_ACK		; ring empty -> flush ACK now
+	; Skip ACK on this packet; keep counter for next iteration.
+	JR	.AOK
+.SEND_ACK
+	XOR	A
+	LD	(RECV_UNACKED),A
 	CALL	BUILD_ACK
 	LD	HL,@MAIN.TX_BUF
 	LD	BC,(TCP_TX_LEN)
@@ -921,6 +956,11 @@ RECV
 	RET
 .FLAGS		DB 0
 .DATA_OFFSET	DB 0
+
+; Counter of segments processed since the last outbound ACK.  Reset
+; on TCP.OPEN and on every actual ACK send; bumped on every accepted
+; (in-sequence) data segment.  See TCP_ACK_THRESH for the cap.
+RECV_UNACKED	DB 0
 
 
 ; ------------------------------------------------------
@@ -1019,12 +1059,13 @@ BUILD_DATA
 	LD	A,TF_PSH | TF_ACK
 	LD	(DE),A
 	INC	DE
-	LD	A,0x10			; window hi (4096)
+	LD	A,TCP_RECV_WIN_HI	; advertised window hi (BE)
+	LD	(DE),A
+	INC	DE
+	LD	A,TCP_RECV_WIN_LO
 	LD	(DE),A
 	INC	DE
 	XOR	A
-	LD	(DE),A
-	INC	DE
 	LD	(DE),A			; csum hi
 	INC	DE
 	LD	(DE),A			; csum lo

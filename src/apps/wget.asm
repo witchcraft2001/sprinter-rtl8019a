@@ -22,6 +22,7 @@ EXE_VERSION		EQU 1
 	INCLUDE "dss.inc"
 	INCLUDE "memmap.inc"
 	INCLUDE "rtl8019.inc"
+	INCLUDE "sprinter.inc"		; PAGE0/PAGE3 ports for pagemem use
 
 	DEFINE USE_UTIL_EXIT_NO_NIC
 	DEFINE USE_RTL_INIT_NORMAL
@@ -117,6 +118,15 @@ START
 	LD	HL,N_NET_MAC
 	LD	DE,OUR_MAC
 	CALL	@NETENV.REQUIRE_MAC
+
+	; Allocate the 32 KB paged-RAM disk-write buffer (2 frames).
+	; Done before INIT_BASE because GETMEM is a DSS syscall and
+	; we want the buffer ready before any chip activity starts.
+	LD	B,2
+	CALL	@PAGEMEM.ALLOC
+	JP	C,PAGEMEM_FAIL
+	LD	HL,0
+	LD	(WGET_BUF_LEN),HL
 
 	; Init NIC.
 	LD	A,1
@@ -386,44 +396,34 @@ PROCESS_CHUNK
 
 
 ; ------------------------------------------------------
-; APPEND_TO_BUF: append BC bytes from (HL) to WGET_FILE_BUF.
-; If the chunk would not fit, flush the current buffer
-; first, then copy.  On flush errors returns CF=1.
+; APPEND_TO_BUF: append BC bytes from (HL) into the 32 KB
+; paged-memory write buffer (2 logical pages, see PAGEMEM).
+; Auto-flushes when adding the chunk would overflow.
+;
+; The buffer lives in a DSS-allocated 2-page block.  At call
+; time ISA is OPEN (chip register window on PAGE3), so to
+; copy bytes into the buffer we briefly map the relevant
+; logical page into WIN0 (0x0000..0x3FFF) via direct PAGE0
+; port writes -- DI bracketed because while WIN0 holds the
+; user buffer, DSS code at 0x0000 is unreachable and any
+; interrupt would crash.
+;
+; The copy is split into 256-byte bursts so the DI window
+; stays in the millisecond range.
+;   Out: CF=0 ok; CF=1 flush failure.
+; Trashes A,BC,DE,HL.
 ; ------------------------------------------------------
 APPEND_TO_BUF
 	LD	A,B
 	OR	C
 	RET	Z
-	; Would (buf_len + chunk_len) exceed buf_size?
+	; Body-byte counter: counts bytes that arrive at the
+	; buffer regardless of whether a flush happens mid-copy.
+	; Update once up-front; the actual append below cannot
+	; partially fail (only FLUSH_BUF can fail, and we call
+	; it before the copy starts).
 	PUSH	HL
 	PUSH	BC
-	LD	HL,(WGET_BUF_LEN)
-	ADD	HL,BC
-	LD	DE,WGET_FILE_BUF_SIZE
-	OR	A
-	SBC	HL,DE			; CF=1 if (buf_len + count) < size
-	JR	C,.FITS
-	; Doesn't fit: flush first.
-	CALL	FLUSH_BUF
-	JR	C,.FAIL
-.FITS
-	POP	BC
-	POP	HL
-	; Copy chunk into buffer at offset WGET_BUF_LEN.
-	LD	DE,(WGET_BUF_LEN)
-	PUSH	HL
-	LD	HL,WGET_FILE_BUF
-	ADD	HL,DE
-	EX	DE,HL			; DE = dst, HL = ?
-	POP	HL			; HL = src
-	PUSH	BC			; save count for body counter
-	LDIR
-	POP	BC
-	; buf_len += count
-	LD	HL,(WGET_BUF_LEN)
-	ADD	HL,BC
-	LD	(WGET_BUF_LEN),HL
-	; body_total += count (32-bit)
 	LD	HL,(BODY_TOTAL_LO)
 	ADD	HL,BC
 	LD	(BODY_TOTAL_LO),HL
@@ -432,6 +432,113 @@ APPEND_TO_BUF
 	INC	HL
 	LD	(BODY_TOTAL_HI),HL
 .NOC
+	; Would (buf_len + count) exceed WGET_FILE_BUF_SIZE (32K)?
+	LD	HL,(WGET_BUF_LEN)
+	ADD	HL,BC
+	LD	DE,WGET_FILE_BUF_SIZE
+	OR	A
+	SBC	HL,DE
+	JR	C,.FITS
+	CALL	FLUSH_BUF
+	JP	C,.FAIL
+.FITS
+	POP	BC
+	POP	HL
+	LD	(.SRC),HL
+	LD	(.REMAIN),BC
+
+.NEXT_CHUNK
+	LD	HL,(.REMAIN)
+	LD	A,H
+	OR	L
+	JP	Z,.ALL_DONE
+
+	; page_idx = (WGET_BUF_LEN >> 14) & 1; offset = WGET_BUF_LEN & 0x3FFF.
+	LD	HL,(WGET_BUF_LEN)
+	LD	A,H
+	AND	0x40
+	JR	Z,.PG_0
+	LD	A,1
+	JR	.PG_DONE
+.PG_0
+	XOR	A
+.PG_DONE
+	LD	(.PG_IDX),A
+	LD	A,H
+	AND	0x3F
+	LD	H,A			; HL = offset_in_page (0..0x3FFF)
+	LD	(.OFFSET),HL
+
+	; pg_avail = 0x4000 - offset
+	EX	DE,HL			; DE = offset
+	LD	HL,0x4000
+	OR	A
+	SBC	HL,DE			; HL = pg_avail (1..0x4000)
+
+	; chunk = min(REMAIN, pg_avail).
+	LD	DE,(.REMAIN)
+	LD	A,H
+	CP	D
+	JR	C,.USE_HL
+	JR	NZ,.USE_DE
+	LD	A,L
+	CP	E
+	JR	C,.USE_HL
+.USE_DE
+	LD	HL,(.REMAIN)
+	JR	.HAVE_CHUNK
+.USE_HL
+	; HL already holds the smaller value.
+.HAVE_CHUNK
+	; Cap chunk to 256 bytes so the DI/EI critical section
+	; stays under ~1.5 ms.
+	LD	A,H
+	OR	A
+	JR	Z,.NOCAP
+	LD	HL,256
+.NOCAP
+	LD	(.CHUNK_LEN),HL
+
+	; Get phys-page byte for current logical index.
+	LD	A,(.PG_IDX)
+	LD	B,A
+	CALL	@PAGEMEM.PHYS_OF
+	LD	(.MAP_PHYS),A
+	; Save current PAGE0 byte (whatever DSS held there).
+	CALL	@PAGEMEM.SAVE_PAGE0
+	LD	(.SAVE_P0),A
+
+	; ---- critical section: WIN0 displaced to user buffer ----
+	DI
+	LD	A,(.MAP_PHYS)
+	LD	BC,PAGE0
+	OUT	(C),A
+	LD	HL,(.SRC)
+	LD	DE,(.OFFSET)
+	LD	BC,(.CHUNK_LEN)
+	LDIR
+	LD	A,(.SAVE_P0)
+	LD	BC,PAGE0
+	OUT	(C),A
+	EI
+	; ---------------------------------------------------------
+
+	; Advance bookkeeping by chunk_len.
+	LD	BC,(.CHUNK_LEN)
+	LD	HL,(.SRC)
+	ADD	HL,BC
+	LD	(.SRC),HL
+	LD	HL,(.REMAIN)
+	OR	A
+	SBC	HL,BC
+	LD	(.REMAIN),HL
+	LD	HL,(WGET_BUF_LEN)
+	ADD	HL,BC
+	LD	(WGET_BUF_LEN),HL
+
+	JP	.NEXT_CHUNK
+
+.ALL_DONE
 	OR	A
 	RET
 .FAIL
@@ -440,10 +547,21 @@ APPEND_TO_BUF
 	SCF
 	RET
 
+.SRC		DW 0
+.REMAIN		DW 0
+.OFFSET		DW 0
+.CHUNK_LEN	DW 0
+.PG_IDX		DB 0
+.MAP_PHYS	DB 0
+.SAVE_P0	DB 0
+
 
 ; ------------------------------------------------------
-; FLUSH_BUF: write the accumulated buffer to OUT_FH and
-; reset the fill counter.  No-op when the buffer is empty.
+; FLUSH_BUF: write the buffered bytes to OUT_FH.  Buffer
+; lives in 2 paged-RAM frames; we close the ISA window
+; (DSS_WRITE needs PAGE3 free), then for each filled page
+; ask DSS to map it into WIN3 and write up to 16 KB out of
+; 0xC000.  Reopens ISA on success or failure.
 ;   Out: CF=0 ok; CF=1 DSS_WRITE error.
 ; ------------------------------------------------------
 FLUSH_BUF
@@ -451,20 +569,68 @@ FLUSH_BUF
 	LD	A,H
 	OR	L
 	RET	Z
-	LD	D,H
-	LD	E,L			; DE = byte count
-	LD	HL,WGET_FILE_BUF
+	CALL	@ISA.ISA_CLOSE
+
+	; Decide split: page 0 (up to 16 KB), then page 1 if anything left.
+	LD	HL,(WGET_BUF_LEN)
+	LD	DE,0x4000
+	OR	A
+	SBC	HL,DE
+	JR	NC,.SPLIT		; HL >= 16 KB after sub
+	; All in page 0; restore HL to original count.
+	LD	HL,(WGET_BUF_LEN)
+	LD	(.PG0_LEN),HL
+	LD	HL,0
+	LD	(.PG1_LEN),HL
+	JR	.WRITE_PAGES
+.SPLIT
+	; HL now = WGET_BUF_LEN - 16384 = page 1 length.
+	LD	(.PG1_LEN),HL
+	LD	HL,0x4000
+	LD	(.PG0_LEN),HL
+
+.WRITE_PAGES
+	; Page 0.
+	LD	A,(PAGEMEM_BLOCK_ID)
+	LD	B,0
+	LD	C,DSS_SETWIN3
+	RST	DSS
+	LD	HL,0xC000
+	LD	DE,(.PG0_LEN)
 	LD	A,(OUT_FH)
 	LD	C,DSS_WRITE
 	RST	DSS
 	JR	C,.ERR
+
+	; Page 1, if non-empty.
+	LD	HL,(.PG1_LEN)
+	LD	A,H
+	OR	L
+	JR	Z,.OK
+	LD	A,(PAGEMEM_BLOCK_ID)
+	LD	B,1
+	LD	C,DSS_SETWIN3
+	RST	DSS
+	LD	HL,0xC000
+	LD	DE,(.PG1_LEN)
+	LD	A,(OUT_FH)
+	LD	C,DSS_WRITE
+	RST	DSS
+	JR	C,.ERR
+
+.OK
 	LD	HL,0
 	LD	(WGET_BUF_LEN),HL
+	CALL	@ISA.ISA_OPEN
 	OR	A
 	RET
 .ERR
+	CALL	@ISA.ISA_OPEN
 	SCF
 	RET
+
+.PG0_LEN	DW 0
+.PG1_LEN	DW 0
 
 
 ; ------------------------------------------------------
@@ -811,6 +977,13 @@ TICK_AND_CHECK_KEY
 	RET
 
 
+PAGEMEM_FAIL
+	; PAGEMEM.ALLOC failed; ISA hasn't been touched yet so just
+	; print + exit with a config-style status.
+	PRINTLN MSG_E_PAGEMEM
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
 RESET_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_RESET
@@ -1059,6 +1232,7 @@ MSG_CONNECTED	DB "ESTABLISHED.",0
 MSG_REGS	DB "REGS ",0
 MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
 MSG_E_RESET	DB "[E90] RESET timeout",0
+MSG_E_PAGEMEM	DB "[E] could not allocate paged-RAM write buffer (DSS GETMEM failed).",0
 MSG_E_SEND	DB "[E91] DMA write or PTX timeout",0
 MSG_E_ARP	DB "ARP request timed out.",0
 MSG_E_TCP_OPEN	DB "TCP connect failed, code 0x",0
@@ -1091,6 +1265,7 @@ LINE_END	DB 13,10,0
 	INCLUDE "dns_lib.asm"
 	INCLUDE "tcp_lib.asm"
 	INCLUDE "file_lib.asm"
+	INCLUDE "pagemem.asm"
 
 
 WGET_IMAGE_END
@@ -1102,12 +1277,11 @@ RX_BUF_SIZE	EQU 1518
 TX_BUF		EQU WGET_IMAGE_END
 RX_HDR		EQU TX_BUF + TCP_MAX_FRAME
 RX_BUF		EQU RX_HDR + 4
-; 8 KB write-coalescing buffer placed in directly-addressable
-; RAM after the RX area; flushed to disk on overflow and at
-; end of stream to amortise DSS_WRITE per-call overhead.
-WGET_FILE_BUF_SIZE EQU 8192
-WGET_FILE_BUF	EQU RX_BUF + RX_BUF_SIZE
-WGET_BSS_END	EQU WGET_FILE_BUF + WGET_FILE_BUF_SIZE
+; The disk-write coalescing buffer lives in 2 paged-RAM frames
+; (DSS-allocated at startup, see PAGEMEM_BLOCK_ID); only the
+; size constant is referenced here.  No linear RAM consumed.
+WGET_FILE_BUF_SIZE EQU 32768
+WGET_BSS_END	EQU RX_BUF + RX_BUF_SIZE
 
 	ENDMODULE
 

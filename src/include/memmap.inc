@@ -140,6 +140,18 @@ TCP_CTX_SIZE		EQU 0xAA26 - 0xAA00	; 38 bytes
 ; region to at least this.
 TCP_MAX_FRAME		EQU 600
 
+; pagemem.asm: state for a single allocated paged-RAM block.
+; Apps that pull pagemem (currently WGET) get a 32 KB buffer
+; backed by 2 paged frames; the cap below is set generously so
+; the helper can grow without touching memmap.
+;   BLOCK_ID  byte (0xFF = no block held)
+;   PHYS      PAGEMEM_MAX_PAGES bytes -- physical page numbers
+;             cached at ALLOC time (queried via BIOS EMM_FN4)
+;             so callers can program the PAGE0..3 ports directly
+;             without further BIOS/DSS calls.
+PAGEMEM_BLOCK_ID	EQU 0xAB00	; 1 byte
+PAGEMEM_PHYS		EQU 0xAB01	; PAGEMEM_MAX_PAGES bytes
+
 ; ----- Per-app private BSS (0xB000+) ---------------------
 
 ; Each app lays out its own scratch starting at this base.

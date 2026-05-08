@@ -7,6 +7,14 @@
 	IFNDEF	_DSS_INC
 	DEFINE	_DSS_INC
 
+; BIOS RST entry (Bios.* functions, e.g. EMM_FN0..7).  We need
+; this to query the physical page numbers backing a paged-RAM
+; block (BIOS_EMM_FN4) without going through DSS -- which is
+; required when the user buffer is mapped over WIN0 and DSS
+; code at 0x0000..0x3FFF is no longer reachable.
+BIOS                EQU 0x08
+BIOS_EMM_FN4        EQU 0xC4		; A=block_id, B=index -> A=phys page
+
 ; DSS RST Entry
 DSS                 EQU 0x10
 
@@ -31,9 +39,13 @@ DSS_WAITKEY			EQU 0x30							; blocks; key returned in A
 DSS_SCANKEY			EQU 0x31
 DSS_ECHOKEY			EQU	0x32
 DSS_K_CLEAR			EQU 0x35							; B=subfn (e.g. WAITKEY) -> clear buf + run subfn
-DSS_SETMEM			EQU 0x38
+DSS_SETWIN			EQU 0x38		; A=block, B=index, H=window*0x40
+DSS_SETWIN1			EQU 0x39		; A=block, B=index (WIN1 shortcut)
+DSS_SETWIN2			EQU 0x3A
+DSS_SETWIN3			EQU 0x3B
 DSS_GETMEM			EQU 0x3D
 DSS_FREEMEM			EQU	0x3E
+DSS_RESIZE_MEM		EQU 0x3F
 DSS_EXIT            EQU 0x41
 DSS_ENVIRON         EQU 0x46							; environment variables (PAGE 2 @ 0xE400)
 
