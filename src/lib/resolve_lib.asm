@@ -21,6 +21,20 @@
 ;                         CF=1 fail.  RESOLVE.LAST_FAIL
 ;                         indicates the cause (see below).
 ;
+;   RESOLVE.NEXT_HOP_FOR
+;                    In:  HL = pointer to a 4-byte IPv4 target.
+;                    Out: CF=0 -> RESOLVE_NEXT_HOP_IP and
+;                         RESOLVE_NEXT_HOP_MAC populated for
+;                         the right next hop (target itself
+;                         when on-subnet, NET_GW otherwise);
+;                         apps copy NEXT_HOP_MAC into their
+;                         per-session TARGET_MAC.
+;                         CF=1 -> off-subnet + no NET_GW (3) or
+;                         ARP timeout (4); LAST_FAIL set.
+;                    Reads NET_MASK / NET_GW from env each
+;                    call; safe to use without RESOLVE.HOST
+;                    (literal-IP apps that don't need DNS).
+;
 ;   RESOLVE.LAST_FAIL  byte; reason of last fail:
 ;                       0 - none / no fail
 ;                       1 - usage (empty / too long name)
@@ -265,6 +279,70 @@ HOST
 .PARSE_OK
 	POP	HL
 	OR	A
+	RET
+
+
+; ------------------------------------------------------
+; NEXT_HOP_FOR: subnet-check + ARP for an arbitrary target.
+; Public so apps that bypass HOST (or that need to ARP a
+; second target -- redirects, FTP PASV peer, etc.) get the
+; same on-subnet / via-gateway logic as the DNS-server hop.
+;   In:  HL = pointer to 4-byte target IPv4.
+;   Out: CF=0 -> RESOLVE_NEXT_HOP_IP / _MAC populated.
+;        CF=1 -> LAST_FAIL = 3 (no GW) or 4 (ARP timeout).
+; Trashes A, BC, DE, HL, IX.
+; ------------------------------------------------------
+NEXT_HOP_FOR
+	; Stage the target into RESOLVE_DNS_IP -- NEXT_HOP reads
+	; from there to do its subnet compare.  We're not in a DNS
+	; lookup at this point so the slot is free.
+	LD	DE,RESOLVE_DNS_IP
+	LD	BC,4
+	LDIR
+	; Re-load NET_MASK / NET_GW from env (caller may not have
+	; come through HOST in this call chain).
+	LD	HL,N_MASK
+	LD	DE,RESOLVE_NET_MASK
+	CALL	@NETENV.GET_IP
+	LD	A,0
+	JR	C,.NM
+	LD	A,1
+.NM
+	LD	(RESOLVE_HAS_MASK),A
+	LD	HL,N_GW
+	LD	DE,RESOLVE_NET_GW
+	CALL	@NETENV.GET_IP
+	LD	A,0
+	JR	C,.NG
+	LD	A,1
+.NG
+	LD	(RESOLVE_HAS_GW),A
+	CALL	NEXT_HOP
+	JR	NC,.DOARP
+	; Off-subnet and NET_GW absent.
+	LD	A,3
+	LD	(LAST_FAIL),A
+	SCF
+	RET
+.DOARP
+	LD	DE,@MAIN.TX_BUF
+	LD	HL,RESOLVE_NEXT_HOP_IP
+	CALL	@ARP.BUILD_REQUEST
+	LD	HL,@MAIN.TX_BUF
+	LD	BC,ARP_FRAME_LEN
+	CALL	@RTL.SEND_FRAME
+	JR	NC,.WAIT
+	LD	A,4
+	LD	(LAST_FAIL),A
+	SCF
+	RET
+.WAIT
+	LD	HL,ARP_TIMEOUT_MS
+	LD	(RESOLVE_TIMEOUT_LEFT),HL
+	CALL	WAIT_ARP
+	RET	NC
+	; LAST_FAIL set inside WAIT_ARP.
+	SCF
 	RET
 
 

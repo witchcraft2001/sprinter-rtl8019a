@@ -152,18 +152,18 @@ START
 	CALL	PRINT_DEC_HL
 	PRINT LINE_END
 
-	; ARP target IP directly (assumes on-subnet for stage 1).
-	LD	DE,TX_BUF
+	; ARP the next hop for TARGET_IP (target itself if on-subnet,
+	; NET_GW otherwise) and copy the resulting MAC into our
+	; per-session TARGET_MAC buffer.  RESOLVE.NEXT_HOP_FOR reads
+	; NET_MASK / NET_GW from env and parks the reply MAC in
+	; RESOLVE_NEXT_HOP_MAC.
 	LD	HL,TARGET_IP
-	CALL	@ARP.BUILD_REQUEST
-	LD	HL,TX_BUF
-	LD	BC,ARP_FRAME_LEN
-	CALL	@RTL.SEND_FRAME
-	JP	C,SEND_FAIL
-	LD	HL,ARP_TIMEOUT_MS
-	LD	(TIMEOUT_MS_LEFT),HL
-	CALL	WAIT_FOR_ARP_REPLY
+	CALL	@RESOLVE.NEXT_HOP_FOR
 	JP	C,ARP_TIMEOUT
+	LD	HL,RESOLVE_NEXT_HOP_MAC
+	LD	DE,TARGET_MAC
+	LD	BC,6
+	LDIR
 
 	; Stage TCP state.
 	LD	HL,TARGET_IP
