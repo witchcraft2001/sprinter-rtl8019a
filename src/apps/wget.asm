@@ -212,7 +212,11 @@ START
 	; Init HTTP parser + body counter + write buffer.
 	XOR	A
 	LD	(HSTATE),A
+	LD	(STATUS_DONE),A
+	LD	(HTTP_ABORT),A
+	LD	(STATUS_LINE_LEN),A
 	LD	HL,0
+	LD	(STATUS_CODE),HL
 	LD	(BODY_TOTAL_LO),HL
 	LD	(BODY_TOTAL_HI),HL
 	LD	(WGET_BUF_LEN),HL
@@ -235,6 +239,13 @@ START
 	JR	.DONE_RX
 .HAVE_DATA
 	CALL	PROCESS_CHUNK
+	; PROCESS_CHUNK sets HTTP_ABORT when it parses a non-2xx
+	; status line; stop receiving immediately so the body
+	; (which is the server's error page) doesn't tie up the
+	; link or end up in a partial output file.
+	LD	A,(HTTP_ABORT)
+	OR	A
+	JP	NZ,HTTP_FAIL
 	; If RECV piggyback'd a FIN with this data segment,
 	; TCP_STATE is already CLOSE_WAIT -- stop now instead
 	; of looping back into another (timeout-bound) RECV.
@@ -356,9 +367,14 @@ PROCESS_CHUNK
 	RET	Z
 	LD	A,(HSTATE)
 	CP	4
-	JR	Z,.WRITE_ALL
+	JR	Z,.MAYBE_WRITE
 	; Header parse loop.
 .HLP
+	LD	A,(HL)
+	; Capture the response's status line until the first \r.
+	; Once \r arrives, PARSE_STATUS_LINE decodes the numeric
+	; code and sets HTTP_ABORT for non-2xx replies.
+	CALL	CAPTURE_STATUS_BYTE
 	LD	A,(HL)
 	CALL	HDR_TRANSITION
 	LD	A,(HSTATE)
@@ -378,11 +394,146 @@ PROCESS_CHUNK
 	LD	A,B
 	OR	C
 	RET	Z
-.WRITE_ALL
+.MAYBE_WRITE
+	; If status was non-2xx the body is the server's error
+	; page; suppress writing it.  HTTP_ABORT will still be 0
+	; here for 2xx replies.
+	LD	A,(HTTP_ABORT)
+	OR	A
+	RET	NZ
 	; Append BC bytes from (HL) to the in-RAM file buffer;
 	; the buffer is flushed to disk when full and at end
 	; of stream, drastically reducing per-segment DSS I/O.
 	JP	APPEND_TO_BUF
+
+
+; ------------------------------------------------------
+; CAPTURE_STATUS_BYTE: append A to STATUS_LINE_BUF until
+; the first CR arrives, then parse the line into STATUS_CODE
+; and (for non-2xx) set HTTP_ABORT.  No-op once STATUS_DONE.
+; Trashes A.  BC, DE, HL preserved (PROCESS_CHUNK uses them
+; as src ptr / remaining count across the call).
+; ------------------------------------------------------
+CAPTURE_STATUS_BYTE
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	LD	B,A
+	LD	A,(STATUS_DONE)
+	OR	A
+	JR	NZ,.OUT
+	LD	A,B
+	CP	13
+	JR	Z,.PARSE
+	; Append, with size cap.
+	LD	A,(STATUS_LINE_LEN)
+	CP	STATUS_LINE_BUF_SIZE - 1
+	JR	NC,.OUT
+	LD	E,A
+	LD	D,0
+	LD	HL,STATUS_LINE_BUF
+	ADD	HL,DE
+	LD	(HL),B
+	LD	A,(STATUS_LINE_LEN)
+	INC	A
+	LD	(STATUS_LINE_LEN),A
+	JR	.OUT
+.PARSE
+	LD	A,(STATUS_LINE_LEN)
+	LD	E,A
+	LD	D,0
+	LD	HL,STATUS_LINE_BUF
+	ADD	HL,DE
+	XOR	A
+	LD	(HL),A			; null-terminate captured line
+	CALL	PARSE_STATUS_LINE
+	LD	A,1
+	LD	(STATUS_DONE),A
+.OUT
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
+
+
+; ------------------------------------------------------
+; PARSE_STATUS_LINE: read STATUS_LINE_BUF (ASCIIZ
+; "HTTP/1.x NNN [reason text]"), put the 16-bit numeric code
+; into STATUS_CODE.  If the code is outside 200..299 print
+; "[E] <whole status line>" and set HTTP_ABORT=1.
+; Trashes A, BC, DE, HL.
+; ------------------------------------------------------
+PARSE_STATUS_LINE
+	LD	HL,STATUS_LINE_BUF
+	; Find the first space after "HTTP/1.x".
+.FSP
+	LD	A,(HL)
+	OR	A
+	RET	Z			; malformed: leave abort=0
+	CP	' '
+	JR	Z,.SAW_SP
+	INC	HL
+	JR	.FSP
+.SAW_SP
+	INC	HL
+	; Skip extra spaces (RFC allows multiple).
+.SKIP
+	LD	A,(HL)
+	CP	' '
+	JR	NZ,.DIGITS
+	INC	HL
+	JR	.SKIP
+.DIGITS
+	LD	DE,0			; accumulator
+.DLP
+	LD	A,(HL)
+	SUB	'0'
+	JR	C,.DEND
+	CP	10
+	JR	NC,.DEND
+	; DE = DE*10 + nibble.
+	LD	B,A
+	PUSH	HL
+	LD	H,D
+	LD	L,E
+	ADD	HL,HL			; *2
+	LD	D,H
+	LD	E,L
+	ADD	HL,HL			; *4
+	ADD	HL,HL			; *8
+	ADD	HL,DE			; *10
+	LD	D,0
+	LD	E,B
+	ADD	HL,DE
+	EX	DE,HL
+	POP	HL
+	INC	HL
+	JR	.DLP
+.DEND
+	LD	(STATUS_CODE),DE
+	; Accept 200..299 silently.
+	LD	A,D
+	OR	A
+	JR	NZ,.NOT_2XX
+	LD	A,E
+	CP	200
+	JR	C,.NOT_2XX
+	CP	250			; 200..249 enough for HTTP/1.0; 25x..29x rare but accepted
+	JR	C,.OK_2XX
+	CP	300
+	JR	NC,.NOT_2XX
+.OK_2XX
+	RET
+.NOT_2XX
+	; "[E] " + the whole captured line + "\r\n".
+	PRINT MSG_E_HTTP_PRE
+	LD	HL,STATUS_LINE_BUF
+	LD	C,DSS_PCHARS
+	RST	DSS
+	PRINT LINE_END
+	LD	A,1
+	LD	(HTTP_ABORT),A
+	RET
 
 
 ; ------------------------------------------------------
@@ -562,6 +713,43 @@ TCP_FAIL
 	CALL	@UTIL.PRINT_HEX_A
 	PRINT LINE_END
 	JP	FAIL_NIC
+
+
+; ------------------------------------------------------
+; HTTP_FAIL: server returned a non-2xx status.  The error
+; line was already printed by PARSE_STATUS_LINE.  Close
+; gracefully (no flush -- the buffered bytes are the
+; server's error body, not the user's file), delete the
+; freshly-created output file so a 404 doesn't leave a
+; truncated/empty file behind, then exit B=EX_NET_ERR.
+; ------------------------------------------------------
+HTTP_FAIL
+	; Drop any body bytes we accidentally let in before the
+	; abort flag was checked.
+	LD	HL,0
+	LD	(WGET_BUF_LEN),HL
+	; Close + delete the output file.
+	LD	A,(OUT_FH)
+	CP	NO_HANDLE
+	JR	Z,.NCL
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+.NCL
+	LD	HL,(OUTPUT_PTR)
+	LD	A,(HL)
+	OR	A
+	JR	Z,.NDEL
+	LD	HL,(OUTPUT_PTR)
+	LD	C,DSS_DELETE
+	RST	DSS
+.NDEL
+	; TCP close (best-effort -- peer may already FIN).
+	CALL	@TCP.CLOSE
+	CALL	@ISA.ISA_CLOSE
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
 
 
 ; ------------------------------------------------------
@@ -1043,10 +1231,16 @@ BODY_TOTAL_LO	EQU APP_BSS_BASE + 29		; 2
 BODY_TOTAL_HI	EQU APP_BSS_BASE + 31		; 2
 DEC_BUF		EQU APP_BSS_BASE + 33		; 6
 FORCE_FLAG	EQU APP_BSS_BASE + 39		; 1 (-y / --yes)
+STATUS_DONE	EQU APP_BSS_BASE + 40		; 1 (1 once \r seen)
+HTTP_ABORT	EQU APP_BSS_BASE + 41		; 1 (1 if status >= 300)
+STATUS_CODE	EQU APP_BSS_BASE + 42		; 2 (parsed numeric code)
+STATUS_LINE_LEN	EQU APP_BSS_BASE + 44		; 1
 HOST_BUF	EQU APP_BSS_BASE + 64		; HOST_BUF_SIZE
 PATH_BUF	EQU HOST_BUF + HOST_BUF_SIZE	; PATH_BUF_SIZE
 REQUEST_BUF	EQU PATH_BUF + PATH_BUF_SIZE	; REQUEST_BUF_SIZE
 WGET_BUF_LEN	EQU REQUEST_BUF + REQUEST_BUF_SIZE	; 2 bytes
+STATUS_LINE_BUF	EQU WGET_BUF_LEN + 2		; STATUS_LINE_BUF_SIZE bytes
+STATUS_LINE_BUF_SIZE EQU 64
 
 
 MSG_BANNER	DB "RTL8019AS WGET v0.2.1",0
@@ -1065,6 +1259,7 @@ MSG_E_TCP_OPEN	DB "TCP connect failed, code 0x",0
 MSG_E_TCP_SEND	DB "TCP send failed, code 0x",0
 MSG_E_RECV	DB "TCP recv failed, code 0x",0
 MSG_E_FILE	DB "[E] file create/write failed.",0
+MSG_E_HTTP_PRE	DB "[E] ",0
 MSG_E_RESOLVE	DB "[E] could not resolve host.",0
 MSG_DONE_PRE	DB "Done. ",0
 MSG_BYTES	DB " bytes received.",0
