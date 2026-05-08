@@ -90,10 +90,32 @@ START
 	JP	Z,USAGE_ERROR
 	LD	(HOST_PTR),HL
 
-	; positional 1: filename (required)
+	; -l: directory-listing mode (no file download).  Detect
+	; first so the filename positional can be optional.
+	XOR	A
+	LD	(LIST_MODE),A
+	LD	A,'l'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_LIST
+	LD	A,1
+	LD	(LIST_MODE),A
+.NO_LIST
+
+	; positional 1: filename (required for download, optional
+	; for list -- treated as the directory to list).
 	LD	B,1
 	CALL	@CMDL.GET_POSITIONAL
-	JP	C,USAGE_ERROR
+	JR	NC,.HAVE_POS1
+	; No positional: only OK in -l mode (list current/root).
+	LD	A,(LIST_MODE)
+	OR	A
+	JP	Z,USAGE_ERROR
+	LD	HL,EMPTY_STR
+	LD	(FILENAME_PTR),HL
+	XOR	A
+	LD	(FILENAME_LEN),A
+	JR	.OUT_OK
+.HAVE_POS1
 	LD	A,(HL)
 	OR	A
 	JP	Z,USAGE_ERROR
@@ -101,7 +123,8 @@ START
 	CALL	STRLEN_FROM_HL
 	LD	(FILENAME_LEN),A
 
-	; -o output (optional, default = filename)
+	; -o output (optional, default = filename).  Ignored in
+	; -l mode (no file is created).
 	LD	A,'o'
 	CALL	@CMDL.GET_FLAG_VALUE
 	JR	C,.NO_OUT
@@ -311,14 +334,19 @@ START
 	CALL	PRINT_DEC_HL
 	PRINT LINE_END
 
-	; --- Open output file (prompt-or-overwrite) ---
+	; --- Open output file (prompt-or-overwrite).  Skipped in
+	; -l (LIST) mode, where data goes to the console instead. ---
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
+	LD	A,(LIST_MODE)
+	OR	A
+	JR	NZ,.SKIP_FILE_OPEN
 	LD	HL,(OUTPUT_PTR)
 	LD	A,(FORCE_FLAG)
 	CALL	@FILE.OPEN_OUTPUT
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
+.SKIP_FILE_OPEN
 
 	; --- Save control session ---
 	LD	DE,CTRL_BACKUP
@@ -347,9 +375,17 @@ START
 	LD	HL,CTRL_BACKUP
 	CALL	@TCP.RESTORE_CTX
 
-	; RETR <filename>
+	; RETR <filename> or LIST [<dir>] depending on mode.
+	LD	A,(LIST_MODE)
+	OR	A
+	JR	NZ,.SEND_LIST
 	LD	HL,CMD_RETR
 	LD	BC,CMD_RETR_LEN
+	JR	.SEND_DC_CMD
+.SEND_LIST
+	LD	HL,CMD_LIST
+	LD	BC,CMD_LIST_LEN
+.SEND_DC_CMD
 	LD	DE,(FILENAME_PTR)
 	LD	A,(FILENAME_LEN)
 	CALL	SEND_CMD_ARG
@@ -392,13 +428,18 @@ START
 	LD	A,H
 	OR	L
 	JR	Z,.DRX_DONE
-	CALL	APPEND_DATA
+	CALL	HANDLE_DATA_CHUNK
 .DRX_DONE
 	JR	.DATA_TRANSFER_DONE
 .DRX_HAVE
-	CALL	APPEND_DATA
+	CALL	HANDLE_DATA_CHUNK
 	JR	.DRXLP
 .DATA_TRANSFER_DONE
+	; In -l mode there's no buffered file content; skip flush
+	; and the file-close.
+	LD	A,(LIST_MODE)
+	OR	A
+	JR	NZ,.NOC
 
 	; Flush remaining buffered bytes to disk.
 	CALL	FLUSH_DATA
@@ -444,7 +485,12 @@ START
 	CALL	PRINT_REPLY
 .NO226
 
-	; Print transferred byte count.
+	; In GET mode print "Done. NNN bytes received." + KB/s.
+	; In LIST mode skip it -- the listing was already streamed
+	; to the console.
+	LD	A,(LIST_MODE)
+	OR	A
+	JR	NZ,.SKIP_SUMMARY
 	PRINT MSG_DONE_PRE
 	LD	HL,(BODY_TOTAL_LO)
 	LD	DE,(BODY_TOTAL_HI)
@@ -453,6 +499,7 @@ START
 	LD	HL,(BODY_TOTAL_LO)
 	LD	DE,(BODY_TOTAL_HI)
 	CALL	@UTIL.TPUT_REPORT
+.SKIP_SUMMARY
 
 	; QUIT
 	LD	HL,CMD_QUIT
@@ -895,6 +942,67 @@ STRLEN_FROM_HL
 	LD	A,B
 	POP	HL
 	RET
+
+
+; ------------------------------------------------------
+; HANDLE_DATA_CHUNK: dispatch the freshly-received chunk
+; to APPEND_DATA (GET mode -- buffer for disk) or to
+; PRINT_DATA_CHUNK (LIST mode -- straight to console).
+; ------------------------------------------------------
+HANDLE_DATA_CHUNK
+	LD	A,(LIST_MODE)
+	OR	A
+	JP	NZ,PRINT_DATA_CHUNK
+	JP	APPEND_DATA
+
+
+; ------------------------------------------------------
+; PRINT_DATA_CHUNK: emit TCP_RX_DATA_LEN bytes from
+; TCP_RX_DATA_PTR to the console.  ISA window is briefly
+; closed for the DSS_PCHARS call (console output uses
+; PAGE3); to make PCHARS happy we temporarily null-
+; terminate the chunk and restore the byte after.  Each
+; chunk is one TCP segment (<= MSS), so the close window
+; stays small enough that the chip's RX ring doesn't
+; overflow during the print.
+; ------------------------------------------------------
+PRINT_DATA_CHUNK
+	LD	HL,(TCP_RX_DATA_PTR)
+	LD	BC,(TCP_RX_DATA_LEN)
+	LD	A,B
+	OR	C
+	RET	Z
+	PUSH	HL
+	ADD	HL,BC
+	LD	A,(HL)
+	LD	(.SAVE_BYTE),A		; remember byte at chunk_end
+	XOR	A
+	LD	(HL),A			; null-terminate chunk for PCHARS
+	POP	HL
+	PUSH	HL
+	PUSH	BC
+	CALL	@ISA.ISA_CLOSE
+	LD	C,DSS_PCHARS
+	RST	DSS
+	CALL	@ISA.ISA_OPEN
+	POP	BC
+	POP	HL
+	ADD	HL,BC
+	LD	A,(.SAVE_BYTE)
+	LD	(HL),A			; restore the byte we clobbered
+	; Update BODY_TOTAL too -- TPUT_REPORT uses it (we don't
+	; print the count in -l mode, but the counter stays
+	; consistent should somebody add a "-l verbose" later).
+	LD	BC,(TCP_RX_DATA_LEN)
+	LD	HL,(BODY_TOTAL_LO)
+	ADD	HL,BC
+	LD	(BODY_TOTAL_LO),HL
+	RET	NC
+	LD	HL,(BODY_TOTAL_HI)
+	INC	HL
+	LD	(BODY_TOTAL_HI),HL
+	RET
+.SAVE_BYTE	DB 0
 
 
 ; ------------------------------------------------------
@@ -1365,6 +1473,9 @@ CMD_PASV	DB "PASV"
 CMD_PASV_LEN	EQU $ - CMD_PASV
 CMD_QUIT	DB "QUIT"
 CMD_QUIT_LEN	EQU $ - CMD_QUIT
+CMD_LIST	DB "LIST "
+CMD_LIST_LEN	EQU $ - CMD_LIST
+EMPTY_STR	DB 0
 CMD_RETR	DB "RETR "
 CMD_RETR_LEN	EQU $ - CMD_RETR
 DEFAULT_USER	DB "anonymous"
@@ -1412,6 +1523,7 @@ USER_LEN	EQU USER_PTR + 2		; 1
 USER_OVERRIDE	EQU USER_LEN + 1		; 1 (1 if -u was given)
 PASS_PTR	EQU USER_OVERRIDE + 1		; 2
 PASS_LEN	EQU PASS_PTR + 2		; 1
+LIST_MODE	EQU PASS_LEN + 1		; 1 (1 if -l was given)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
@@ -1445,9 +1557,12 @@ MSG_USAGE_ERR	DB "[E] usage: missing host or filename",0
 MSG_HELP
 	DB "Usage:",13,10
 	DB "  FTP host filename [-u user] [-p pass] [-o output] [-y]",13,10
+	DB "  FTP host [path] -l [-u user] [-p pass]",13,10
 	DB "  FTP /?",13,10,13,10
 	DB "  host       FTP server (IPv4 or hostname).",13,10
 	DB "  filename   remote file to download.",13,10
+	DB "  path       remote directory to list (default: server CWD).",13,10
+	DB "  -l         list a directory instead of downloading.",13,10
 	DB "  -u user    FTP username (default: anonymous).",13,10
 	DB "  -p pass    FTP password (default: anonymous@; empty",13,10
 	DB "             when -u is given without -p).",13,10

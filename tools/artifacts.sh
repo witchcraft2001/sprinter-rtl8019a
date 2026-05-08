@@ -34,9 +34,23 @@ BUILD_APPS=(
 
 # Text/documentation files copied to the distribution root.
 # docs/MAME_NETWORK.md is intentionally NOT shipped: it is developer-only.
+# Per-utility pages are short references; HOWTO.md collects everything
+# common (env vars, exit codes, batch examples).  USAGE.md is the index.
 DIST_DOC_FILES=(
   README.md
   docs/USAGE.md
+  docs/HOWTO.md
+  docs/NETCFG.md
+  docs/IFUP.md
+  docs/ARP.md
+  docs/PING.md
+  docs/UDPTEST.md
+  docs/NSLOOKUP.md
+  docs/NTP.md
+  docs/WGET.md
+  docs/FTP.md
+  docs/TFTP.md
+  docs/ISAPROBE.md
   LICENSE
 )
 
