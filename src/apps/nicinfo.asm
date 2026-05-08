@@ -52,18 +52,28 @@ START
 	CALL	@RTL.INIT_BASE
 	JP	C,SCAN_FAIL
 
-	; [N0] SLOT=N BASE=NNNN  -- where the chip actually lives.
+	; [N0] Slot/Addr: N/#HHH  -- canonical form, matches the
+	; NET_RTL_HW env var written by INIT_BASE.
 	PRINT MSG_N0
 	LD	A,(@ISA.ISA_SLOT)
 	ADD	A,'0'
 	CALL	PUTCHAR
-	PRINT MSG_N0_BASE
+	PRINT MSG_N0_SEP
 	LD	HL,(RTL_BASE_PTR)
 	LD	A,H
 	SUB	HIGH ISA_BASE_A
-	CALL	@UTIL.PRINT_HEX_A
+	AND	0x0F			; high hex nibble of the I/O addr
+	CALL	PRINT_HEX_NIBBLE
 	LD	A,L
-	CALL	@UTIL.PRINT_HEX_A
+	RRCA
+	RRCA
+	RRCA
+	RRCA
+	AND	0x0F
+	CALL	PRINT_HEX_NIBBLE
+	LD	A,L
+	AND	0x0F
+	CALL	PRINT_HEX_NIBBLE
 	PRINT LINE_END
 
 	; Diagnostic scan of all 16 candidate bases on the active
@@ -423,6 +433,18 @@ PUTCHAR
 	RET
 
 ; ------------------------------------------------------
+; PRINT_HEX_NIBBLE: A = 0..15 -> '0'..'9' or 'A'..'F'.
+; ------------------------------------------------------
+PRINT_HEX_NIBBLE
+	CP	10
+	JR	C,.D
+	ADD	A,'A' - 10
+	JR	PUTCHAR
+.D
+	ADD	A,'0'
+	JR	PUTCHAR
+
+; ------------------------------------------------------
 ; DETECT_LAYOUT: A = 0 direct, 1 doubled, 2 unknown.
 ; ------------------------------------------------------
 DETECT_LAYOUT
@@ -551,8 +573,8 @@ REG_NAMES
 
 ; ------- messages -------
 MSG_BANNER	DB "RTL8019AS NICINFO v0.1",0
-MSG_N0		DB "[N0] SLOT=",0
-MSG_N0_BASE	DB " BASE=",0
+MSG_N0		DB "[N0] Slot/Addr: ",0
+MSG_N0_SEP	DB "/#",0
 MSG_N1		DB "[N1] RESET ",0
 MSG_OK		DB "OK",0
 MSG_N2		DB "[N2] CR=",0

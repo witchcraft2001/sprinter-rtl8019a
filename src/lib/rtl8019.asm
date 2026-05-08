@@ -40,9 +40,17 @@
 	IFNDEF	_RTL8019
 	DEFINE	_RTL8019
 
+	; INIT_BASE's TRY_ENV_OVERRIDE parses the canonical
+	; "S/#HHH" env value via UTIL.PARSE_HEX_NIBBLE; ensure it
+	; is enabled before util.asm is pulled in.
+	IFNDEF USE_UTIL_PARSE_HEX_BYTE
+	DEFINE USE_UTIL_PARSE_HEX_BYTE
+	ENDIF
+
 	INCLUDE "rtl8019.inc"
 	INCLUDE "isa.inc"
 	INCLUDE "util.asm"
+	INCLUDE "dss.inc"		; DSS_ENVIRON, ENV_GET/SET
 
 ; Timeouts in arbitrary inner-loop units, calibrated empirically.
 RTL_RESET_LOOPS		EQU 8000		; ~ ISR.RST poll budget
@@ -54,45 +62,63 @@ RTL_RDC_LOOPS		EQU 4000		; remote DMA complete budget
 ; INIT_BASE: locate the chip, open the right ISA slot, set
 ; RTL_BASE_PTR to its window address.
 ;
-; Behaviour:
-;  - If RTL_BASE_PTR is already non-zero (caller pre-set
-;    it from env or NICINFO's manual scan), open ISA and
-;    verify the chip responds at that base; if yes, keep it.
-;  - Otherwise scan the 16 standard NE2000 jumperless bases
-;    (0x200..0x3E0 step 0x20), first on ISA slot 1 (or
-;    whatever value the caller put in @ISA.ISA_SLOT), then
-;    on the OTHER slot.  First responder wins.
+; Two-stage strategy:
+;  1. Try the env override "NET_RTL_HW" (canonical "S/#HHH";
+;     written by NETCFG from net.cfg's RTL_HW= line, or
+;     persisted by an earlier successful auto-scan).  If the
+;     value parses cleanly AND the chip responds at that
+;     slot/base, accept it -- no scan, no ISA churn.
+;  2. Otherwise scan the 16 standard NE2000 jumperless bases
+;     (0x200..0x3E0 step 0x20) on the currently-selected ISA
+;     slot, then the other slot.  First responder wins, and
+;     its discovered slot/base is written back to env so
+;     subsequent utilities in the same DSS session take the
+;     fast path.
 ;
-; On success ISA is left OPEN and ISA_SLOT correctly set,
-; so the caller can continue with RTL.RESET etc.
-; On failure ISA is CLOSED.
+; ISA must be CLOSED at entry (caller comes here before any
+; chip activity).  On success ISA is left OPEN and ISA_SLOT
+; reflects the chosen slot.  On failure ISA is CLOSED.
 ;
 ; Out: CF=0 -> RTL_BASE_PTR populated, IX = base, ISA OPEN.
 ;      CF=1 -> no chip on any slot/base, ISA CLOSED.
 ; Trashes A, BC, DE, HL, IX.
 ; ------------------------------------------------------
 INIT_BASE
-	; RTL_BASE_PTR lives in uninitialized BSS, so we MUST clear it
-	; before scanning -- otherwise leftover stack/heap garbage would
-	; pose as a pre-set base and the helper PROBE_AT_IX, hitting
-	; plain Z80 RAM, would falsely "succeed".  RTL_IOBASE env-var
-	; override (followup #24) will be honoured here once wired up.
+	; RTL_BASE_PTR lives in uninitialized BSS; clear it so the
+	; helpers see a clean slate.
 	LD	HL,0
 	LD	(RTL_BASE_PTR),HL
-	; Try the currently-selected slot first.
+
+	; Stage 1: env override.
+	CALL	TRY_ENV_OVERRIDE
+	RET	NC			; ISA OPEN, base accepted
+
+	; Stage 2: auto-scan currently-selected slot, then the other.
 	CALL	@ISA.ISA_OPEN
 	CALL	.SCAN_BASES
-	RET	NC			; found, ISA stays OPEN
+	JR	NC,.SCAN_OK
 	CALL	@ISA.ISA_CLOSE
-	; Flip slot (0 <-> 1) and try again.
 	LD	A,(@ISA.ISA_SLOT)
 	XOR	1
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@ISA.ISA_OPEN
 	CALL	.SCAN_BASES
-	RET	NC
+	JR	NC,.SCAN_OK
 	CALL	@ISA.ISA_CLOSE
 	SCF
+	RET
+.SCAN_OK
+	; Persist S/#HHH to env so subsequent utilities in the same
+	; DSS session take the fast path.  This may overwrite a
+	; (wrong) net.cfg-supplied value -- the user has already
+	; been warned by TRY_ENV_OVERRIDE; fixing net.cfg on disk
+	; is their responsibility, but in-memory the session is
+	; self-healing so each program doesn't need to re-scan.
+	; WRITE_ENV_HW briefly closes/reopens ISA around the SETENV
+	; call (DSS env data lives at 0xE400 which is in PAGE3, our
+	; ISA window).
+	CALL	WRITE_ENV_HW
+	OR	A
 	RET
 
 ; Helper: walk SCAN_TABLE, set RTL_BASE_PTR to first hit.
@@ -145,6 +171,229 @@ SCAN_TABLE
 	DW ISA_BASE_A + 0x3C0
 	DW ISA_BASE_A + 0x3E0
 	DW 0
+
+
+; ------------------------------------------------------
+; TRY_ENV_OVERRIDE: parse N_NET_RTL_HW (if set) into a slot
+; and an I/O base, configure ISA, and probe.
+; Pre-condition: ISA closed at entry.
+;   Out: CF=0 -> env valid AND chip responded; ISA OPEN,
+;                @ISA.ISA_SLOT and RTL_BASE_PTR populated.
+;        CF=1 -> env missing/malformed/no-response; ISA CLOSED,
+;                RTL_BASE_PTR cleared, ISA_SLOT untouched.
+; Trashes A, BC, DE, HL, IX.
+; Uses NETENV_VAL_BUF as the GETENV destination (always
+; defined in memmap.inc; safe to reference here without
+; pulling in netenv_lib).
+; ------------------------------------------------------
+TRY_ENV_OVERRIDE
+	LD	HL,N_RTL_HW
+	LD	DE,NETENV_VAL_BUF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A			; A=0xFF found, 0 not
+	JR	Z,.SILENT		; env not set: silent fallback
+	LD	HL,NETENV_VAL_BUF
+	LD	A,(HL)
+	OR	A
+	JR	Z,.SILENT		; "found" but value empty
+	CALL	PARSE_HW_VALUE		; A=slot, DE=addr on success
+	JR	C,.WARN			; malformed
+	; Configure ISA + RTL_BASE_PTR from parsed value.
+	LD	(@ISA.ISA_SLOT),A
+	LD	HL,ISA_BASE_A
+	ADD	HL,DE
+	LD	(RTL_BASE_PTR),HL
+	PUSH	HL
+	POP	IX
+	CALL	@ISA.ISA_OPEN
+	CALL	PROBE_AT_IX
+	JR	C,.PROBE_NO
+	OR	A
+	RET
+.PROBE_NO
+	CALL	@ISA.ISA_CLOSE
+.WARN
+	; Env had a value but either parsing failed or no chip
+	; responded.  Print a warning so the user notices the
+	; net.cfg setting was bypassed, then fall through to the
+	; auto-scan path.  ISA is CLOSED here either way.
+	LD	HL,0
+	LD	(RTL_BASE_PTR),HL
+	LD	HL,MSG_HW_FALLBACK_PRE
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	HL,NETENV_VAL_BUF
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	HL,MSG_HW_FALLBACK_POST
+	LD	C,DSS_PCHARS
+	RST	DSS
+.SILENT
+	SCF
+	RET
+
+MSG_HW_FALLBACK_PRE	DB "[W] NET_RTL_HW=",0
+MSG_HW_FALLBACK_POST	DB " not usable, auto-scanning.",13,10,0
+
+
+; ------------------------------------------------------
+; PARSE_HW_VALUE: ASCIIZ at HL holds "S/N", "S/#N",
+; "S/0xN" or "S/0XN".  S in {0,1}; N is 1..3 hex digits
+; in {0x200..0x3E0 step 0x20}.
+;   Out: CF=0 -> A = slot, DE = I/O address.
+;        CF=1 -> malformed.
+; Trashes A, BC, DE, HL.
+; ------------------------------------------------------
+PARSE_HW_VALUE
+	LD	A,(HL)
+	SUB	'0'
+	CP	2
+	JR	NC,.BAD
+	LD	(.SLOT),A
+	INC	HL
+	LD	A,(HL)
+	CP	'/'
+	JR	NZ,.BAD
+	INC	HL
+	LD	A,(HL)
+	CP	'#'
+	JR	NZ,.NH
+	INC	HL
+	JR	.HEX
+.NH
+	CP	'0'
+	JR	NZ,.HEX
+	; '0' could be "0x"/"0X" prefix or a leading-zero hex digit.
+	PUSH	HL
+	INC	HL
+	LD	A,(HL)
+	CP	'x'
+	JR	Z,.PFX
+	CP	'X'
+	JR	Z,.PFX
+	POP	HL
+	JR	.HEX
+.PFX
+	INC	HL
+	POP	DE			; discard saved
+.HEX
+	LD	DE,0
+	LD	B,3
+.HLP
+	LD	A,(HL)
+	CALL	@UTIL.PARSE_HEX_NIBBLE
+	JR	C,.HEND
+	LD	C,A
+	EX	DE,HL
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,HL
+	LD	A,L
+	OR	C
+	LD	L,A
+	EX	DE,HL
+	INC	HL
+	DJNZ	.HLP
+.HEND
+	; Validate range and 0x20 alignment.
+	LD	A,D
+	CP	2
+	JR	C,.BAD
+	CP	4
+	JR	NC,.BAD
+	LD	A,E
+	AND	0x1F
+	JR	NZ,.BAD
+	LD	A,(.SLOT)
+	OR	A			; CF=0
+	RET
+.BAD
+	SCF
+	RET
+.SLOT		DB 0
+
+
+; ------------------------------------------------------
+; WRITE_ENV_HW: format the current slot/base as
+; "NET_RTL_HW=S/#HHH\0" and SETENV.  ISA must be OPEN at
+; entry; we briefly close it for the SETENV call (DSS env
+; storage lives at 0xE400 which is in PAGE3) and reopen.
+; CF and any DSS error are silently absorbed -- the override
+; is best-effort persistence, not load-bearing.
+; Trashes A, BC, DE, HL.
+; ------------------------------------------------------
+WRITE_ENV_HW
+	CALL	@ISA.ISA_CLOSE
+	; Build "NET_RTL_HW=S/#HHH\0" in NETENV_VAL_BUF (reused).
+	LD	HL,N_RTL_HW
+	LD	DE,NETENV_VAL_BUF
+.CN
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	OR	A
+	JR	NZ,.CN
+	DEC	DE			; back to NUL
+	LD	A,'='
+	LD	(DE),A
+	INC	DE
+	LD	A,(@ISA.ISA_SLOT)
+	ADD	A,'0'
+	LD	(DE),A
+	INC	DE
+	LD	A,'/'
+	LD	(DE),A
+	INC	DE
+	LD	A,'#'
+	LD	(DE),A
+	INC	DE
+	; Address = (RTL_BASE_PTR - ISA_BASE_A); 12 valid bits,
+	; printed as 3 uppercase hex digits.
+	LD	HL,(RTL_BASE_PTR)
+	LD	A,H
+	SUB	HIGH ISA_BASE_A
+	AND	0x0F
+	CALL	.NIB
+	LD	(DE),A
+	INC	DE
+	LD	A,L
+	RRCA
+	RRCA
+	RRCA
+	RRCA
+	AND	0x0F
+	CALL	.NIB
+	LD	(DE),A
+	INC	DE
+	LD	A,L
+	AND	0x0F
+	CALL	.NIB
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A
+	; SETENV.
+	LD	HL,NETENV_VAL_BUF
+	LD	B,ENV_SET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	JP	@ISA.ISA_OPEN
+
+.NIB
+	CP	10
+	JR	C,.D9
+	ADD	A,'A' - 10
+	RET
+.D9
+	ADD	A,'0'
+	RET
+
+
+N_RTL_HW	DB "NET_RTL_HW",0
 
 
 ; ------------------------------------------------------

@@ -204,8 +204,9 @@ PARSE_DEC_BYTE
 ; ------------------------------------------------------
 ; PARSE_HEX_NIBBLE: A = '0'..'9'/'a'..'f'/'A'..'F' -> 0..15
 ; Out: A = nibble (low 4 bits). CF=1 if input not a hex digit.
+; Always compiled -- used by rtl8019.asm INIT_BASE for the env
+; override "S/#HHH" parser, which every app pulls in.
 ; ------------------------------------------------------
-	IFDEF USE_UTIL_PARSE_HEX_BYTE
 PARSE_HEX_NIBBLE
 	CP	'0'
 	JR	C,.BAD
@@ -239,6 +240,7 @@ PARSE_HEX_NIBBLE
 ;   Out: A = byte; CF=1 on bad digit.
 ; Trashes A only. BC preserved (saved/restored on stack).
 ; ------------------------------------------------------
+	IFDEF USE_UTIL_PARSE_HEX_BYTE
 PARSE_HEX_BYTE
 	PUSH	BC			; save caller's BC
 	LD	A,(HL)

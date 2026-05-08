@@ -73,6 +73,7 @@ NETCFG_LOAD_BUF		EQU 0xA240	; 1024 bytes
 NETCFG_LOAD_BUF_SIZE	EQU 1024
 NETCFG_TMP_IP		EQU 0xA640	; 4 bytes (parser scratch)
 NETCFG_TMP_MAC		EQU 0xA644	; 6 bytes (parser scratch)
+NETCFG_OUR_RTL_HW	EQU 0xA64A	; 8 bytes ASCIIZ "S/#HHH" or empty
 
 ; dhcp_lib: parsed-field outputs.  Active only in IFUP.EXE.
 DHCP_XID		EQU 0xA800	; 4 bytes (transaction id, host order)

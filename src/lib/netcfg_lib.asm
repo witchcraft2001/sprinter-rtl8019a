@@ -10,6 +10,16 @@
 ;   IP, NETMASK, GATEWAY, DNS1, DNS2 -- dotted IPv4.
 ;   RTL_MAC                          -- aa:bb:cc:dd:ee:ff (empty
 ;                                       value -> default MAC).
+;   RTL_HW                           -- ISA slot + I/O base in the
+;                                       form "S/HHH"  (S = 0|1,
+;                                       HHH = hex addr; the optional
+;                                       leading "#" or "0x" of HHH
+;                                       is stripped).  Examples:
+;                                         RTL_HW=0/300
+;                                         RTL_HW=1/#320
+;                                         RTL_HW=0/0x3E0
+;                                       Empty / missing -> driver
+;                                       auto-scans both slots.
 ;   TZ                               -- signed integer hours.
 ;   NTP                              -- ASCIIZ host (<=31 chars).
 ;
@@ -73,6 +83,7 @@ TZ		EQU NETCFG_TZ
 DHCP_MODE	EQU NETCFG_DHCP_MODE
 LOAD_FH		EQU NETCFG_LOAD_FH
 LOAD_BUF	EQU NETCFG_LOAD_BUF
+OUR_RTL_HW	EQU NETCFG_OUR_RTL_HW
 
 
 ; ------------------------------------------------------
@@ -156,6 +167,8 @@ APPLY_DEFAULTS
 	LD	(NTP),A
 	LD	(TZ),A
 	LD	(DHCP_MODE),A
+	; RTL_HW also defaults empty -- driver will auto-scan.
+	LD	(OUR_RTL_HW),A
 	RET
 
 ; Hardcoded defaults applied BEFORE NET.CFG parsing.  If NET.CFG
@@ -255,6 +268,9 @@ PARSE
 	LD	DE,.K_MAC
 	CALL	@UTIL.STARTSWITH
 	JR	Z,.MAC
+	LD	DE,.K_HW
+	CALL	@UTIL.STARTSWITH
+	JP	Z,.HW
 	LD	DE,.K_TZ
 	CALL	@UTIL.STARTSWITH
 	JR	Z,.TZ
@@ -318,6 +334,11 @@ PARSE
 	LD	DE,OUR_MAC
 	CALL	PARSE_MAC_LINE
 	JP	.LINE
+.HW
+	LD	BC,7			; len("RTL_HW=")
+	ADD	HL,BC
+	CALL	PARSE_HW_LINE
+	JP	.LINE
 .TZ
 	LD	BC,3			; len("TZ=")
 	ADD	HL,BC
@@ -337,6 +358,7 @@ PARSE
 .K_DNS1		DB "DNS1=",0
 .K_DNS2		DB "DNS2=",0
 .K_MAC		DB "RTL_MAC=",0
+.K_HW		DB "RTL_HW=",0
 .K_TZ		DB "TZ=",0
 .K_NTP		DB "NTP=",0
 
@@ -506,6 +528,123 @@ PARSE_TZ_LINE
 	JP	SKIP_TO_NEXT_LINE
 .SKIP
 	JP	SKIP_TO_NEXT_LINE
+
+
+; ------------------------------------------------------
+; PARSE_HW_LINE: HL just past "RTL_HW=" of a config line.
+; Accepts:    S/N    S/#N    S/0xN    S/0XN
+;   S = '0' or '1'
+;   N = 1..3 hex digits, value 0x200..0x3E0 step 0x20.
+; On success writes canonical "S/#HHH" (uppercase, fixed
+; 3-digit hex) to OUR_RTL_HW.  On any parse / range error
+; leaves OUR_RTL_HW empty (driver auto-scans).  Always exits
+; via SKIP_TO_NEXT_LINE so the parent dispatcher can JP .LINE.
+; ------------------------------------------------------
+PARSE_HW_LINE
+	; Slot digit (0 or 1).
+	LD	A,(HL)
+	SUB	'0'
+	CP	2
+	JP	NC,.SKIP
+	LD	(.SLOT),A
+	INC	HL
+	; Mandatory '/'.
+	LD	A,(HL)
+	CP	'/'
+	JP	NZ,.SKIP
+	INC	HL
+	; Optional '#' or '0x' / '0X' prefix.
+	LD	A,(HL)
+	CP	'#'
+	JR	NZ,.NOTHASH
+	INC	HL
+	JR	.READ_HEX
+.NOTHASH
+	CP	'0'
+	JR	NZ,.READ_HEX
+	; '0' could be "0x" / "0X" prefix or the first hex digit.
+	PUSH	HL
+	INC	HL
+	LD	A,(HL)
+	CP	'x'
+	JR	Z,.PFX_OK
+	CP	'X'
+	JR	Z,.PFX_OK
+	POP	HL			; nope, just a leading-zero hex digit
+	JR	.READ_HEX
+.PFX_OK
+	INC	HL
+	POP	DE			; discard saved
+.READ_HEX
+	LD	DE,0			; DE = accumulated 16-bit address
+	LD	B,3			; up to 3 hex digits
+.HEX_LP
+	LD	A,(HL)
+	CALL	@UTIL.PARSE_HEX_NIBBLE
+	JR	C,.HEX_END
+	LD	C,A			; C = nibble
+	EX	DE,HL			; HL = addr, DE = source ptr
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,HL
+	ADD	HL,HL
+	LD	A,L
+	OR	C
+	LD	L,A
+	EX	DE,HL			; DE = addr, HL = source ptr
+	INC	HL
+	DJNZ	.HEX_LP
+.HEX_END
+	; Range-check: 0x200..0x3E0, low byte aligned to 0x20.
+	LD	A,D
+	CP	2
+	JR	C,.SKIP
+	CP	4
+	JR	NC,.SKIP
+	LD	A,E
+	AND	0x1F
+	JR	NZ,.SKIP
+
+	; Write canonical "S/#HHH\0" to OUR_RTL_HW.
+	LD	A,(.SLOT)
+	ADD	A,'0'
+	LD	(OUR_RTL_HW + 0),A
+	LD	A,'/'
+	LD	(OUR_RTL_HW + 1),A
+	LD	A,'#'
+	LD	(OUR_RTL_HW + 2),A
+	; D = high byte (low nibble used), E = full low byte (two nibbles).
+	LD	A,D
+	AND	0x0F
+	CALL	.NIBBLE_TO_HEX
+	LD	(OUR_RTL_HW + 3),A
+	LD	A,E
+	RRCA
+	RRCA
+	RRCA
+	RRCA
+	AND	0x0F
+	CALL	.NIBBLE_TO_HEX
+	LD	(OUR_RTL_HW + 4),A
+	LD	A,E
+	AND	0x0F
+	CALL	.NIBBLE_TO_HEX
+	LD	(OUR_RTL_HW + 5),A
+	XOR	A
+	LD	(OUR_RTL_HW + 6),A
+.SKIP
+	JP	SKIP_TO_NEXT_LINE
+
+.NIBBLE_TO_HEX
+	; In: A = 0..15.  Out: A = '0'..'9' or 'A'..'F'.
+	CP	10
+	JR	C,.DIG
+	ADD	A,'A' - 10
+	RET
+.DIG
+	ADD	A,'0'
+	RET
+.SLOT		DB 0
 
 
 ; ------------------------------------------------------

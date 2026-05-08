@@ -346,6 +346,12 @@ DO_INIT
 	LD	HL,N_NET_TZ
 	LD	A,(@NETCFG.TZ)
 	CALL	SETENV_TZ
+	; RTL_HW: ASCIIZ "S/#HHH" if NET.CFG specified it; SETENV_STR
+	; deletes the env var when the buffer is empty, so the driver
+	; falls back to its auto-scan.
+	LD	HL,N_NET_RTL_HW
+	LD	IX,@NETCFG.OUR_RTL_HW
+	CALL	SETENV_STR
 
 	; IP_SRC and the IP/MASK/GW/DNS group depend on whether
 	; NET.CFG asked for DHCP.
@@ -811,6 +817,7 @@ N_NET_DNS1	DB "NET_DNS1",0
 N_NET_DNS2	DB "NET_DNS2",0
 N_NET_NTP	DB "NET_NTP",0
 N_NET_TZ	DB "NET_TZ",0
+N_NET_RTL_HW	DB "NET_RTL_HW",0
 		DB 0			; table terminator
 
 V_STATIC	DB "STATIC",0
