@@ -353,6 +353,8 @@ START
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
 .NOCLOSE
+	; Terminate the progress-dot line emitted by FLUSH_BUF.
+	PRINT LINE_END
 	PRINT MSG_DONE
 	LD	HL,(TOTAL_BYTES_LO)
 	LD	DE,(TOTAL_BYTES_HI)
@@ -673,19 +675,26 @@ FLUSH_BUF
 	LD	A,H
 	OR	L
 	RET	Z
+	; Console writes (DSS_PUTCHAR) need PAGE3 free, so close
+	; ISA briefly just for the dot.  DSS_WRITE works fine with
+	; ISA still open (source pointer is in PAGE2 linear RAM),
+	; so keep it outside the close/open bracket.
+	CALL	@ISA.ISA_CLOSE
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(TFTP_BUF_LEN)
 	LD	D,H
 	LD	E,L			; DE = byte count
 	LD	HL,TFTP_FILE_BUF
 	LD	A,(OUT_FH)
 	LD	C,DSS_WRITE
 	RST	DSS
-	JR	C,.ERR
+	RET	C
 	LD	HL,0
 	LD	(TFTP_BUF_LEN),HL
 	OR	A
-	RET
-.ERR
-	SCF
 	RET
 
 

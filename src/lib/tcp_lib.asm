@@ -360,6 +360,22 @@ BUILD_SYN
 
 
 ; ------------------------------------------------------
+; SEND_DUP_ACK: build + transmit a pure ACK on the current
+; session.  Used after a session swap to nudge the peer's
+; TCP into fast-retransmit, so any reply that landed in
+; the chip's RX ring (and was dropped by the other-session
+; filter) gets re-sent without waiting for the slow
+; exponential backoff timer.
+;   Out: CF set on send error.
+; ------------------------------------------------------
+SEND_DUP_ACK
+	CALL	BUILD_ACK
+	LD	HL,@MAIN.TX_BUF
+	LD	BC,(TCP_TX_LEN)
+	JP	@RTL.SEND_FRAME
+
+
+; ------------------------------------------------------
 ; BUILD_ACK: build pure ACK (20-byte TCP, no payload).
 ; Sets TCP_TX_LEN.
 ; ------------------------------------------------------
@@ -800,8 +816,19 @@ SEND
 ;        CF=1 + LAST_FAIL set: error / timeout / RST.
 ; ------------------------------------------------------
 RECV
-	LD	HL,30000		; 30 s overall recv budget
+	; Initial budget: caller's RECV_TIMEOUT (set via the public
+	; knob) or the 30 000 ms default if the caller didn't touch
+	; it.  After consuming the budget we re-arm the default so
+	; the override is one-shot.
+	LD	HL,(RECV_TIMEOUT)
+	LD	A,H
+	OR	L
+	JR	NZ,.HAVE_TO
+	LD	HL,30000
+.HAVE_TO
 	LD	(TCP_TIMEOUT_LEFT),HL
+	LD	HL,0
+	LD	(RECV_TIMEOUT),HL
 .LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
@@ -962,6 +989,11 @@ RECV
 ; (in-sequence) data segment.  See TCP_ACK_THRESH for the cap.
 RECV_UNACKED	DB 0
 
+; One-shot RECV timeout override, in ms.  Caller writes here just
+; before calling RECV; on entry RECV consumes the value and clears
+; the slot back to 0 (= "use 30 000 ms default").
+RECV_TIMEOUT	DW 0
+
 
 ; ------------------------------------------------------
 ; CLOSE: tear down the connection.
@@ -991,35 +1023,17 @@ CLOSE
 	CALL	INC_SEQ32
 	LD	A,ST_LAST_ACK
 	LD	(TCP_STATE),A
-	; Wait briefly for the peer's ACK or FIN+ACK and the
-	; final state transition.  We don't strictly need it
-	; (kernel will RST our FIN if late), but draining the
-	; buffer is polite.
-	LD	HL,3000
-	LD	(TCP_TIMEOUT_LEFT),HL
-.WAITLP
-	CALL	@RTL.RING_HAS_PACKET
-	JR	NZ,.WHAVE
-	CALL	@MAIN.TICK_AND_CHECK_KEY
-	JR	C,.CDONE
-	LD	HL,(TCP_TIMEOUT_LEFT)
-	DEC	HL
-	LD	(TCP_TIMEOUT_LEFT),HL
-	LD	A,H
-	OR	L
-	JR	NZ,.WAITLP
-.CDONE
+	; Skip the post-FIN drain.  We used to read+discard ring
+	; packets for ~3 sec to wait for the peer's final ACK, but
+	; that also discarded packets belonging to OTHER sessions
+	; (e.g. FTP's "226 Transfer complete" on the control conn
+	; arriving while we were closing the data conn).  The peer
+	; will retransmit if our FIN is in flight; not draining is
+	; fine for a one-shot teardown.
 	LD	A,ST_CLOSED
 	LD	(TCP_STATE),A
 	OR	A
 	RET
-.WHAVE
-	; Drain one packet, regardless of contents.
-	LD	HL,@MAIN.RX_HDR
-	LD	DE,@MAIN.RX_BUF
-	LD	BC,1518
-	CALL	@RTL.READ_PACKET
-	JR	.WAITLP
 
 
 ; ------------------------------------------------------

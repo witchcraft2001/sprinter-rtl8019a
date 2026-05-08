@@ -420,9 +420,26 @@ START
 	; Close data TCP cleanly.
 	CALL	@TCP.CLOSE
 
+	; Terminate the progress-dot line emitted by FLUSH_DATA so
+	; the server's "226 Transfer complete" banner lands on a
+	; fresh line.
+	PRINT LINE_END
+
 	; Restore control session.
 	LD	HL,CTRL_BACKUP
 	CALL	@TCP.RESTORE_CTX
+
+	; The "226 Transfer complete" reply may have arrived on the
+	; control session while we were still polling the data
+	; session, in which case our IS_TCP_FROM_PEER filter
+	; dropped it and the server is now waiting for an exponential-
+	; backoff retransmit.  Send a duplicate ACK to provoke a
+	; fast retransmit, and cap the read at 3 s -- 226 is
+	; informational; if it never arrives we still print the
+	; transfer summary and QUIT cleanly.
+	CALL	@TCP.SEND_DUP_ACK
+	LD	HL,3000
+	LD	(@TCP.RECV_TIMEOUT),HL
 
 	; Read 226 (Transfer complete).
 	CALL	READ_REPLY
@@ -940,19 +957,28 @@ FLUSH_DATA
 	LD	A,H
 	OR	L
 	RET	Z
+	; Console writes (DSS_PUTCHAR) need PAGE3 free, so close
+	; ISA briefly just for the dot, then reopen.  DSS_WRITE
+	; works fine with ISA still open (its source pointer is in
+	; PAGE2 linear RAM, no PAGE3 access required) -- keep it
+	; outside the close/open bracket to avoid an extra MMU
+	; toggle on a hot path.
+	CALL	@ISA.ISA_CLOSE
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(FTP_DATA_LEN)
 	LD	D,H
 	LD	E,L
 	LD	HL,FTP_DATA_BUF
 	LD	A,(OUT_FH)
 	LD	C,DSS_WRITE
 	RST	DSS
-	JR	C,.ERR
+	RET	C			; CF=1 propagated, ISA stays OPEN
 	LD	HL,0
 	LD	(FTP_DATA_LEN),HL
 	OR	A
-	RET
-.ERR
-	SCF
 	RET
 
 
@@ -1391,7 +1417,7 @@ PASS_PTR	EQU USER_OVERRIDE + 1		; 2
 PASS_LEN	EQU PASS_PTR + 2		; 1
 
 NO_HANDLE	EQU 0xFF
-FTP_DATA_BUF_SIZE EQU 4096
+FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
 
 
 MSG_BANNER	DB "RTL8019AS FTP v0.1",0

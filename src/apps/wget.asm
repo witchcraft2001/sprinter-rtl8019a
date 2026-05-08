@@ -271,7 +271,9 @@ START
 	; Close TCP cleanly.
 	CALL	@TCP.CLOSE
 
-	; Print summary.
+	; Terminate the progress-dot line emitted by FLUSH_BUF, then
+	; print summary.
+	PRINT LINE_END
 	PRINT MSG_DONE_PRE
 	LD	HL,(BODY_TOTAL_LO)
 	LD	DE,(BODY_TOTAL_HI)
@@ -602,19 +604,27 @@ FLUSH_BUF
 	LD	A,H
 	OR	L
 	RET	Z
+	; Console writes (DSS_PUTCHAR) need PAGE3 free, so close
+	; ISA briefly just for the dot.  DSS_WRITE works fine with
+	; ISA still open (source pointer is in PAGE2 linear RAM),
+	; so keep it outside the close/open bracket -- one less MMU
+	; toggle pair on a hot path.
+	CALL	@ISA.ISA_CLOSE
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(WGET_BUF_LEN)
 	LD	D,H
 	LD	E,L			; DE = byte count
 	LD	HL,WGET_FILE_BUF
 	LD	A,(OUT_FH)
 	LD	C,DSS_WRITE
 	RST	DSS
-	JR	C,.ERR
+	RET	C
 	LD	HL,0
 	LD	(WGET_BUF_LEN),HL
 	OR	A
-	RET
-.ERR
-	SCF
 	RET
 
 
