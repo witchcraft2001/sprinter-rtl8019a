@@ -1,7 +1,7 @@
 ; ======================================================
 ; FTP.EXE - stage 10 of the Sprinter RTL8019AS network kit.
 ;
-;   FTP host filename [-u user] [-p pass] [-o output]
+;   FTP host filename [-u user] [-p pass] [-o output] [-y]
 ;   FTP /?
 ;
 ; Stage 1 (this build): cmdline parse, NIC init, resolve,
@@ -112,6 +112,52 @@ START
 	LD	(OUTPUT_PTR),HL
 .OUT_OK
 
+	; -u user (optional, default = anonymous)
+	XOR	A
+	LD	(USER_OVERRIDE),A
+	LD	A,'u'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_USER
+	LD	(USER_PTR),HL
+	CALL	STRLEN_FROM_HL
+	LD	(USER_LEN),A
+	LD	A,1
+	LD	(USER_OVERRIDE),A
+	JR	.USER_OK
+.NO_USER
+	LD	HL,DEFAULT_USER
+	LD	(USER_PTR),HL
+	LD	A,DEFAULT_USER_LEN
+	LD	(USER_LEN),A
+.USER_OK
+
+	; -p pass (optional)
+	;   absent + -u absent -> "anonymous@" (legacy default).
+	;   absent + -u given  -> empty (sending "anonymous@" with a
+	;                         non-anonymous user is wrong).
+	LD	A,'p'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_PASS
+	LD	(PASS_PTR),HL
+	CALL	STRLEN_FROM_HL
+	LD	(PASS_LEN),A
+	JR	.PASS_OK
+.NO_PASS
+	LD	A,(USER_OVERRIDE)
+	OR	A
+	JR	NZ,.PASS_BLANK
+	LD	HL,DEFAULT_PASS
+	LD	(PASS_PTR),HL
+	LD	A,DEFAULT_PASS_LEN
+	LD	(PASS_LEN),A
+	JR	.PASS_OK
+.PASS_BLANK
+	LD	HL,DEFAULT_PASS		; ptr unused when LEN=0
+	LD	(PASS_PTR),HL
+	XOR	A
+	LD	(PASS_LEN),A
+.PASS_OK
+
 	; -y / --yes: force overwrite without prompt.
 	XOR	A
 	LD	(FORCE_FLAG),A
@@ -199,24 +245,30 @@ START
 	CALL	EXPECT_2XX
 	JP	C,REPLY_BAD
 
-	; USER anonymous
+	; USER <username>
 	LD	HL,CMD_USER
 	LD	BC,CMD_USER_LEN
-	LD	DE,DEFAULT_USER
-	LD	A,DEFAULT_USER_LEN
+	LD	DE,(USER_PTR)
+	LD	A,(USER_LEN)
 	CALL	SEND_CMD_ARG
 	JP	C,TCP_FAIL
 	CALL	READ_REPLY
 	JP	C,REPLY_FAIL
 	CALL	PRINT_REPLY
-	; pyftpdlib accepts anonymous: 230 (already) or 331 (need pass).
-	; Either is fine.
+	; 2xx -> already authenticated, skip PASS.
+	; 3xx -> server wants PASS.
+	; Anything else -> auth refused.
+	LD	A,(REPLY_CODE)
+	CP	'2'
+	JR	Z,.AUTH_OK
+	CP	'3'
+	JP	NZ,REPLY_BAD
 
-	; PASS anonymous@
+	; PASS <password>
 	LD	HL,CMD_PASS
 	LD	BC,CMD_PASS_LEN
-	LD	DE,DEFAULT_PASS
-	LD	A,DEFAULT_PASS_LEN
+	LD	DE,(PASS_PTR)
+	LD	A,(PASS_LEN)
 	CALL	SEND_CMD_ARG
 	JP	C,TCP_FAIL
 	CALL	READ_REPLY
@@ -224,6 +276,7 @@ START
 	CALL	PRINT_REPLY
 	CALL	EXPECT_2XX
 	JP	C,REPLY_BAD
+.AUTH_OK
 
 	; TYPE I
 	LD	HL,CMD_TYPE_I
@@ -1331,6 +1384,11 @@ DATA_BACKUP	EQU CTRL_BACKUP + TCP_CTX_SIZE	; TCP_CTX_SIZE
 BODY_TOTAL_HI	EQU DATA_BACKUP + TCP_CTX_SIZE	; 2
 FTP_DATA_LEN	EQU BODY_TOTAL_HI + 2		; 2
 FORCE_FLAG	EQU FTP_DATA_LEN + 2		; 1 (-y / --yes)
+USER_PTR	EQU FORCE_FLAG + 1		; 2 (-u / default DEFAULT_USER)
+USER_LEN	EQU USER_PTR + 2		; 1
+USER_OVERRIDE	EQU USER_LEN + 1		; 1 (1 if -u was given)
+PASS_PTR	EQU USER_OVERRIDE + 1		; 2
+PASS_LEN	EQU PASS_PTR + 2		; 1
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 4096
@@ -1363,14 +1421,15 @@ MSG_E_FILE	DB "[E] file create/write failed.",0
 MSG_USAGE_ERR	DB "[E] usage: missing host or filename",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  FTP host filename [-o output] [-y]",13,10
+	DB "  FTP host filename [-u user] [-p pass] [-o output] [-y]",13,10
 	DB "  FTP /?",13,10,13,10
 	DB "  host       FTP server (IPv4 or hostname).",13,10
 	DB "  filename   remote file to download.",13,10
+	DB "  -u user    FTP username (default: anonymous).",13,10
+	DB "  -p pass    FTP password (default: anonymous@; empty",13,10
+	DB "             when -u is given without -p).",13,10
 	DB "  -o file    local output (default = remote name).",13,10
-	DB "  -y         overwrite local file without prompt.",13,10
-	DB "Anonymous login is used (USER anonymous /",13,10
-	DB "PASS anonymous@); auth-required servers are NYI.",13,10,0
+	DB "  -y         overwrite local file without prompt.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
