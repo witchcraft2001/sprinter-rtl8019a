@@ -509,17 +509,21 @@ TPUT_START
 ; TPUT_REPORT: print transfer summary line.
 ;   In: DE:HL = bytes transferred (DE = high word, HL = low).
 ;   Output (one of):
-;     "  <bytes> bytes in <secs> sec, <K> KB/s\n"
-;     "  <bytes> bytes in 0 sec\n"     (when elapsed == 0)
+;     "  <bytes> bytes in <secs> sec, <K> KB/s\n"   (rate >= 1 KB/s)
+;     "  <bytes> bytes in <secs> sec, <N> B/s\n"    (rate < 1 KB/s)
+;     "  <bytes> bytes in <secs> sec\n"             (elapsed == 0)
 ; Trashes everything.
 ; ------------------------------------------------------
 TPUT_REPORT
-	; Save bytes argument across TPUT_NOW (which clobbers DEHL).
-	PUSH	DE
-	PUSH	HL
+	; Stash bytes in UTIL_HBUF -- it survives both PRINT_DEC_32
+	; calls below (each of those clobbers UTIL_DEC32_SCRATCH but
+	; leaves UTIL_HBUF alone).
+	LD	(UTIL_HBUF),HL
+	LD	(UTIL_HBUF + 2),DE
+
 	; Compute current SOD (B:HL).
 	CALL	TPUT_NOW
-	; elapsed = current - start (24-bit).
+	; elapsed = current - start (24-bit subtract).
 	LD	DE,(UTIL_TPUT_START)
 	LD	A,L
 	SUB	E
@@ -540,61 +544,22 @@ TPUT_REPORT
 	ADC	A,1
 	LD	B,A
 .NO_WRAP
-	; B:HL = elapsed seconds.  Save.
 	LD	(UTIL_TPUT_ELAPSED),HL
 	LD	A,B
 	LD	(UTIL_TPUT_ELAPSED + 2),A
 
-	; --- compute KB/s = (bytes >> 10) / elapsed (16-bit / 16-bit) ---
-	; Bytes are still on the stack at top of frame: top = lo, then hi.
-	POP	HL			; HL = bytes_lo
-	POP	DE			; DE = bytes_hi
-	PUSH	DE			; push bytes back for printing later
-	PUSH	HL
-	; KB = bytes >> 10.  Shift right 8 first (drop low byte): bits 8..23
-	; live in (HL_high, DE_low).  Then shift right 2 more.
-	LD	L,H			; HL_lo  = bytes bits  8..15
-	LD	H,E			; HL_hi  = bytes bits 16..23
-	; If bytes > 64 MB (DE_high non-zero), cap KB at 0xFFFF -- no real
-	; transfer in this kit reaches 64 MB and the math saturates anyway.
-	LD	A,D
-	OR	A
-	JR	Z,.KB_OK
-	LD	HL,0xFFFF
-.KB_OK
-	SRL	H
-	RR	L
-	SRL	H
-	RR	L			; HL = KB
-	; Throughput = KB / elapsed.  Skip if elapsed > 65535 (>18 h, never)
-	; or elapsed == 0 (transfer < 1 sec resolution).
-	LD	A,(UTIL_TPUT_ELAPSED + 2)
-	OR	A
-	JR	NZ,.RATE_ZERO
-	LD	DE,(UTIL_TPUT_ELAPSED)
-	LD	A,D
-	OR	E
-	JR	Z,.RATE_ZERO
-	; Cap KB to fit unsigned-16: divide produces a 16-bit quotient.
-	CALL	DIV16_HL_BY_DE		; HL = KB/elapsed
-	JR	.SAVE_RATE
-.RATE_ZERO
-	LD	HL,0
-.SAVE_RATE
-	LD	(UTIL_TPUT_RATE),HL
-
-	; --- print "  <bytes> bytes in " ---
+	; --- "  <bytes> bytes in " ---
 	LD	HL,_TPUT_S_PREFIX
 	LD	C,DSS_PCHARS
 	RST	DSS
-	POP	HL			; bytes_lo
-	POP	DE			; bytes_hi
+	LD	HL,(UTIL_HBUF)
+	LD	DE,(UTIL_HBUF + 2)
 	CALL	PRINT_DEC_32
 	LD	HL,_TPUT_S_BYTES_IN
 	LD	C,DSS_PCHARS
 	RST	DSS
 
-	; --- print elapsed seconds ---
+	; --- elapsed seconds ---
 	LD	HL,(UTIL_TPUT_ELAPSED)
 	LD	A,(UTIL_TPUT_ELAPSED + 2)
 	LD	E,A
@@ -604,24 +569,70 @@ TPUT_REPORT
 	LD	C,DSS_PCHARS
 	RST	DSS
 
-	; --- print ", <KB/s> KB/s" only if rate is non-zero ---
-	LD	A,(UTIL_TPUT_ELAPSED + 0)
+	; --- compute and print rate ---
+	; Skip if elapsed[2] != 0 (>18 h, divisor too big) or elapsed == 0.
+	LD	A,(UTIL_TPUT_ELAPSED + 2)
+	OR	A
+	JP	NZ,.NL_ONLY
+	LD	A,(UTIL_TPUT_ELAPSED)
 	LD	B,A
 	LD	A,(UTIL_TPUT_ELAPSED + 1)
 	OR	B
-	LD	B,A
-	LD	A,(UTIL_TPUT_ELAPSED + 2)
-	OR	B
-	JR	Z,.NL_ONLY
+	JP	Z,.NL_ONLY
+
+	; B/s = bytes / elapsed (32-bit / 16-bit, in-place).
+	LD	HL,(UTIL_HBUF)
+	LD	(UTIL_DEC32_SCRATCH),HL
+	LD	HL,(UTIL_HBUF + 2)
+	LD	(UTIL_DEC32_SCRATCH + 2),HL
+	LD	DE,(UTIL_TPUT_ELAPSED)
+	CALL	DIV32_BY_DE
+
 	LD	HL,_TPUT_S_COMMA
 	LD	C,DSS_PCHARS
 	RST	DSS
-	LD	HL,(UTIL_TPUT_RATE)
-	LD	DE,0
+
+	; If quotient >= 1024 print as KB/s; otherwise as B/s.
+	LD	A,(UTIL_DEC32_SCRATCH + 3)
+	OR	A
+	JR	NZ,.RATE_KB
+	LD	A,(UTIL_DEC32_SCRATCH + 2)
+	OR	A
+	JR	NZ,.RATE_KB
+	LD	A,(UTIL_DEC32_SCRATCH + 1)
+	CP	4			; >= 4 in byte 1 means value >= 1024
+	JR	NC,.RATE_KB
+
+	; --- B/s ---
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	LD	DE,(UTIL_DEC32_SCRATCH + 2)
+	CALL	PRINT_DEC_32
+	LD	HL,_TPUT_S_BPS
+	LD	C,DSS_PCHARS
+	RST	DSS
+	JR	.NL_ONLY
+
+.RATE_KB
+	; --- KB/s = quotient >> 10 ---
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	LD	DE,(UTIL_DEC32_SCRATCH + 2)
+	; >> 8: drop the low byte.  HL := (HL_hi : DE_lo); DE := (0 : DE_hi).
+	LD	L,H
+	LD	H,E
+	LD	E,D
+	LD	D,0
+	; >> 2 more.
+	SRL	E
+	RR	H
+	RR	L
+	SRL	E
+	RR	H
+	RR	L
 	CALL	PRINT_DEC_32
 	LD	HL,_TPUT_S_KBS
 	LD	C,DSS_PCHARS
 	RST	DSS
+
 .NL_ONLY
 	LD	HL,_TPUT_S_NL
 	LD	C,DSS_PCHARS
@@ -629,34 +640,50 @@ TPUT_REPORT
 	RET
 
 ; ------------------------------------------------------
-; DIV16_HL_BY_DE: HL = HL / DE, BC = HL mod DE.
-; In:  HL dividend, DE divisor (must be > 0).
-; Out: HL = quotient, BC = remainder, DE preserved.
-; Trashes: A, BC, flags.
+; DIV32_BY_DE: in-place 32-bit / 16-bit unsigned division.
+;   Dividend: 4 bytes at UTIL_DEC32_SCRATCH (LE), replaced by quotient.
+;   Divisor:  DE (must be > 0).
+;   Out:      HL = remainder.  DE preserved.
+; Trashes: A, B, HL, flags.
 ; ------------------------------------------------------
-DIV16_HL_BY_DE
-	LD	BC,0
-	LD	A,16
+DIV32_BY_DE
+	LD	HL,0			; remainder
+	LD	B,32
 .LP
-	ADD	HL,HL
-	RL	C
-	RL	B
+	; Shift dividend left in place (low->high), MSB -> CY.
 	PUSH	HL
-	LD	H,B
-	LD	L,C
+	LD	HL,UTIL_DEC32_SCRATCH
+	SLA	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	POP	HL
+	; Shift carry into the 16-bit remainder.  ADC HL,HL may itself
+	; overflow when remainder*2+bit >= 2^16; in that case the true
+	; remainder is in [2^16, 2*divisor) so always >= divisor and we
+	; subtract unconditionally.
+	ADC	HL,HL
+	JR	C,.SUB_FORCE
 	OR	A
 	SBC	HL,DE
 	JR	C,.NOSUB
-	LD	B,H
-	LD	C,L
+	JR	.SET
+.SUB_FORCE
+	OR	A
+	SBC	HL,DE			; result fits in 16 bits (< divisor)
+.SET
+	PUSH	HL
+	LD	HL,UTIL_DEC32_SCRATCH
+	SET	0,(HL)
 	POP	HL
-	INC	L			; ADD HL,HL above set bit0=0, so INC sets it
 	JR	.NEXT
 .NOSUB
-	POP	HL
+	ADD	HL,DE			; restore remainder
 .NEXT
-	DEC	A
-	JR	NZ,.LP
+	DJNZ	.LP
 	RET
 
 _TPUT_S_PREFIX		DB "  ",0
@@ -664,6 +691,7 @@ _TPUT_S_BYTES_IN	DB " bytes in ",0
 _TPUT_S_SEC		DB " sec",0
 _TPUT_S_COMMA		DB ", ",0
 _TPUT_S_KBS		DB " KB/s",0
+_TPUT_S_BPS		DB " B/s",0
 _TPUT_S_NL		DB 13,10,0
 	ENDIF
 

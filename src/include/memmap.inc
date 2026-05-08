@@ -28,13 +28,14 @@ UTIL_DEC32_SCRATCH	EQU 0xA004
 ; util.asm: throughput-metric state, used by USE_UTIL_TPUT.
 ;   START   = transfer start time (24-bit seconds-of-day, LE)
 ;   ELAPSED = transfer duration  (24-bit seconds, LE)
-;   RATE    = computed KB/s (16-bit)
-; UTIL_DEC32_SCRATCH is reused as the SECONDS_OF_DAY accumulator
-; -- safe because TPUT_NOW runs to completion before any caller
-; touches PRINT_DEC_32.
+; UTIL_HBUF is reused as a 4-byte stash of the bytes-transferred
+; argument across the multiple PRINT_DEC_32 calls in TPUT_REPORT
+; (each of which destroys UTIL_DEC32_SCRATCH).  UTIL_DEC32_SCRATCH
+; in turn doubles as both the SECONDS_OF_DAY accumulator (during
+; TPUT_NOW) and the in-place dividend / quotient for DIV32_BY_DE
+; (during rate calc) -- safe because the steps are sequential.
 UTIL_TPUT_START		EQU 0xA008	; 3 bytes
 UTIL_TPUT_ELAPSED	EQU 0xA00B	; 3 bytes
-UTIL_TPUT_RATE		EQU 0xA00E	; 2 bytes
 
 ; rtl8019.asm: 10-byte register snapshot scratch.
 RTL_REG_SNAPSHOT	EQU 0xA010
