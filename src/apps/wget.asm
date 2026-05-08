@@ -133,13 +133,36 @@ START
 	LD	HL,OUR_IP
 	LD	(@ARP.OUR_IP_PTR),HL
 
+	; Open output file once -- it stays empty across redirects
+	; (body bytes are suppressed for non-2xx responses), and the
+	; final 2xx hop fills it.
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+	LD	HL,(OUTPUT_PTR)
+	LD	A,(FORCE_FLAG)
+	CALL	@FILE.OPEN_OUTPUT
+	JP	C,FILE_FAIL
+	LD	(OUT_FH),A
+
+	; Total wall-clock includes any redirect hops -- start the
+	; timer here, before the hop loop.
+	CALL	@UTIL.TPUT_START
+
+	XOR	A
+	LD	(HOP_COUNT),A
+
+; ====================================================================
+; HOP_LOOP: one iteration per HTTP request.  3xx redirects parse the
+; Location header into a fresh HOST_BUF / PATH_BUF / PORT and jump
+; back here; 2xx falls through to .DONE_RX; 4xx/5xx jumps to HTTP_FAIL.
+; ====================================================================
+.HOP_LOOP
 	; Resolve host.
 	LD	HL,HOST_BUF
 	LD	DE,TARGET_IP
 	CALL	@RESOLVE.HOST
 	JP	C,RESOLVE_FAIL
 
-	; "Resolved host -> X.X.X.X port P"
 	PRINT MSG_RESOLVED_PRE
 	LD	HL,HOST_BUF
 	LD	C,DSS_PCHARS
@@ -152,11 +175,7 @@ START
 	CALL	PRINT_DEC_HL
 	PRINT LINE_END
 
-	; ARP the next hop for TARGET_IP (target itself if on-subnet,
-	; NET_GW otherwise) and copy the resulting MAC into our
-	; per-session TARGET_MAC buffer.  RESOLVE.NEXT_HOP_FOR reads
-	; NET_MASK / NET_GW from env and parks the reply MAC in
-	; RESOLVE_NEXT_HOP_MAC.
+	; ARP the next hop and copy its MAC into TARGET_MAC.
 	LD	HL,TARGET_IP
 	CALL	@RESOLVE.NEXT_HOP_FOR
 	JP	C,ARP_TIMEOUT
@@ -174,7 +193,7 @@ START
 	LD	DE,TCP_REMOTE_MAC
 	LD	BC,6
 	LDIR
-	LD	A,(PORT + 1)			; PORT stored LE; +1 = high byte
+	LD	A,(PORT + 1)
 	LD	(TCP_REMOTE_PORT_HI),A
 	LD	A,(PORT)
 	LD	(TCP_REMOTE_PORT_LO),A
@@ -191,30 +210,19 @@ START
 	JP	C,TCP_OPEN_FAIL
 	PRINTLN MSG_CONNECTED
 
-	; Open output file (prompt-or-overwrite via @FILE.OPEN_OUTPUT).
-	LD	A,NO_HANDLE
-	LD	(OUT_FH),A
-	LD	HL,(OUTPUT_PTR)
-	LD	A,(FORCE_FLAG)
-	CALL	@FILE.OPEN_OUTPUT
-	JP	C,FILE_FAIL
-	LD	(OUT_FH),A
-
-	; Capture transfer-start timestamp for end-of-run KB/s metric.
-	CALL	@UTIL.TPUT_START
-
 	; Build and send GET request.
 	CALL	BUILD_GET
-	; HL = REQUEST_BUF, BC = length.
 	CALL	@TCP.SEND
 	JP	C,TCP_FAIL
 
-	; Init HTTP parser + body counter + write buffer.
+	; Reset per-hop parser + buffer state.
 	XOR	A
 	LD	(HSTATE),A
 	LD	(STATUS_DONE),A
 	LD	(HTTP_ABORT),A
-	LD	(STATUS_LINE_LEN),A
+	LD	(HTTP_REDIRECT),A
+	LD	(HDR_LINE_LEN),A
+	LD	(REDIRECT_URL_BUF),A
 	LD	HL,0
 	LD	(STATUS_CODE),HL
 	LD	(BODY_TOTAL_LO),HL
@@ -227,32 +235,47 @@ START
 	JR	NC,.HAVE_DATA
 	; CF=1: peer FIN or error.
 	LD	A,(TCP_STATE)
-	CP	2				; ST_ESTAB constant from tcp_lib
-	JR	Z,.RXFAIL			; still ESTAB but CF=1 -> error
-	; CLOSE_WAIT: maybe trailing data in this final segment.
+	CP	2
+	JP	Z,.RXFAIL
 	LD	HL,(TCP_RX_DATA_LEN)
 	LD	A,H
 	OR	L
 	JR	Z,.DRAIN_DONE
 	CALL	PROCESS_CHUNK
 .DRAIN_DONE
-	JR	.DONE_RX
+	JR	.HOP_RX_DONE
 .HAVE_DATA
 	CALL	PROCESS_CHUNK
-	; PROCESS_CHUNK sets HTTP_ABORT when it parses a non-2xx
-	; status line; stop receiving immediately so the body
-	; (which is the server's error page) doesn't tie up the
-	; link or end up in a partial output file.
 	LD	A,(HTTP_ABORT)
 	OR	A
 	JP	NZ,HTTP_FAIL
-	; If RECV piggyback'd a FIN with this data segment,
-	; TCP_STATE is already CLOSE_WAIT -- stop now instead
-	; of looping back into another (timeout-bound) RECV.
 	LD	A,(TCP_STATE)
-	CP	3				; ST_CLOSE_WAIT
-	JR	Z,.DONE_RX
+	CP	3
+	JR	Z,.HOP_RX_DONE
 	JR	.RXLP
+.HOP_RX_DONE
+	; TCP closes either way -- next hop opens a fresh session.
+	CALL	@TCP.CLOSE
+
+	; If a 3xx was seen with a usable Location, follow it.
+	LD	A,(HTTP_REDIRECT)
+	OR	A
+	JR	Z,.DONE_RX			; 2xx -> finish download
+	; Was Location actually present?
+	LD	A,(REDIRECT_URL_BUF)
+	OR	A
+	JP	Z,REDIRECT_NO_LOC
+	; Hop budget.
+	LD	A,(HOP_COUNT)
+	CP	MAX_REDIRECT_HOPS
+	JP	NC,REDIRECT_TOO_MANY
+	INC	A
+	LD	(HOP_COUNT),A
+	; Parse Location into HOST_BUF / PATH_BUF / PORT.
+	LD	HL,REDIRECT_URL_BUF
+	CALL	APPLY_REDIRECT_URL
+	JP	C,REDIRECT_BAD
+	JP	.HOP_LOOP
 .DONE_RX
 
 	; Flush any buffered body bytes to disk.
@@ -268,8 +291,7 @@ START
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
 .NOCLOSE
-	; Close TCP cleanly.
-	CALL	@TCP.CLOSE
+	; (TCP already CLOSEd by .HOP_RX_DONE.)
 
 	; Terminate the progress-dot line emitted by FLUSH_BUF, then
 	; print summary.
@@ -373,10 +395,11 @@ PROCESS_CHUNK
 	; Header parse loop.
 .HLP
 	LD	A,(HL)
-	; Capture the response's status line until the first \r.
-	; Once \r arrives, PARSE_STATUS_LINE decodes the numeric
-	; code and sets HTTP_ABORT for non-2xx replies.
-	CALL	CAPTURE_STATUS_BYTE
+	; Feed the byte first to the line capturer (which tracks
+	; status line + every header line into HDR_LINE_BUF, parses
+	; on \r, and may set HTTP_ABORT / HTTP_REDIRECT) and then to
+	; the \r\n\r\n state machine.
+	CALL	CAPTURE_HDR_BYTE
 	LD	A,(HL)
 	CALL	HDR_TRANSITION
 	LD	A,(HSTATE)
@@ -397,10 +420,14 @@ PROCESS_CHUNK
 	OR	C
 	RET	Z
 .MAYBE_WRITE
-	; If status was non-2xx the body is the server's error
-	; page; suppress writing it.  HTTP_ABORT will still be 0
-	; here for 2xx replies.
+	; If status was 4xx/5xx (HTTP_ABORT) or 3xx (HTTP_REDIRECT,
+	; body is the redirect HTML), suppress writing the body --
+	; the main loop will either fail or follow the Location
+	; URL on a fresh GET.
 	LD	A,(HTTP_ABORT)
+	OR	A
+	RET	NZ
+	LD	A,(HTTP_REDIRECT)
 	OR	A
 	RET	NZ
 	; Append BC bytes from (HL) to the in-RAM file buffer;
@@ -410,47 +437,61 @@ PROCESS_CHUNK
 
 
 ; ------------------------------------------------------
-; CAPTURE_STATUS_BYTE: append A to STATUS_LINE_BUF until
-; the first CR arrives, then parse the line into STATUS_CODE
-; and (for non-2xx) set HTTP_ABORT.  No-op once STATUS_DONE.
-; Trashes A.  BC, DE, HL preserved (PROCESS_CHUNK uses them
-; as src ptr / remaining count across the call).
+; CAPTURE_HDR_BYTE: accumulate one byte of the response into
+; HDR_LINE_BUF (shared between the status line and every
+; header line).  On CR the accumulated line is dispatched:
+;   - first time (STATUS_DONE=0) -> PARSE_STATUS_LINE;
+;     STATUS_DONE flips to 1.
+;   - subsequent times          -> CHECK_LOCATION_HEADER.
+; LF is silently skipped; appends past HDR_LINE_BUF_SIZE-1
+; are dropped (truncate-on-overflow).
+; Trashes A only -- BC, DE, HL preserved (PROCESS_CHUNK uses
+; them as src ptr / remaining count across the call).
 ; ------------------------------------------------------
-CAPTURE_STATUS_BYTE
+CAPTURE_HDR_BYTE
 	PUSH	BC
 	PUSH	DE
 	PUSH	HL
 	LD	B,A
-	LD	A,(STATUS_DONE)
-	OR	A
-	JR	NZ,.OUT
-	LD	A,B
+	CP	10
+	JR	Z,.OUT			; ignore LF (only \r ends the line)
 	CP	13
-	JR	Z,.PARSE
+	JR	Z,.EOL
 	; Append, with size cap.
-	LD	A,(STATUS_LINE_LEN)
-	CP	STATUS_LINE_BUF_SIZE - 1
+	LD	A,(HDR_LINE_LEN)
+	CP	HDR_LINE_BUF_SIZE - 1
 	JR	NC,.OUT
 	LD	E,A
 	LD	D,0
-	LD	HL,STATUS_LINE_BUF
+	LD	HL,HDR_LINE_BUF
 	ADD	HL,DE
 	LD	(HL),B
-	LD	A,(STATUS_LINE_LEN)
+	LD	A,(HDR_LINE_LEN)
 	INC	A
-	LD	(STATUS_LINE_LEN),A
+	LD	(HDR_LINE_LEN),A
 	JR	.OUT
-.PARSE
-	LD	A,(STATUS_LINE_LEN)
+.EOL
+	; Null-terminate the captured line.
+	LD	A,(HDR_LINE_LEN)
 	LD	E,A
 	LD	D,0
-	LD	HL,STATUS_LINE_BUF
+	LD	HL,HDR_LINE_BUF
 	ADD	HL,DE
 	XOR	A
-	LD	(HL),A			; null-terminate captured line
+	LD	(HL),A
+	; Dispatch.
+	LD	A,(STATUS_DONE)
+	OR	A
+	JR	NZ,.HDR_DISPATCH
 	CALL	PARSE_STATUS_LINE
 	LD	A,1
 	LD	(STATUS_DONE),A
+	JR	.RESET
+.HDR_DISPATCH
+	CALL	CHECK_LOCATION_HEADER
+.RESET
+	XOR	A
+	LD	(HDR_LINE_LEN),A
 .OUT
 	POP	HL
 	POP	DE
@@ -459,26 +500,88 @@ CAPTURE_STATUS_BYTE
 
 
 ; ------------------------------------------------------
-; PARSE_STATUS_LINE: read STATUS_LINE_BUF (ASCIIZ
-; "HTTP/1.x NNN [reason text]"), put the 16-bit numeric code
-; into STATUS_CODE.  If the code is outside 200..299 print
-; "[E] <whole status line>" and set HTTP_ABORT=1.
+; CHECK_LOCATION_HEADER: HDR_LINE_BUF holds an ASCIIZ
+; header line ("Name: value").  If the name (case-
+; insensitive) is "location", copy the value into
+; REDIRECT_URL_BUF and set HTTP_REDIRECT.
+; Trashes A, BC, DE, HL.
+; ------------------------------------------------------
+CHECK_LOCATION_HEADER
+	; Compare HDR_LINE_BUF prefix with "location:".
+	LD	HL,HDR_LINE_BUF
+	LD	DE,LIT_LOCATION
+.PFX
+	LD	A,(DE)
+	OR	A
+	JR	Z,.PFX_OK		; matched whole prefix
+	LD	C,A			; expected (already lowercase)
+	LD	A,(HL)
+	OR	A
+	RET	Z
+	CALL	TOLOWER
+	CP	C
+	RET	NZ			; mismatch -> not Location
+	INC	HL
+	INC	DE
+	JR	.PFX
+.PFX_OK
+	; HL now past "Location:".  Skip leading whitespace.
+.SKIPSP
+	LD	A,(HL)
+	CP	' '
+	JR	Z,.ADV
+	CP	9
+	JR	NZ,.COPY
+.ADV
+	INC	HL
+	JR	.SKIPSP
+.COPY
+	LD	DE,REDIRECT_URL_BUF
+	LD	B,REDIRECT_URL_BUF_SIZE - 1
+.CL
+	LD	A,B
+	OR	A
+	JR	Z,.TERM
+	LD	A,(HL)
+	OR	A
+	JR	Z,.TERM
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	DEC	B
+	JR	.CL
+.TERM
+	XOR	A
+	LD	(DE),A
+	LD	A,1
+	LD	(HTTP_REDIRECT),A
+	RET
+
+LIT_LOCATION	DB "location:",0
+
+
+; ------------------------------------------------------
+; PARSE_STATUS_LINE: read HDR_LINE_BUF ("HTTP/1.x NNN ...")
+; and put the 16-bit numeric code into STATUS_CODE.
+;   200..299 -> success, no flag set.
+;   300..399 -> HTTP_REDIRECT=1; main loop will look for the
+;               Location header and re-issue GET.
+;   else     -> HTTP_ABORT=1, "[E] <line>" printed.
 ; Trashes A, BC, DE, HL.
 ; ------------------------------------------------------
 PARSE_STATUS_LINE
-	LD	HL,STATUS_LINE_BUF
+	LD	HL,HDR_LINE_BUF
 	; Find the first space after "HTTP/1.x".
 .FSP
 	LD	A,(HL)
 	OR	A
-	RET	Z			; malformed: leave abort=0
+	RET	Z			; malformed: leave both flags clear
 	CP	' '
 	JR	Z,.SAW_SP
 	INC	HL
 	JR	.FSP
 .SAW_SP
 	INC	HL
-	; Skip extra spaces (RFC allows multiple).
 .SKIP
 	LD	A,(HL)
 	CP	' '
@@ -486,14 +589,13 @@ PARSE_STATUS_LINE
 	INC	HL
 	JR	.SKIP
 .DIGITS
-	LD	DE,0			; accumulator
+	LD	DE,0
 .DLP
 	LD	A,(HL)
 	SUB	'0'
 	JR	C,.DEND
 	CP	10
 	JR	NC,.DEND
-	; DE = DE*10 + nibble.
 	LD	B,A
 	PUSH	HL
 	LD	H,D
@@ -513,28 +615,47 @@ PARSE_STATUS_LINE
 	JR	.DLP
 .DEND
 	LD	(STATUS_CODE),DE
-	; Accept 200..299 silently.
+	; Classify the 16-bit code via D/E (a single 8-bit CP would
+	; truncate the 300/400 thresholds at 0x2C/0x90).
 	LD	A,D
-	OR	A
-	JR	NZ,.NOT_2XX
+	CP	1
+	JR	Z,.D1
+	JR	NC,.NOT_2XX		; D >= 2 -> 5xx+ -> abort
+	; D = 0 (codes 0..255): only 200..255 count as 2xx.
 	LD	A,E
 	CP	200
 	JR	C,.NOT_2XX
-	CP	250			; 200..249 enough for HTTP/1.0; 25x..29x rare but accepted
-	JR	C,.OK_2XX
-	CP	300
-	JR	NC,.NOT_2XX
-.OK_2XX
-	RET
+	JR	.OK_2XX
+.D1
+	; D = 1 (codes 256..511).
+	LD	A,E
+	CP	44			; 256+44 = 300
+	JR	C,.OK_2XX		; 256..299 -> 2xx
+	CP	144			; 256+144 = 400
+	JR	C,.IS_3XX		; 300..399 -> 3xx
 .NOT_2XX
-	; "[E] " + the whole captured line + "\r\n".
+	; 1xx (unexpected in HTTP/1.0 reply) or 4xx/5xx -> abort.
 	PRINT MSG_E_HTTP_PRE
-	LD	HL,STATUS_LINE_BUF
+	LD	HL,HDR_LINE_BUF
 	LD	C,DSS_PCHARS
 	RST	DSS
 	PRINT LINE_END
 	LD	A,1
 	LD	(HTTP_ABORT),A
+	RET
+.IS_3XX
+	; Mark redirect; the actual Location is captured later by
+	; CHECK_LOCATION_HEADER.  Print the status line so the user
+	; can see the redirect happening.
+	PRINT MSG_REDIRECT_PRE
+	LD	HL,HDR_LINE_BUF
+	LD	C,DSS_PCHARS
+	RST	DSS
+	PRINT LINE_END
+	; Tentatively mark redirect; cleared if Location is absent.
+	LD	A,1
+	LD	(HTTP_REDIRECT),A
+.OK_2XX
 	RET
 
 
@@ -762,6 +883,102 @@ HTTP_FAIL
 	JP	@UTIL.EXIT_FAIL
 
 
+REDIRECT_NO_LOC
+	PRINTLN MSG_E_NO_LOC
+	JP	HTTP_FAIL
+
+REDIRECT_BAD
+	PRINTLN MSG_E_BAD_LOC
+	JP	HTTP_FAIL
+
+REDIRECT_TOO_MANY
+	PRINTLN MSG_E_TOO_MANY
+	JP	HTTP_FAIL
+
+
+; ------------------------------------------------------
+; APPLY_REDIRECT_URL: take a Location header value (ASCIIZ
+; at HL) and update HOST_BUF / PATH_BUF / PORT in place.
+;
+; Two forms accepted:
+;   - absolute "http://host[:port][/path]" -> PARSE_URL
+;     replaces all three.
+;   - path-only "/new/path"               -> only PATH_BUF
+;     is rewritten; HOST_BUF and PORT carry over from the
+;     previous hop.
+;
+; Anything else (relative path without leading slash, or a
+; non-http scheme) returns CF=1 -- main loop fails the
+; whole transfer.
+; Trashes A, BC, DE, HL.
+; ------------------------------------------------------
+APPLY_REDIRECT_URL
+	; Try as full URL first.  PARSE_URL trashes HL on failure
+	; via the "PFX" mismatch path, so save+restore.
+	PUSH	HL
+	CALL	PARSE_URL
+	POP	HL
+	JR	C,.NOT_FULL
+	OR	A
+	RET
+.NOT_FULL
+	; Detect https:// (case-insensitive) so the user gets a
+	; clear "no TLS" error instead of a vague "cannot parse".
+	PUSH	HL
+	LD	DE,HTTPS_PFX
+	LD	B,8
+.PHL
+	LD	A,(DE)
+	OR	A
+	JR	Z,.HTTPS
+	LD	C,A
+	LD	A,(HL)
+	OR	A
+	JR	Z,.NOT_HTTPS
+	CALL	TOLOWER
+	CP	C
+	JR	NZ,.NOT_HTTPS
+	INC	HL
+	INC	DE
+	JR	.PHL
+.HTTPS
+	POP	HL
+	; HTTPS redirects can't be followed (no TLS).  Print the
+	; specific message and jump straight to HTTP_FAIL so the
+	; main-loop's generic "cannot parse Location" doesn't fire
+	; on top.
+	PRINTLN MSG_E_HTTPS
+	JP	HTTP_FAIL
+.NOT_HTTPS
+	POP	HL
+	; Path-only?  Must start with '/'.
+	LD	A,(HL)
+	CP	'/'
+	JR	NZ,.BAD
+	LD	DE,PATH_BUF
+	LD	B,PATH_BUF_SIZE - 1
+.LP
+	LD	A,B
+	OR	A
+	JR	Z,.TERM
+	LD	A,(HL)
+	OR	A
+	JR	Z,.TERM
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	DEC	B
+	JR	.LP
+.TERM
+	XOR	A
+	LD	(DE),A
+	OR	A
+	RET
+.BAD
+	SCF
+	RET
+
+
 ; ------------------------------------------------------
 ; PARSE_URL: parse "http://host[:port][/path]" from (HL).
 ; Outputs HOST_BUF (ASCIIZ), PORT (LE u16), PATH_BUF (ASCIIZ).
@@ -895,6 +1112,7 @@ PARSE_URL
 
 
 URL_PFX		DB "http://"
+HTTPS_PFX	DB "https://",0
 DEFAULT_PATH	DB "/",0
 
 
@@ -1241,16 +1459,21 @@ BODY_TOTAL_LO	EQU APP_BSS_BASE + 29		; 2
 BODY_TOTAL_HI	EQU APP_BSS_BASE + 31		; 2
 DEC_BUF		EQU APP_BSS_BASE + 33		; 6
 FORCE_FLAG	EQU APP_BSS_BASE + 39		; 1 (-y / --yes)
-STATUS_DONE	EQU APP_BSS_BASE + 40		; 1 (1 once \r seen)
-HTTP_ABORT	EQU APP_BSS_BASE + 41		; 1 (1 if status >= 300)
+STATUS_DONE	EQU APP_BSS_BASE + 40		; 1 (1 once status line parsed)
+HTTP_ABORT	EQU APP_BSS_BASE + 41		; 1 (1 if status 4xx/5xx)
 STATUS_CODE	EQU APP_BSS_BASE + 42		; 2 (parsed numeric code)
-STATUS_LINE_LEN	EQU APP_BSS_BASE + 44		; 1
+HDR_LINE_LEN	EQU APP_BSS_BASE + 44		; 1 (current line capture fill)
+HTTP_REDIRECT	EQU APP_BSS_BASE + 45		; 1 (1 if status 3xx + Location)
+HOP_COUNT	EQU APP_BSS_BASE + 46		; 1 (redirect hops so far)
+HDR_LINE_BUF_SIZE EQU 256
+REDIRECT_URL_BUF_SIZE EQU 256
+MAX_REDIRECT_HOPS EQU 5
 HOST_BUF	EQU APP_BSS_BASE + 64		; HOST_BUF_SIZE
 PATH_BUF	EQU HOST_BUF + HOST_BUF_SIZE	; PATH_BUF_SIZE
 REQUEST_BUF	EQU PATH_BUF + PATH_BUF_SIZE	; REQUEST_BUF_SIZE
 WGET_BUF_LEN	EQU REQUEST_BUF + REQUEST_BUF_SIZE	; 2 bytes
-STATUS_LINE_BUF	EQU WGET_BUF_LEN + 2		; STATUS_LINE_BUF_SIZE bytes
-STATUS_LINE_BUF_SIZE EQU 64
+HDR_LINE_BUF	EQU WGET_BUF_LEN + 2		; HDR_LINE_BUF_SIZE bytes
+REDIRECT_URL_BUF EQU HDR_LINE_BUF + HDR_LINE_BUF_SIZE	; REDIRECT_URL_BUF_SIZE bytes
 
 
 MSG_BANNER	DB "RTL8019AS WGET v0.2.1",0
@@ -1270,6 +1493,11 @@ MSG_E_TCP_SEND	DB "TCP send failed, code 0x",0
 MSG_E_RECV	DB "TCP recv failed, code 0x",0
 MSG_E_FILE	DB "[E] file create/write failed.",0
 MSG_E_HTTP_PRE	DB "[E] ",0
+MSG_REDIRECT_PRE DB "Redirect: ",0
+MSG_E_NO_LOC	DB "[E] redirect with no Location header",0
+MSG_E_BAD_LOC	DB "[E] cannot parse redirect Location",0
+MSG_E_TOO_MANY	DB "[E] too many redirects (cap = 5)",0
+MSG_E_HTTPS	DB "[E] redirect to https:// is not supported (no TLS).",0
 MSG_E_RESOLVE	DB "[E] could not resolve host.",0
 MSG_DONE_PRE	DB "Done. ",0
 MSG_BYTES	DB " bytes received.",0

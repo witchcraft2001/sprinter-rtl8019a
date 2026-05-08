@@ -153,6 +153,15 @@ TCP_MAX_FRAME		EQU 600
 PAGEMEM_BLOCK_ID	EQU 0xAB00	; 1 byte
 PAGEMEM_PHYS		EQU 0xAB01	; PAGEMEM_MAX_PAGES bytes
 
+; file_lib: scratch for OPEN_OUTPUT path support.  When the
+; supplied filename includes '/' or '\\', file_lib stages the
+; directory part in FILE_DIR_BUF, CHDIRs there, creates the
+; file with just the basename, and restores CWD from
+; FILE_SAVED_CWD before returning.  128 bytes each is enough
+; for the DSS path conventions.
+FILE_SAVED_CWD		EQU 0xAC00	; 128 bytes
+FILE_DIR_BUF		EQU 0xAC80	; 128 bytes
+
 ; ----- Per-app private BSS (0xB000+) ---------------------
 
 ; Each app lays out its own scratch starting at this base.
