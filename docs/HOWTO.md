@@ -214,7 +214,7 @@ in this release:
 | Utility   | Banner     |
 |-----------|------------|
 | ARP       | v0.2       |
-| FTP       | v0.2       |
+| FTP       | v0.3       |
 | IFUP      | v0.2       |
 | ISAPROBE  | v0.1       |
 | NETCFG    | v0.1       |

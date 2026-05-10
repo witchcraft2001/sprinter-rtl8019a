@@ -1,13 +1,15 @@
 # FTP.EXE
 
-Plain FTP client.  Always uses passive mode (PASV) in v0.2.
-Three modes: file download (default), verbose directory
-listing (`-l`), and terse name-only listing (`-n`).
+Plain FTP client.  Always uses passive mode (PASV).  Four
+modes: file download (default), file upload (`PUT` verb),
+verbose directory listing (`-l`), and terse name-only listing
+(`-n`).
 
 ## Usage
 
 ```
-FTP host filename [-u user] [-p pass] [-o output] [-y]   (download)
+FTP host filename  [-u user] [-p pass] [-o output] [-y]   (download)
+FTP host PUT local [-u user] [-p pass] [-o remote-name]   (upload)
 FTP host [path] -l [-u user] [-p pass]                    (LIST)
 FTP host [path] -n [-u user] [-p pass]                    (NLST)
 FTP /?
@@ -17,6 +19,8 @@ FTP /?
 |--------------|----------------------------------------------------|
 | `host`       | FTP server IPv4 or hostname (port 21)              |
 | `filename`   | Remote file to RETR (paths allowed: `/pub/foo.zip`)|
+| `PUT local`  | Switches to upload mode; `local` is the on-disk    |
+|              | source file (path-aware, e.g. `test\foo.zip`).     |
 | `path`       | Remote directory to list.  Without `-l` / `-n`     |
 |              | ignored.                                           |
 | `-l`         | LIST mode (verbose, "ls -l" style with metadata).  |
@@ -27,10 +31,12 @@ FTP /?
 | `-u user`    | FTP username (default `anonymous`)                 |
 | `-p pass`    | FTP password (default `anonymous@`; empty when     |
 |              | `-u` is given without `-p`)                        |
-| `-o file`    | Local output (download mode only; default = remote |
-|              | basename; supports directory prefix per "Output    |
-|              | paths" in HOWTO.TXT)                               |
-| `-y`         | Overwrite local file without prompt                |
+| `-o name`    | GET: alternate local output filename.              |
+|              | PUT: alternate name on the server (overrides STOR  |
+|              | argument; default = local basename).               |
+|              | Both forms support a directory prefix per          |
+|              | "Output paths" in HOWTO.TXT.                       |
+| `-y`         | Overwrite local file without prompt (GET only).    |
 
 ## Login flow
 
@@ -47,7 +53,7 @@ Download:
 
 ```
 FTP 192.168.7.1 IM2.TXT -y
-RTL8019AS FTP v0.2
+RTL8019AS FTP v0.3
 Resolved 192.168.7.1 -> 192.168.7.1
 Connecting...ok.
 220 pyftpdlib 2.2.0 ready.
@@ -66,11 +72,28 @@ Done. 389579 bytes received.
 RESULT OK
 ```
 
+Upload (`PUT`):
+
+```
+FTP 192.168.7.1 PUT BOOT.BIN -u alice -p secret
+RTL8019AS FTP v0.3
+...
+227 Entering passive mode (192,168,7,1,226,99).
+Opening data connection...
+125 Data connection already open. Transfer starting.
+.....
+226 Transfer complete.
+Done. 32768 bytes sent.
+  32768 bytes in 1 sec, 32 KB/s
+221 Goodbye.
+RESULT OK
+```
+
 Verbose listing (`-l`):
 
 ```
 FTP 192.168.7.1 -l -u alice -p secret
-RTL8019AS FTP v0.2
+RTL8019AS FTP v0.3
 ...
 227 Entering passive mode (192,168,7,1,226,68).
 Opening data connection...
@@ -88,7 +111,7 @@ Terse listing (`-n`, NLST -- just filenames):
 
 ```
 FTP 192.168.7.1 -n
-RTL8019AS FTP v0.2
+RTL8019AS FTP v0.3
 ...
 fformat.txt
 2k.bin

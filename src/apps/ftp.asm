@@ -113,12 +113,14 @@ START
 	LD	(NLST_MODE),A
 .NO_NFLAG
 
-	; positional 1: filename (required for download, optional
-	; for list -- treated as the directory to list).
+	; positional 1: filename, "PUT" verb, or (in list mode) the
+	; directory path -- the latter is optional.
+	XOR	A
+	LD	(PUT_MODE),A
 	LD	B,1
 	CALL	@CMDL.GET_POSITIONAL
 	JR	NC,.HAVE_POS1
-	; No positional: only OK in -l mode (list current/root).
+	; No positional: only valid in listing modes.
 	LD	A,(LIST_MODE)
 	OR	A
 	JP	Z,USAGE_ERROR
@@ -128,23 +130,47 @@ START
 	LD	(FILENAME_LEN),A
 	JR	.OUT_OK
 .HAVE_POS1
+	; Is positional 1 the keyword "PUT"?  If so the caller
+	; wants an upload; the filename is positional 2.
+	CALL	IS_PUT_KW
+	JR	NZ,.NOT_PUT
+	; PUT + listing flags don't combine.
+	LD	A,(LIST_MODE)
+	OR	A
+	JP	NZ,USAGE_ERROR
+	LD	A,1
+	LD	(PUT_MODE),A
+	LD	B,2
+	CALL	@CMDL.GET_POSITIONAL
+	JP	C,USAGE_ERROR
+.NOT_PUT
 	LD	A,(HL)
 	OR	A
 	JP	Z,USAGE_ERROR
+	; By default both the wire name (RETR/STOR/LIST/NLST arg)
+	; and the local name (file we open) start out as the same
+	; positional argument; -o flips one of them depending on
+	; mode.
 	LD	(FILENAME_PTR),HL
+	LD	(OUTPUT_PTR),HL
 	CALL	STRLEN_FROM_HL
 	LD	(FILENAME_LEN),A
 
-	; -o output (optional, default = filename).  Ignored in
-	; -l mode (no file is created).
+	; -o flag.  GET: alternate local output filename.  PUT:
+	; alternate name on the server (overrides STOR argument).
+	; Listing modes ignore -o.
 	LD	A,'o'
 	CALL	@CMDL.GET_FLAG_VALUE
-	JR	C,.NO_OUT
+	JR	C,.OUT_OK
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.OVR_WIRE
 	LD	(OUTPUT_PTR),HL
 	JR	.OUT_OK
-.NO_OUT
-	LD	HL,(FILENAME_PTR)
-	LD	(OUTPUT_PTR),HL
+.OVR_WIRE
+	LD	(FILENAME_PTR),HL
+	CALL	STRLEN_FROM_HL
+	LD	(FILENAME_LEN),A
 .OUT_OK
 
 	; -u user (optional, default = anonymous)
@@ -346,16 +372,27 @@ START
 	CALL	PRINT_DEC_HL
 	PRINT LINE_END
 
-	; --- Open output file (prompt-or-overwrite).  Skipped in
-	; -l (LIST) mode, where data goes to the console instead. ---
+	; --- Open the local file ---
+	;   GET  -> output, with overwrite prompt (file_lib).
+	;   PUT  -> input,  read-only.
+	;   LIST -> nothing (data streamed to console).
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
 	LD	A,(LIST_MODE)
 	OR	A
 	JR	NZ,.SKIP_FILE_OPEN
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.OPEN_PUT
 	LD	HL,(OUTPUT_PTR)
 	LD	A,(FORCE_FLAG)
 	CALL	@FILE.OPEN_OUTPUT
+	JP	C,FILE_FAIL
+	LD	(OUT_FH),A
+	JR	.SKIP_FILE_OPEN
+.OPEN_PUT
+	LD	HL,(OUTPUT_PTR)
+	CALL	@FILE.OPEN_INPUT
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
 .SKIP_FILE_OPEN
@@ -387,13 +424,19 @@ START
 	LD	HL,CTRL_BACKUP
 	CALL	@TCP.RESTORE_CTX
 
-	; RETR <filename> / LIST [<dir>] / NLST [<dir>] depending
-	; on mode.
+	; RETR / STOR / LIST / NLST depending on mode.
 	LD	A,(LIST_MODE)
 	OR	A
 	JR	NZ,.SEND_LISTING
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.SEND_STOR
 	LD	HL,CMD_RETR
 	LD	BC,CMD_RETR_LEN
+	JR	.SEND_DC_CMD
+.SEND_STOR
+	LD	HL,CMD_STOR
+	LD	BC,CMD_STOR_LEN
 	JR	.SEND_DC_CMD
 .SEND_LISTING
 	LD	A,(NLST_MODE)
@@ -443,14 +486,17 @@ START
 	LD	HL,DATA_BACKUP
 	CALL	@TCP.RESTORE_CTX
 
-	; --- Receive data into 4 KB buffer, flush to file ---
-	; Capture transfer-start timestamp for end-of-run KB/s metric.
+	; --- Data-channel transfer ---
 	CALL	@UTIL.TPUT_START
 	LD	HL,0
 	LD	(FTP_DATA_LEN),HL
 	LD	(BODY_TOTAL_LO),HL
 	LD	(BODY_TOTAL_HI),HL
+	LD	A,(PUT_MODE)
+	OR	A
+	JP	NZ,.PUT_DATA_LOOP
 
+	; GET / LIST: receive bytes from data session.
 .DRXLP
 	CALL	@TCP.RECV
 	JR	NC,.DRX_HAVE
@@ -470,17 +516,20 @@ START
 	CALL	HANDLE_DATA_CHUNK
 	JR	.DRXLP
 .DATA_TRANSFER_DONE
-	; In -l mode there's no buffered file content; skip flush
-	; and the file-close.
+	; LIST mode: nothing local to flush or close.
 	LD	A,(LIST_MODE)
 	OR	A
 	JR	NZ,.NOC
+	; PUT mode: only the input handle to close (no flush).
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.CLOSE_HANDLE
 
-	; Flush remaining buffered bytes to disk.
+	; GET: flush buffered output to disk first.
 	CALL	FLUSH_DATA
 	JP	C,FILE_FAIL
 
-	; Close output file.
+.CLOSE_HANDLE
 	LD	A,(OUT_FH)
 	CP	NO_HANDLE
 	JR	Z,.NOC
@@ -520,9 +569,8 @@ START
 	CALL	PRINT_REPLY
 .NO226
 
-	; In GET mode print "Done. NNN bytes received." + KB/s.
-	; In LIST mode skip it -- the listing was already streamed
-	; to the console.
+	; In GET / PUT print byte counter + KB/s.  In LIST skip
+	; it -- the listing was already streamed to the console.
 	LD	A,(LIST_MODE)
 	OR	A
 	JR	NZ,.SKIP_SUMMARY
@@ -530,7 +578,14 @@ START
 	LD	HL,(BODY_TOTAL_LO)
 	LD	DE,(BODY_TOTAL_HI)
 	CALL	@UTIL.PRINT_DEC_32
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.SUM_SENT
 	PRINTLN MSG_BYTES
+	JR	.SUM_RATE
+.SUM_SENT
+	PRINTLN MSG_BYTES_SENT
+.SUM_RATE
 	LD	HL,(BODY_TOTAL_LO)
 	LD	DE,(BODY_TOTAL_HI)
 	CALL	@UTIL.TPUT_REPORT
@@ -548,6 +603,65 @@ START
 	CALL	@TCP.CLOSE
 	CALL	@ISA.ISA_CLOSE
 	JP	@UTIL.EXIT_OK
+
+
+; --------------------------------------------------------------------
+; PUT (STOR) data loop.  Read up to FTP_PUT_CHUNK bytes from OUT_FH,
+; ship through the data session via TCP.SEND.  Each TCP.SEND posts
+; one PSH+ACK segment and returns immediately; after every chunk we
+; give the chip a chance to drain a peer ACK so SND_UNA doesn't fall
+; arbitrarily far behind SND_NXT.  EOF (DSS_READ -> 0 bytes) jumps
+; back to .DATA_TRANSFER_DONE for the unified close-out / 226 read.
+; --------------------------------------------------------------------
+.PUT_DATA_LOOP
+	; Read up to one MSS into FTP_DATA_BUF.
+	LD	HL,FTP_DATA_BUF
+	LD	DE,FTP_PUT_CHUNK
+	LD	A,(OUT_FH)
+	LD	C,DSS_READ_FILE
+	RST	DSS
+	JP	C,FILE_FAIL
+	LD	A,D
+	OR	E
+	JP	Z,.DATA_TRANSFER_DONE	; nothing left to send
+
+	; Send the chunk.  TCP.SEND wants HL=ptr, BC=length.
+	LD	HL,FTP_DATA_BUF
+	LD	B,D
+	LD	C,E
+	PUSH	BC
+	CALL	@TCP.SEND
+	POP	BC
+	JP	C,DATA_RX_FAIL
+
+	; BODY_TOTAL += bytes sent.
+	LD	HL,(BODY_TOTAL_LO)
+	ADD	HL,BC
+	LD	(BODY_TOTAL_LO),HL
+	JR	NC,.PUT_NOC
+	LD	HL,(BODY_TOTAL_HI)
+	INC	HL
+	LD	(BODY_TOTAL_HI),HL
+.PUT_NOC
+
+	; Progress dot per chunk -- briefly close ISA so PUTCHAR
+	; reaches the console.
+	CALL	@ISA.ISA_CLOSE
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	CALL	@ISA.ISA_OPEN
+
+	; Non-blocking ACK drain.  If no packet is queued, skip;
+	; otherwise pull one ACK off the ring (1 ms cap).
+	CALL	@RTL.RING_HAS_PACKET
+	JR	Z,.PUT_NO_ACK
+	LD	HL,1
+	LD	(@TCP.RECV_TIMEOUT),HL
+	CALL	@TCP.RECV
+	; CF=1 here means timeout (ok) or peer closed (caught later).
+.PUT_NO_ACK
+	JP	.PUT_DATA_LOOP
 
 
 ; ------------------------------------------------------
@@ -956,6 +1070,39 @@ PARSE_DEC_BYTE_LOC
 	POP	DE
 	POP	BC
 	SCF
+	RET
+
+
+; ------------------------------------------------------
+; IS_PUT_KW: ZF=1 if (HL) is exactly "PUT" / "put" (3 chars,
+; case-insensitive).  HL preserved.  Trashes A.
+; ------------------------------------------------------
+IS_PUT_KW
+	PUSH	HL
+	LD	A,(HL)
+	OR	0x20			; force lower-case
+	CP	'p'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	OR	0x20
+	CP	'u'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	OR	0x20
+	CP	't'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.NO			; must be terminator
+	POP	HL
+	XOR	A			; ZF=1
+	RET
+.NO
+	POP	HL
+	OR	1			; ZF=0
 	RET
 
 
@@ -1512,6 +1659,8 @@ CMD_LIST	DB "LIST "
 CMD_LIST_LEN	EQU $ - CMD_LIST
 CMD_NLST	DB "NLST "
 CMD_NLST_LEN	EQU $ - CMD_NLST
+CMD_STOR	DB "STOR "
+CMD_STOR_LEN	EQU $ - CMD_STOR
 EMPTY_STR	DB 0
 CMD_RETR	DB "RETR "
 CMD_RETR_LEN	EQU $ - CMD_RETR
@@ -1562,12 +1711,14 @@ PASS_PTR	EQU USER_OVERRIDE + 1		; 2
 PASS_LEN	EQU PASS_PTR + 2		; 1
 LIST_MODE	EQU PASS_LEN + 1		; 1 (1 if -l or -n was given)
 NLST_MODE	EQU LIST_MODE + 1		; 1 (1 if -n was given)
+PUT_MODE	EQU NLST_MODE + 1		; 1 (1 if "PUT" verb was given)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
+FTP_PUT_CHUNK	  EQU 536		; one TCP MSS per STOR send
 
 
-MSG_BANNER	DB "RTL8019AS FTP v0.2",0
+MSG_BANNER	DB "RTL8019AS FTP v0.3",0
 MSG_RESOLVED	DB "Resolved ",0
 MSG_TO		DB " -> ",0
 MSG_CONNECTING	DB "Connecting...",0
@@ -1589,26 +1740,30 @@ MSG_OPENING_DATA DB "Opening data connection...",0
 MSG_NLST_FB	 DB "[W] NLST not supported; retrying with LIST.",0
 MSG_DONE_PRE	DB "Done. ",0
 MSG_BYTES	DB " bytes received.",0
+MSG_BYTES_SENT	DB " bytes sent.",0
 MSG_E_DATA_OPEN	DB "[E] data connection failed.",0
 MSG_E_DATA_RX	DB "[E] data recv failed.",0
 MSG_E_FILE	DB "[E] file create/write failed.",0
 MSG_USAGE_ERR	DB "[E] usage: missing host or filename",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  FTP host filename [-u user] [-p pass] [-o output] [-y]",13,10
-	DB "  FTP host [path] -l [-u user] [-p pass]",13,10
-	DB "  FTP host [path] -n [-u user] [-p pass]",13,10
+	DB "  FTP host filename     [-u user] [-p pass] [-o output] [-y]",13,10
+	DB "  FTP host PUT local    [-u user] [-p pass] [-o remote-name]",13,10
+	DB "  FTP host [path] -l    [-u user] [-p pass]",13,10
+	DB "  FTP host [path] -n    [-u user] [-p pass]",13,10
 	DB "  FTP /?",13,10,13,10
 	DB "  host       FTP server (IPv4 or hostname).",13,10
-	DB "  filename   remote file to download.",13,10
+	DB "  filename   remote file to download (default mode).",13,10
+	DB "  PUT local  upload local file to server.",13,10
 	DB "  path       remote directory to list (default: server CWD).",13,10
 	DB "  -l         list a directory (LIST: verbose, ls -l style).",13,10
 	DB "  -n         list a directory (NLST: terse, names only).",13,10
 	DB "  -u user    FTP username (default: anonymous).",13,10
 	DB "  -p pass    FTP password (default: anonymous@; empty",13,10
 	DB "             when -u is given without -p).",13,10
-	DB "  -o file    local output (default = remote name).",13,10
-	DB "  -y         overwrite local file without prompt.",13,10,0
+	DB "  -o name    GET: alternate local output filename.",13,10
+	DB "             PUT: alternate remote name on the server.",13,10
+	DB "  -y         overwrite local file without prompt (GET).",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
