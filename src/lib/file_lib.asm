@@ -1,29 +1,31 @@
 ; ======================================================
 ; file_lib - shared file helpers for DSS utilities.
 ;
-; Provides FILE.OPEN_OUTPUT: probe-or-prompt overwrite of
-; a target file.  Works around the DSS_CREATE_OVERWRITE
-; quirk that the syscall does NOT return an error and does
-; NOT truncate when the file already exists; using it as an
-; "exists?" probe silently corrupts data.
+; Provides FILE.OPEN_OUTPUT (write-with-prompt for downloads)
+; and FILE.OPEN_INPUT (read for uploads / streaming sources).
+; Both call into a common SETUP_PATH helper that handles
+; relative ("test\file.zip") and absolute ("C:\foo\file.zip",
+; "\file.zip") paths: split the name at the last '/' or '\\',
+; CHDIR into the directory, run the create/open against the
+; basename, then restore CWD before returning.
 ;
-; Path support: when the filename contains '/' or '\\',
-; OPEN_OUTPUT splits it into directory + basename, CHDIRs
-; into the directory, runs the existing probe / create
-; flow against the basename, then restores the original
-; CWD.  Both relative ("test\file.zip") and absolute
-; ("C:\foo\file.zip") paths work.  CHDIR failure is
-; surfaced as "[E] directory not found".
+; Works around the DSS_CREATE_OVERWRITE quirk where the
+; syscall does NOT return an error and does NOT truncate when
+; the file already exists; using it as an "exists?" probe
+; silently corrupts data.
 ;
 ; Usage:
 ;   DEFINE USE_FILE
 ;   INCLUDE "file_lib.asm"
 ;   ...
-;   LD  HL,(OUTPUT_PTR)     ; ASCIIZ filename, optional path
-;   LD  A,(FORCE_FLAG)      ; 0 = prompt, !=0 = silent
+;   LD  HL,(OUTPUT_PTR)         ; ASCIIZ filename, optional path
+;   LD  A,(FORCE_FLAG)          ; 0 = prompt, !=0 = silent
 ;   CALL @FILE.OPEN_OUTPUT
 ;   ; CF=0 -> A = file handle
-;   ; CF=1 -> user declined / I/O error / dir missing
+;
+;   LD  HL,(INPUT_PTR)
+;   CALL @FILE.OPEN_INPUT
+;   ; CF=0 -> A = file handle (read-only)
 ;
 ; Requires: @ISA.ISA_CLOSE / @ISA.ISA_OPEN (for the
 ; keyboard syscall that runs while the ISA window is open).
@@ -42,28 +44,110 @@
 	MODULE FILE
 
 ; ------------------------------------------------------
-; OPEN_OUTPUT
-;   In:  HL = ASCIIZ filename, A = force flag
+; OPEN_OUTPUT: open a file for writing, with overwrite
+; prompt or silent overwrite when force flag is set.
+;   In:  HL = ASCIIZ filename, A = force flag (!=0 silent)
 ;   Out: CF=0 -> A = handle (FA_ARCHIVE, write)
-;        CF=1 -> declined / error
+;        CF=1 -> user declined / I/O error / dir missing
 ; ------------------------------------------------------
 OPEN_OUTPUT
-	LD	(.FORCE),A
-	LD	(.FULL_PTR),HL
-	LD	(.NAME_PTR),HL		; updated to basename if path is split
-	XOR	A
-	LD	(.HAS_DIR),A
+	LD	(FORCE_FLAG_BS),A
+	CALL	SETUP_PATH
+	RET	C				; dir not found, CWD untouched
+	; --- existence probe / prompt / create ---
+	LD	HL,(NAME_PTR)
+	LD	A,FA_READONLY
+	LD	C,DSS_OPEN_FILE
+	RST	DSS
+	JR	C,.CREATE_FRESH
+	; File exists: close the probe handle and decide.
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	A,(FORCE_FLAG_BS)
+	OR	A
+	JR	NZ,.DELETE
+	; Prompt user (echo full original path so they see what
+	; they typed, not just the basename).
+	LD	HL,MSG_PRE
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	HL,(FULL_PTR)
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	HL,MSG_POST
+	LD	C,DSS_PCHARS
+	RST	DSS
+	CALL	WAIT_YES_NO
+	JR	C,.USER_NO
+.DELETE
+	LD	HL,(NAME_PTR)
+	LD	C,DSS_DELETE
+	RST	DSS
+	; Ignore delete result (file may have race-disappeared).
+.CREATE_FRESH
+	LD	HL,(NAME_PTR)
+	LD	A,FA_ARCHIVE
+	LD	C,DSS_CREATE_OVERWRITE
+	RST	DSS
+	; CF reflects CREATE.  Restore CWD before returning.
+	PUSH	AF
+	CALL	RESTORE_CWD
+	POP	AF
+	RET
+.USER_NO
+	LD	HL,MSG_NO
+	LD	C,DSS_PCHARS
+	RST	DSS
+	CALL	RESTORE_CWD
+	SCF
+	RET
 
-	; Save current dir so we can restore on exit.  DSS_CURDIR
-	; copies the current path to (HL); 128 bytes is comfortably
-	; more than DSS path limits.
+
+; ------------------------------------------------------
+; OPEN_INPUT: open a file for reading.
+;   In:  HL = ASCIIZ filename, optional path
+;   Out: CF=0 -> A = handle (FA_READONLY)
+;        CF=1 -> not found / dir missing
+; ------------------------------------------------------
+OPEN_INPUT
+	CALL	SETUP_PATH
+	RET	C
+	LD	HL,(NAME_PTR)
+	LD	A,FA_READONLY
+	LD	C,DSS_OPEN_FILE
+	RST	DSS
+	PUSH	AF
+	CALL	RESTORE_CWD
+	POP	AF
+	RET
+
+
+; ------------------------------------------------------
+; SETUP_PATH: shared front-end for OPEN_OUTPUT / OPEN_INPUT.
+;   In:  HL = ASCIIZ filename (may include path).
+;   Out: NAME_PTR points at the basename to feed DSS file
+;        syscalls; FULL_PTR keeps the original (so prompts
+;        and error messages can echo it).  HAS_DIR=1 if a
+;        CHDIR happened (RESTORE_CWD will undo it).
+;        CF=0 success.  CF=1 -> CHDIR failed (dir missing
+;        / empty basename); the message has been printed,
+;        CWD was not changed.
+; Trashes A, BC, DE, HL.
+; ------------------------------------------------------
+SETUP_PATH
+	LD	(FULL_PTR),HL
+	LD	(NAME_PTR),HL
+	XOR	A
+	LD	(HAS_DIR),A
+
+	; Save current dir for the eventual restore.
 	LD	HL,FILE_SAVED_CWD
 	LD	C,DSS_CURDIR
 	RST	DSS
 
-	; Find last '/' or '\\' in the supplied name.  DE = pointer
-	; to that separator (0 if no path).
-	LD	HL,(.FULL_PTR)
+	; Find last '/' or '\\' in the name.  DE = pointer to
+	; that separator, or 0 if no path component.
+	LD	HL,(FULL_PTR)
 	LD	DE,0
 .SCAN
 	LD	A,(HL)
@@ -71,12 +155,12 @@ OPEN_OUTPUT
 	JR	Z,.SCAN_END
 	CP	'/'
 	JR	Z,.HIT
-	CP	0x5C			; backslash
-	JR	NZ,.SCAN_NEXT
+	CP	0x5C
+	JR	NZ,.NEXT
 .HIT
 	LD	D,H
 	LD	E,L
-.SCAN_NEXT
+.NEXT
 	INC	HL
 	JR	.SCAN
 .SCAN_END
@@ -84,11 +168,10 @@ OPEN_OUTPUT
 	OR	E
 	JP	Z,.NO_PATH
 
-	; --- We have a path.  Copy [name..separator-1] into
-	; FILE_DIR_BUF, null-terminate. ---
-	LD	HL,(.FULL_PTR)
+	; Copy the dir part [name..separator-1] into FILE_DIR_BUF.
+	LD	HL,(FULL_PTR)
 	LD	BC,FILE_DIR_BUF
-.CP_DIR
+.CP
 	LD	A,L
 	CP	E
 	JR	NZ,.CP_BYTE
@@ -100,14 +183,12 @@ OPEN_OUTPUT
 	LD	(BC),A
 	INC	HL
 	INC	BC
-	JR	.CP_DIR
+	JR	.CP
 .CP_END
 	XOR	A
 	LD	(BC),A
 
-	; If the dir part is empty (separator was the very first
-	; character, e.g. "\file.zip"), substitute "\" so CHDIR
-	; targets the volume root.
+	; Empty dir part (separator at position 0) -> volume root.
 	LD	HL,FILE_DIR_BUF
 	LD	A,(HL)
 	OR	A
@@ -116,17 +197,14 @@ OPEN_OUTPUT
 	INC	HL
 	LD	(HL),0
 .CHDIR_GO
-	; DSS calls may clobber DE/HL; preserve the separator
-	; pointer (DE) across the syscall so .CHDIR_OK below can
-	; resolve the basename.
+	; DSS calls clobber DE/HL; preserve the separator pointer.
 	LD	HL,FILE_DIR_BUF
 	PUSH	DE
 	LD	C,DSS_CHDIR
 	RST	DSS
 	POP	DE
 	JR	NC,.CHDIR_OK
-	; CHDIR failed -- print "[E] directory not found: <dir>".
-	; CWD wasn't changed, no restore needed.
+	; CHDIR failed.
 	LD	HL,MSG_E_DIR_PRE
 	LD	C,DSS_PCHARS
 	RST	DSS
@@ -140,80 +218,32 @@ OPEN_OUTPUT
 	RET
 .CHDIR_OK
 	LD	A,1
-	LD	(.HAS_DIR),A
-	; Basename = char after separator (DE was preserved).
-	EX	DE,HL			; HL = separator ptr
+	LD	(HAS_DIR),A
+	; Basename = char after separator.
+	EX	DE,HL
 	INC	HL
-	LD	(.NAME_PTR),HL
+	LD	(NAME_PTR),HL
 	LD	A,(HL)
 	OR	A
 	JR	NZ,.NO_PATH
-	; "dir\" with empty basename -> nothing to create.
-	CALL	.RESTORE_CWD
+	; "dir\" with empty basename -> nothing to open.
+	CALL	RESTORE_CWD
 	LD	HL,MSG_E_NOFILE
 	LD	C,DSS_PCHARS
 	RST	DSS
 	SCF
 	RET
-
 .NO_PATH
-	; ---- existing probe / prompt / create flow ----
-	; Probe existence: read-only OPEN.  CREATE_OVERWRITE
-	; cannot be used here -- it silently succeeds on an
-	; existing file without truncating.
-	LD	HL,(.NAME_PTR)
-	LD	A,FA_READONLY
-	LD	C,DSS_OPEN_FILE
-	RST	DSS
-	JR	C,.CREATE_FRESH
-	; File exists: close the probe handle and decide.
-	LD	C,DSS_CLOSE_FILE
-	RST	DSS
-	LD	A,(.FORCE)
 	OR	A
-	JR	NZ,.DELETE
-	; Prompt user (echo full original path so they see what
-	; they typed, not just the basename).
-	LD	HL,MSG_PRE
-	LD	C,DSS_PCHARS
-	RST	DSS
-	LD	HL,(.FULL_PTR)
-	LD	C,DSS_PCHARS
-	RST	DSS
-	LD	HL,MSG_POST
-	LD	C,DSS_PCHARS
-	RST	DSS
-	CALL	WAIT_YES_NO
-	JR	C,.USER_NO
-.DELETE
-	LD	HL,(.NAME_PTR)
-	LD	C,DSS_DELETE
-	RST	DSS
-	; Ignore delete result (file may have race-disappeared).
-.CREATE_FRESH
-	LD	HL,(.NAME_PTR)
-	LD	A,FA_ARCHIVE
-	LD	C,DSS_CREATE_OVERWRITE
-	RST	DSS
-	; CF reflects CREATE.  Restore CWD before returning.
-	PUSH	AF
-	CALL	.RESTORE_CWD
-	POP	AF
 	RET
-.USER_NO
-	LD	HL,MSG_NO
-	LD	C,DSS_PCHARS
-	RST	DSS
-	CALL	.RESTORE_CWD
-	SCF
-	RET
+
 
 ; ------------------------------------------------------
-; .RESTORE_CWD: if a CHDIR happened on the way in, undo it.
+; RESTORE_CWD: if SETUP_PATH did a CHDIR, undo it.
 ; Preserves AF, BC, DE, HL.
 ; ------------------------------------------------------
-.RESTORE_CWD
-	LD	A,(.HAS_DIR)
+RESTORE_CWD
+	LD	A,(HAS_DIR)
 	OR	A
 	RET	Z
 	PUSH	AF
@@ -221,7 +251,7 @@ OPEN_OUTPUT
 	PUSH	DE
 	PUSH	HL
 	XOR	A
-	LD	(.HAS_DIR),A
+	LD	(HAS_DIR),A
 	LD	HL,FILE_SAVED_CWD
 	LD	C,DSS_CHDIR
 	RST	DSS
@@ -231,10 +261,11 @@ OPEN_OUTPUT
 	POP	AF
 	RET
 
-.FULL_PTR	DW 0
-.NAME_PTR	DW 0
-.FORCE		DB 0
-.HAS_DIR	DB 0
+
+FULL_PTR	DW 0
+NAME_PTR	DW 0
+FORCE_FLAG_BS	DB 0
+HAS_DIR		DB 0
 
 
 ; ------------------------------------------------------

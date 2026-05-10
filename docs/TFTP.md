@@ -1,23 +1,27 @@
 # TFTP.EXE
 
 TFTP client, octet mode (RFC 1350) with RFC 2348 `blksize`
-option negotiation.  Only `GET` is implemented in v0.4.
+option negotiation.  Both `GET` (download) and `PUT` (upload)
+are supported in v0.5.
 
 ## Usage
 
 ```
-TFTP host GET filename [-o output] [-y]
+TFTP host GET remote-file [-o local-name] [-y]
+TFTP host PUT local-file  [-o remote-name]
 TFTP /?
 ```
 
 | Option       | Meaning                                            |
 |--------------|----------------------------------------------------|
 | `host`       | TFTP server IPv4 or hostname                       |
-| `GET`        | Fetch operation (only mode supported)              |
-| `filename`   | Remote file (relative to the server's TFTP root)   |
-| `-o file`    | Local output (default = remote name; supports      |
-|              | directory prefix per "Output paths" in HOWTO.TXT)  |
-| `-y`         | Overwrite local file without prompt                |
+| `GET / PUT`  | Direction of transfer                              |
+| `filename`   | Remote name (GET) or local name (PUT).  Local      |
+|              | side supports directory prefix per "Output paths"  |
+|              | in HOWTO.TXT.                                      |
+| `-o name`    | Override the OTHER side's name: local output for   |
+|              | GET, remote name on the server for PUT.            |
+| `-y`         | Overwrite local file without prompt (GET only)     |
 
 The RRQ asks for `blksize=1428` (Ethernet MTU minus the IP /
 UDP / TFTP headers); a server that ignores the option falls
@@ -28,23 +32,38 @@ Disk I/O is buffered: TFTP coalesces incoming blocks into an
 8 KB buffer and writes that to disk in one `DSS_WRITE`,
 printing one `.` per buffer flush as a progress indicator.
 
-## Example
+## Examples
+
+Download:
 
 ```
-RTL8019AS TFTP v0.4
+RTL8019AS TFTP v0.5
 
 GET IM2.TXT from 192.168.7.1
-[F0] OACK blksize=1428
 .................................................
 Done. 389579 bytes received.
   389579 bytes in 5 sec, 76 KB/s
 RESULT OK
 ```
 
-Cancelling with Esc/Ctrl+C closes the partial output file.
+Upload (one dot per sent block):
 
-`PUT` and a `windowsize` option (RFC 7440) for further
-speed-up are tracked as follow-ups; not in v0.4.
+```
+TFTP 192.168.7.1 PUT BOOT.BIN -o /tmp/boot.bin
+RTL8019AS TFTP v0.5
+
+PUT BOOT.BIN to 192.168.7.1
+.....
+Done. 32768 bytes sent.
+  32768 bytes in 1 sec, 32 KB/s
+RESULT OK
+```
+
+Cancelling with Esc/Ctrl+C closes the partial input/output
+file.
+
+A `windowsize` option (RFC 7440) for further speed-up is
+tracked as a follow-up.
 
 ## Exit codes
 

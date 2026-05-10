@@ -90,16 +90,28 @@ START
 	JP	Z,USAGE_ERROR
 	LD	(HOST_PTR),HL
 
-	; -l: directory-listing mode (no file download).  Detect
-	; first so the filename positional can be optional.
+	; -l / -n: directory-listing mode (no file download).
+	;   -l -> LIST  (verbose, "ls -l" style with metadata)
+	;   -n -> NLST  (terse, just names; useful for scripting)
+	; Either flag implies LIST_MODE; -n additionally sets
+	; NLST_MODE to swap the wire command.  Detect both first
+	; so the filename positional can be optional in either.
 	XOR	A
 	LD	(LIST_MODE),A
+	LD	(NLST_MODE),A
 	LD	A,'l'
 	CALL	@CMDL.HAS_FLAG
-	JR	C,.NO_LIST
+	JR	C,.NO_LFLAG
 	LD	A,1
 	LD	(LIST_MODE),A
-.NO_LIST
+.NO_LFLAG
+	LD	A,'n'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_NFLAG
+	LD	A,1
+	LD	(LIST_MODE),A
+	LD	(NLST_MODE),A
+.NO_NFLAG
 
 	; positional 1: filename (required for download, optional
 	; for list -- treated as the directory to list).
@@ -375,16 +387,24 @@ START
 	LD	HL,CTRL_BACKUP
 	CALL	@TCP.RESTORE_CTX
 
-	; RETR <filename> or LIST [<dir>] depending on mode.
+	; RETR <filename> / LIST [<dir>] / NLST [<dir>] depending
+	; on mode.
 	LD	A,(LIST_MODE)
 	OR	A
-	JR	NZ,.SEND_LIST
+	JR	NZ,.SEND_LISTING
 	LD	HL,CMD_RETR
 	LD	BC,CMD_RETR_LEN
 	JR	.SEND_DC_CMD
-.SEND_LIST
+.SEND_LISTING
+	LD	A,(NLST_MODE)
+	OR	A
+	JR	NZ,.SEND_NLST
 	LD	HL,CMD_LIST
 	LD	BC,CMD_LIST_LEN
+	JR	.SEND_DC_CMD
+.SEND_NLST
+	LD	HL,CMD_NLST
+	LD	BC,CMD_NLST_LEN
 .SEND_DC_CMD
 	LD	DE,(FILENAME_PTR)
 	LD	A,(FILENAME_LEN)
@@ -399,7 +419,22 @@ START
 	JR	Z,.RETR_OK
 	CP	'2'
 	JR	Z,.RETR_OK
-	JP	REPLY_BAD
+	; If we sent NLST and the server doesn't know it (500), fall
+	; back to LIST automatically -- some embedded FTP servers
+	; (e.g. dmnas) implement only the "verbose" listing.
+	LD	A,(NLST_MODE)
+	OR	A
+	JP	Z,REPLY_BAD
+	LD	A,(REPLY_CODE)
+	CP	'5'
+	JP	NZ,REPLY_BAD
+	; Suppress further NLST attempts and retry with LIST.
+	XOR	A
+	LD	(NLST_MODE),A
+	PRINTLN MSG_NLST_FB
+	LD	HL,CMD_LIST
+	LD	BC,CMD_LIST_LEN
+	JP	.SEND_DC_CMD
 .RETR_OK
 
 	; --- Save control, restore data ---
@@ -1475,6 +1510,8 @@ CMD_QUIT	DB "QUIT"
 CMD_QUIT_LEN	EQU $ - CMD_QUIT
 CMD_LIST	DB "LIST "
 CMD_LIST_LEN	EQU $ - CMD_LIST
+CMD_NLST	DB "NLST "
+CMD_NLST_LEN	EQU $ - CMD_NLST
 EMPTY_STR	DB 0
 CMD_RETR	DB "RETR "
 CMD_RETR_LEN	EQU $ - CMD_RETR
@@ -1523,13 +1560,14 @@ USER_LEN	EQU USER_PTR + 2		; 1
 USER_OVERRIDE	EQU USER_LEN + 1		; 1 (1 if -u was given)
 PASS_PTR	EQU USER_OVERRIDE + 1		; 2
 PASS_LEN	EQU PASS_PTR + 2		; 1
-LIST_MODE	EQU PASS_LEN + 1		; 1 (1 if -l was given)
+LIST_MODE	EQU PASS_LEN + 1		; 1 (1 if -l or -n was given)
+NLST_MODE	EQU LIST_MODE + 1		; 1 (1 if -n was given)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
 
 
-MSG_BANNER	DB "RTL8019AS FTP v0.1",0
+MSG_BANNER	DB "RTL8019AS FTP v0.2",0
 MSG_RESOLVED	DB "Resolved ",0
 MSG_TO		DB " -> ",0
 MSG_CONNECTING	DB "Connecting...",0
@@ -1548,6 +1586,7 @@ MSG_E_TCP_SEND	DB "[E] TCP send failed.",0
 MSG_E_PASV	DB "[E] could not parse PASV reply.",0
 MSG_PASV_HDR	DB "Data endpoint: ",0
 MSG_OPENING_DATA DB "Opening data connection...",0
+MSG_NLST_FB	 DB "[W] NLST not supported; retrying with LIST.",0
 MSG_DONE_PRE	DB "Done. ",0
 MSG_BYTES	DB " bytes received.",0
 MSG_E_DATA_OPEN	DB "[E] data connection failed.",0
@@ -1558,11 +1597,13 @@ MSG_HELP
 	DB "Usage:",13,10
 	DB "  FTP host filename [-u user] [-p pass] [-o output] [-y]",13,10
 	DB "  FTP host [path] -l [-u user] [-p pass]",13,10
+	DB "  FTP host [path] -n [-u user] [-p pass]",13,10
 	DB "  FTP /?",13,10,13,10
 	DB "  host       FTP server (IPv4 or hostname).",13,10
 	DB "  filename   remote file to download.",13,10
 	DB "  path       remote directory to list (default: server CWD).",13,10
-	DB "  -l         list a directory instead of downloading.",13,10
+	DB "  -l         list a directory (LIST: verbose, ls -l style).",13,10
+	DB "  -n         list a directory (NLST: terse, names only).",13,10
 	DB "  -u user    FTP username (default: anonymous).",13,10
 	DB "  -p pass    FTP password (default: anonymous@; empty",13,10
 	DB "             when -u is given without -p).",13,10

@@ -1,14 +1,15 @@
 # FTP.EXE
 
-Plain FTP client.  Always uses passive mode (PASV) in v0.1.
-Two modes: file download (default) and remote directory
-listing (`-l`).
+Plain FTP client.  Always uses passive mode (PASV) in v0.2.
+Three modes: file download (default), verbose directory
+listing (`-l`), and terse name-only listing (`-n`).
 
 ## Usage
 
 ```
 FTP host filename [-u user] [-p pass] [-o output] [-y]   (download)
-FTP host [path] -l [-u user] [-p pass]                    (list)
+FTP host [path] -l [-u user] [-p pass]                    (LIST)
+FTP host [path] -n [-u user] [-p pass]                    (NLST)
 FTP /?
 ```
 
@@ -16,9 +17,13 @@ FTP /?
 |--------------|----------------------------------------------------|
 | `host`       | FTP server IPv4 or hostname (port 21)              |
 | `filename`   | Remote file to RETR (paths allowed: `/pub/foo.zip`)|
-| `path`       | Remote directory to LIST.  Without `-l` ignored.   |
-| `-l`         | List directory instead of downloading.  Without a  |
-|              | path argument lists the server's CWD after login.  |
+| `path`       | Remote directory to list.  Without `-l` / `-n`     |
+|              | ignored.                                           |
+| `-l`         | LIST mode (verbose, "ls -l" style with metadata).  |
+|              | Without a path argument lists the server's CWD     |
+|              | after login.                                       |
+| `-n`         | NLST mode (terse, just filenames -- one per line). |
+|              | Useful for scripting (parse with batch loops).     |
 | `-u user`    | FTP username (default `anonymous`)                 |
 | `-p pass`    | FTP password (default `anonymous@`; empty when     |
 |              | `-u` is given without `-p`)                        |
@@ -42,7 +47,7 @@ Download:
 
 ```
 FTP 192.168.7.1 IM2.TXT -y
-RTL8019AS FTP v0.1
+RTL8019AS FTP v0.2
 Resolved 192.168.7.1 -> 192.168.7.1
 Connecting...ok.
 220 pyftpdlib 2.2.0 ready.
@@ -61,11 +66,11 @@ Done. 389579 bytes received.
 RESULT OK
 ```
 
-Listing:
+Verbose listing (`-l`):
 
 ```
 FTP 192.168.7.1 -l -u alice -p secret
-RTL8019AS FTP v0.1
+RTL8019AS FTP v0.2
 ...
 227 Entering passive mode (192,168,7,1,226,68).
 Opening data connection...
@@ -74,6 +79,21 @@ Opening data connection...
 -rw-r--r--   1 root  wheel     2048 May  6 15:28 2k.bin
 -rw-r--r--   1 root  wheel    57344 May  6 15:28 56k.bin
 -rw-r--r--   1 root  wheel   389579 May  6 15:28 im2.txt
+226 Transfer complete.
+221 Goodbye.
+RESULT OK
+```
+
+Terse listing (`-n`, NLST -- just filenames):
+
+```
+FTP 192.168.7.1 -n
+RTL8019AS FTP v0.2
+...
+fformat.txt
+2k.bin
+56k.bin
+im2.txt
 226 Transfer complete.
 221 Goodbye.
 RESULT OK

@@ -72,6 +72,7 @@ TFTP_SRV_PORT_LO EQU 69
 
 ; -- TFTP opcodes
 OP_RRQ		EQU 1
+OP_WRQ		EQU 2
 OP_DATA		EQU 3
 OP_ACK		EQU 4
 OP_ERROR	EQU 5
@@ -109,6 +110,7 @@ START
 
 	XOR	A
 	LD	(CANCELLED),A
+	LD	(SAW_TFTP_ERR),A
 
 	CALL	@CMDL.PARSE
 	CALL	@CMDL.IS_HELP
@@ -120,34 +122,77 @@ START
 	JP	C,USAGE_ERROR
 	LD	(TARGET_HOST_PTR),HL
 
-	; positional 1: subcommand "GET" (only mode supported in v0.2)
+	; positional 1: subcommand GET or PUT.
 	LD	B,1
 	CALL	@CMDL.GET_POSITIONAL
 	JP	C,USAGE_ERROR
 	CALL	IS_GET
+	JR	NZ,.NOT_GET
+	XOR	A			; PUT_MODE = 0 (GET)
+	LD	(PUT_MODE),A
+	JR	.MODE_OK
+.NOT_GET
+	CALL	IS_PUT
 	JP	NZ,USAGE_ERROR
+	LD	A,1			; PUT_MODE = 1
+	LD	(PUT_MODE),A
+.MODE_OK
 
-	; positional 2: filename (must fit FILENAME_BUF / 8.3 limits).
+	; positional 2: filename.  Saved verbatim as the local-side
+	; name; it is the wire-side name too unless -o overrides.
 	LD	B,2
 	CALL	@CMDL.GET_POSITIONAL
 	JP	C,USAGE_ERROR
-	; Copy ASCIIZ filename into FILENAME_BUF.
-	LD	DE,FILENAME_BUF
-	LD	B,FILENAME_BUF_SIZE - 1
-.CPF
-	LD	A,(HL)
-	OR	A
-	JR	Z,.CPF_DONE
-	LD	(DE),A
-	INC	HL
-	INC	DE
-	DEC	B
-	JR	NZ,.CPF
-.CPF_DONE
-	XOR	A
-	LD	(DE),A
+	LD	(LOCAL_NAME_PTR),HL
 
-	; -y / --yes: force overwrite without prompt.
+	; -o name : optional override for the OTHER side of the
+	; transfer.  GET: alternate local output filename.  PUT:
+	; alternate name on the server.
+	LD	A,'o'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_OVERRIDE
+	LD	(OVERRIDE_PTR),HL
+	LD	A,1
+	LD	(HAS_OVERRIDE),A
+	JR	.OVERRIDE_OK
+.NO_OVERRIDE
+	XOR	A
+	LD	(HAS_OVERRIDE),A
+.OVERRIDE_OK
+
+	; Resolve which name goes on the wire (RRQ/WRQ) and which
+	; one is the local file path.
+	;   GET: wire = positional 2; local = -o (if any) else
+	;        positional 2.
+	;   PUT: local = positional 2; wire = -o (if any) else
+	;        positional 2.
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.NAME_PUT
+	; GET: wire is positional 2 -- copy into FILENAME_BUF.
+	LD	HL,(LOCAL_NAME_PTR)
+	CALL	COPY_TO_FILENAME_BUF
+	; LOCAL stays at LOCAL_NAME_PTR if no override; -o swaps it.
+	LD	A,(HAS_OVERRIDE)
+	OR	A
+	JR	Z,.NAMES_OK
+	LD	HL,(OVERRIDE_PTR)
+	LD	(LOCAL_NAME_PTR),HL
+	JR	.NAMES_OK
+.NAME_PUT
+	; PUT: wire is -o if any, else positional 2.
+	LD	A,(HAS_OVERRIDE)
+	OR	A
+	JR	Z,.PUT_NO_OV
+	LD	HL,(OVERRIDE_PTR)
+	JR	.PUT_COPY
+.PUT_NO_OV
+	LD	HL,(LOCAL_NAME_PTR)
+.PUT_COPY
+	CALL	COPY_TO_FILENAME_BUF
+.NAMES_OK
+
+	; -y / --yes: force overwrite without prompt (GET only).
 	XOR	A
 	LD	(FORCE_FLAG),A
 	LD	A,'y'
@@ -203,12 +248,26 @@ START
 	LD	HL,TFTP_BLOCK_DEFAULT
 	LD	(NEG_BLKSIZE),HL
 
-	; Banner: "GET FILENAME from HOST"
+	; Banner: "GET FILENAME from HOST" or "PUT FILENAME to HOST".
 	PRINT LINE_END
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.BANNER_PUT
 	PRINT MSG_GET_HDR
+	JR	.BANNER_NAME
+.BANNER_PUT
+	PRINT MSG_PUT_HDR
+.BANNER_NAME
 	LD	HL,FILENAME_BUF
 	PRINT_HL
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.BANNER_TO
 	PRINT MSG_FROM_HOST
+	JR	.BANNER_HOST
+.BANNER_TO
+	PRINT MSG_TO_HOST
+.BANNER_HOST
 	LD	HL,TARGET_IP
 	CALL	PRINT_IPV4
 	PRINT LINE_END
@@ -223,18 +282,37 @@ START
 	LD	BC,6
 	LDIR
 
-	; Open output file (prompt-or-overwrite via @FILE.OPEN_OUTPUT).
-	LD	HL,FILENAME_BUF
+	; Open the local file -- write side for GET, read side for
+	; PUT.  Both go through file_lib's path-aware helpers so an
+	; -o argument with a directory ("test\foo.zip") just works.
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.OPEN_FOR_PUT
+	LD	HL,(LOCAL_NAME_PTR)
 	LD	A,(FORCE_FLAG)
 	CALL	@FILE.OPEN_OUTPUT
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
+	JR	.OPEN_OK
+.OPEN_FOR_PUT
+	LD	HL,(LOCAL_NAME_PTR)
+	CALL	@FILE.OPEN_INPUT
+	JP	C,FILE_FAIL
+	LD	(OUT_FH),A
+.OPEN_OK
 
 	; Capture transfer-start timestamp for end-of-run KB/s metric.
 	CALL	@UTIL.TPUT_START
 
-	; Send RRQ.
+	; Send RRQ (GET) or WRQ (PUT).
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.SEND_WRQ
 	CALL	BUILD_RRQ_PAYLOAD
+	JR	.RQ_BUILT
+.SEND_WRQ
+	CALL	BUILD_WRQ_PAYLOAD
+.RQ_BUILT
 	; Set up frame parameters and build full UDP-over-IP frame.
 	LD	HL,TFTP_BUF
 	LD	(TFTP_PAYLOAD_PTR),HL
@@ -249,7 +327,14 @@ START
 	CALL	@RTL.SEND_FRAME
 	JP	C,SEND_FAIL
 
-	; -- Block loop --
+	; PUT diverges here -- after WRQ we expect OACK or ACK(0)
+	; from the server, then start streaming DATA blocks.  The
+	; GET path follows immediately below as before.
+	LD	A,(PUT_MODE)
+	OR	A
+	JP	NZ,.PUT_LOOP
+
+	; -- GET block loop --
 .BLOCK_LOOP
 	LD	HL,TFTP_TIMEOUT_MS
 	LD	(TIMEOUT_MS_LEFT),HL
@@ -365,6 +450,152 @@ START
 	JP	@UTIL.EXIT_OK
 
 
+; ====================================================================
+; PUT block loop.  The WRQ has just been sent.  The server replies
+; either OACK (options accepted) or ACK(block=0) (options ignored,
+; default 512-byte blocks); on either we start sending DATA(1).
+; Each DATA(N) is acknowledged with ACK(N).  A DATA block shorter
+; than NEG_BLKSIZE (incl. zero-byte) marks the end of file -- after
+; its ACK we close the local handle and exit.
+; ====================================================================
+.PUT_LOOP
+	LD	HL,0
+	LD	(EXPECTED_BLOCK),HL	; expecting ACK 0 or OACK first
+
+	LD	HL,TFTP_TIMEOUT_MS
+	LD	(TIMEOUT_MS_LEFT),HL
+	CALL	WAIT_FOR_TFTP_DATA
+	JP	C,TFTP_TIMEOUT
+	; A = OP_DATA / OP_ACK / OP_OACK.
+	CP	OP_OACK
+	JR	Z,.PUT_FIRST_OACK
+	CP	OP_ACK
+	JP	NZ,TFTP_TIMEOUT		; protocol error
+	; ACK first response -> server ignored options.  Verify ACK 0.
+	LD	HL,(ACK_BLOCK)
+	LD	A,H
+	OR	L
+	JP	NZ,TFTP_TIMEOUT		; non-zero ACK before any DATA
+	JR	.PUT_AFTER_FIRST
+.PUT_FIRST_OACK
+	CALL	PARSE_OACK		; updates NEG_BLKSIZE
+.PUT_AFTER_FIRST
+	; Start streaming.  Block numbers begin at 1.
+	LD	HL,1
+	LD	(EXPECTED_BLOCK),HL
+
+.PUT_DATA_LOOP
+	; Read up to NEG_BLKSIZE bytes from the local file directly
+	; into TFTP_FILE_BUF + 4 (4 bytes reserved for the DATA
+	; header).
+	LD	HL,TFTP_FILE_BUF + 4
+	LD	DE,(NEG_BLKSIZE)
+	LD	A,(OUT_FH)
+	LD	C,DSS_READ_FILE
+	RST	DSS
+	JP	C,FILE_FAIL
+	LD	(DATA_LEN),DE
+
+	; Build the 4-byte TFTP DATA header.
+	XOR	A
+	LD	(TFTP_FILE_BUF + 0),A
+	LD	A,OP_DATA
+	LD	(TFTP_FILE_BUF + 1),A
+	LD	HL,(EXPECTED_BLOCK)
+	LD	A,H
+	LD	(TFTP_FILE_BUF + 2),A
+	LD	A,L
+	LD	(TFTP_FILE_BUF + 3),A
+
+	; Wrap as a UDP frame and ship it.
+	LD	HL,TFTP_FILE_BUF
+	LD	(TFTP_PAYLOAD_PTR),HL
+	LD	HL,(DATA_LEN)
+	LD	BC,4
+	ADD	HL,BC
+	LD	(TFTP_PAYLOAD_LEN),HL
+	LD	A,(SERVER_PORT_HI)
+	LD	(TFTP_DST_PORT_HI),A
+	LD	A,(SERVER_PORT_LO)
+	LD	(TFTP_DST_PORT_LO),A
+	CALL	BUILD_UDP_FRAME
+	LD	HL,TX_BUF
+	CALL	@RTL.SEND_FRAME
+	JP	C,SEND_FAIL
+
+	; Accumulate counter.
+	LD	HL,(DATA_LEN)
+	LD	BC,(TOTAL_BYTES_LO)
+	ADD	HL,BC
+	LD	(TOTAL_BYTES_LO),HL
+	LD	HL,(TOTAL_BYTES_HI)
+	LD	BC,0
+	ADC	HL,BC
+	LD	(TOTAL_BYTES_HI),HL
+
+	; One progress dot per sent block.  Briefly close ISA so
+	; DSS_PUTCHAR can reach the console.
+	CALL	@ISA.ISA_CLOSE
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	CALL	@ISA.ISA_OPEN
+
+	; Wait for ACK matching the block we just sent.
+	LD	HL,TFTP_TIMEOUT_MS
+	LD	(TIMEOUT_MS_LEFT),HL
+	CALL	WAIT_FOR_TFTP_DATA
+	JP	C,TFTP_TIMEOUT
+	CP	OP_ACK
+	JP	NZ,TFTP_TIMEOUT		; protocol error
+	LD	HL,(ACK_BLOCK)
+	LD	DE,(EXPECTED_BLOCK)
+	LD	A,H
+	CP	D
+	JP	NZ,TFTP_TIMEOUT		; mismatched ACK
+	LD	A,L
+	CP	E
+	JP	NZ,TFTP_TIMEOUT
+
+	; Was this the last block?  DATA_LEN < NEG_BLKSIZE -> EOF.
+	LD	HL,(DATA_LEN)
+	LD	DE,(NEG_BLKSIZE)
+	LD	A,H
+	CP	D
+	JR	C,.PUT_DONE
+	JR	NZ,.PUT_NEXT
+	LD	A,L
+	CP	E
+	JR	C,.PUT_DONE
+.PUT_NEXT
+	LD	HL,(EXPECTED_BLOCK)
+	INC	HL
+	LD	(EXPECTED_BLOCK),HL
+	JP	.PUT_DATA_LOOP
+
+.PUT_DONE
+	; Close local input file.
+	LD	A,(OUT_FH)
+	CP	NO_HANDLE
+	JR	Z,.PUT_NCL
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+.PUT_NCL
+	PRINT LINE_END
+	PRINT MSG_DONE
+	LD	HL,(TOTAL_BYTES_LO)
+	LD	DE,(TOTAL_BYTES_HI)
+	CALL	@UTIL.PRINT_DEC_32
+	PRINTLN MSG_BYTES_SENT
+	LD	HL,(TOTAL_BYTES_LO)
+	LD	DE,(TOTAL_BYTES_HI)
+	CALL	@UTIL.TPUT_REPORT
+	CALL	@ISA.ISA_CLOSE
+	JP	@UTIL.EXIT_OK
+
+
 RESET_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_RESET
@@ -391,6 +622,12 @@ TFTP_TIMEOUT
 	LD	A,(CANCELLED)
 	OR	A
 	JR	NZ,.CANCEL
+	; If WAIT_FOR_TFTP_DATA already printed a server-side
+	; OP_ERROR message, skip the generic "TFTP timeout"
+	; banner so the user gets a single, specific reason.
+	LD	A,(SAW_TFTP_ERR)
+	OR	A
+	JR	NZ,FAIL_FILE
 	PRINTLN MSG_E_TFTP
 	JP	FAIL_FILE
 .CANCEL
@@ -504,6 +741,61 @@ IS_GET
 	OR	1			; ZF=0
 	RET
 
+
+; ------------------------------------------------------
+; IS_PUT: ZF=1 if (HL) is exactly "PUT" / "put" (3 chars).
+; ------------------------------------------------------
+IS_PUT
+	PUSH	HL
+	LD	A,(HL)
+	CALL	UPCASE
+	CP	'P'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	CALL	UPCASE
+	CP	'U'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	CALL	UPCASE
+	CP	'T'
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.NO
+	POP	HL
+	XOR	A
+	RET
+.NO
+	POP	HL
+	OR	1
+	RET
+
+
+; ------------------------------------------------------
+; COPY_TO_FILENAME_BUF: copy ASCIIZ from (HL) to
+; FILENAME_BUF, capped at FILENAME_BUF_SIZE-1.
+; Trashes A, B, DE, HL.
+; ------------------------------------------------------
+COPY_TO_FILENAME_BUF
+	LD	DE,FILENAME_BUF
+	LD	B,FILENAME_BUF_SIZE - 1
+.LP
+	LD	A,(HL)
+	OR	A
+	JR	Z,.END
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	DEC	B
+	JR	NZ,.LP
+.END
+	XOR	A
+	LD	(DE),A
+	RET
+
 UPCASE
 	CP	'a'
 	RET	C
@@ -552,11 +844,28 @@ TICK_AND_CHECK_KEY
 ; ignore options (we then fall back to the 512-byte default).
 ; ------------------------------------------------------
 BUILD_RRQ_PAYLOAD
+	LD	A,OP_RRQ
+	JR	BUILD_RQ_PAYLOAD
+
+; ------------------------------------------------------
+; BUILD_WRQ_PAYLOAD: same shape as RRQ but opcode 2.
+; ------------------------------------------------------
+BUILD_WRQ_PAYLOAD
+	LD	A,OP_WRQ
+	; fall through
+
+; ------------------------------------------------------
+; BUILD_RQ_PAYLOAD: shared backbone for RRQ / WRQ.  Stores
+; opcode (in A) + filename + "octet" + "blksize" + "1428"
+; into TFTP_BUF; sets RRQ_LEN.
+; ------------------------------------------------------
+BUILD_RQ_PAYLOAD
+	LD	(.OPCODE),A
 	LD	DE,TFTP_BUF
 	XOR	A
 	LD	(DE),A
 	INC	DE
-	LD	A,OP_RRQ
+	LD	A,(.OPCODE)
 	LD	(DE),A
 	INC	DE
 	; Filename + 0
@@ -575,9 +884,10 @@ BUILD_RRQ_PAYLOAD
 	LD	HL,TFTP_BUF
 	OR	A
 	EX	DE,HL
-	SBC	HL,DE			; HL = end - start
+	SBC	HL,DE
 	LD	(RRQ_LEN),HL
 	RET
+.OPCODE	DB 0
 
 ; COPY_ASCIIZ: copy ASCIIZ string from HL to DE (including
 ; the trailing zero). Trashes A, advances HL and DE.
@@ -1101,8 +1411,11 @@ WAIT_FOR_TFTP_DATA
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 1)
 	CP	OP_OACK
 	JR	Z,.IS_OACK
+	CP	OP_ACK
+	JR	Z,.IS_ACK
 	CP	OP_DATA
 	JP	NZ,.LP_OR_ERR
+	; --- DATA (used by GET) ---
 	; Block# (BE) at offset +14+IP_HDR+UDP_HDR+2..+3.
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 2)
 	LD	H,A
@@ -1133,13 +1446,34 @@ WAIT_FOR_TFTP_DATA
 	LD	A,OP_OACK
 	OR	A			; CF=0
 	RET
+.IS_ACK
+	; --- ACK (used by PUT) ---
+	; Capture the acked block# into ACK_BLOCK; caller validates.
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 2)
+	LD	H,A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 3)
+	LD	L,A
+	LD	(ACK_BLOCK),HL
+	LD	A,OP_ACK
+	OR	A
+	RET
 .LP_OR_ERR
-	; If TFTP opcode is ERROR, bail with timeout (caller will fail).
+	; If TFTP opcode is ERROR, surface the server's message so
+	; the user sees WHY (e.g. "write not supported", "file not
+	; found") instead of a generic "TFTP timeout".
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 1)
 	CP	OP_ERROR
 	JR	Z,.TFTP_ERROR
 	JP	.LP
 .TFTP_ERROR
+	; ERROR packet body: errcode (2 bytes BE) + ASCIIZ message.
+	PRINT MSG_E_TFTP_SRV
+	LD	HL,RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 4
+	LD	C,DSS_PCHARS
+	RST	DSS
+	PRINT LINE_END
+	LD	A,1
+	LD	(SAW_TFTP_ERR),A
 	SCF
 	RET
 .TIMEOUT
@@ -1281,20 +1615,30 @@ FILENAME_BUF	 EQU APP_BSS_BASE + 48		; FILENAME_BUF_SIZE bytes
 NEG_BLKSIZE	 EQU APP_BSS_BASE + 52 + FILENAME_BUF_SIZE	; 2 bytes (negotiated block)
 OACK_END_PTR	 EQU NEG_BLKSIZE + 2		; 2 bytes (parser end ptr)
 TFTP_BUF_LEN	 EQU OACK_END_PTR + 2		; 2 bytes (current fill of TFTP_FILE_BUF)
+PUT_MODE	 EQU TFTP_BUF_LEN + 2		; 1 byte (1 if PUT, 0 if GET)
+LOCAL_NAME_PTR	 EQU PUT_MODE + 1		; 2 bytes
+HAS_OVERRIDE	 EQU LOCAL_NAME_PTR + 2		; 1 byte
+OVERRIDE_PTR	 EQU HAS_OVERRIDE + 1		; 2 bytes
+ACK_BLOCK	 EQU OVERRIDE_PTR + 2		; 2 bytes (block# from received ACK)
+SAW_TFTP_ERR	 EQU ACK_BLOCK + 2		; 1 byte (1 if we got an OP_ERROR)
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS TFTP v0.4",0
+MSG_BANNER	DB "RTL8019AS TFTP v0.5",0
 MSG_GET_HDR	DB "GET ",0
+MSG_PUT_HDR	DB "PUT ",0
 MSG_FROM_HOST	DB " from ",0
+MSG_TO_HOST	DB " to ",0
 MSG_DONE	DB "Done. ",0
 MSG_BYTES_RECV	DB " bytes received.",0
+MSG_BYTES_SENT	DB " bytes sent.",0
 MSG_REGS	DB "REGS ",0
 MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
 MSG_E_RESET	DB "[E80] RESET timeout",0
 MSG_E_SEND	DB "[E81] DMA write or PTX timeout",0
 MSG_E_ARP	DB "ARP request timed out.",0
 MSG_E_TFTP	DB "TFTP timeout or server error.",0
+MSG_E_TFTP_SRV	DB "[E] TFTP server: ",0
 MSG_E_FILE	DB "[E] file create/write/close failed",0
 MSG_USAGE_ERR	DB "[E] usage: missing or invalid arguments",0
 MSG_E_RESOLVE	DB "[E] could not resolve host (DNS / ARP timeout or NXDOMAIN).",0
@@ -1302,14 +1646,17 @@ MSG_E_NO_DNS1	DB "[E] NET_DNS1 not set; pass an IPv4 literal or run NETCFG/IFUP 
 MSG_E_NO_GW	DB "[E] DNS server is off-subnet but NET_GW is not set.",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  TFTP host GET filename [-y]",13,10
+	DB "  TFTP host GET remote-file [-o local-name] [-y]",13,10
+	DB "  TFTP host PUT local-file  [-o remote-name]",13,10
 	DB "  TFTP /?",13,10,13,10
-	DB "  host      TFTP server IPv4 (e.g. 192.168.7.1).",13,10
-	DB "  GET       fetch operation (only mode supported).",13,10
-	DB "  filename  remote file (saved locally with same name).",13,10
-	DB "  -y        overwrite local file without prompt.",13,10,13,10
-	DB "RFC 2348 blksize=1428 is requested in the RRQ; servers",13,10
-	DB "that ignore options fall back to RFC 1350 512-byte blocks.",13,10,0
+	DB "  host         TFTP server IPv4 or hostname.",13,10
+	DB "  GET / PUT    download from / upload to the server.",13,10
+	DB "  filename     remote (GET) or local (PUT) name.",13,10
+	DB "  -o name      override the OTHER side: local output for",13,10
+	DB "               GET, remote name on the server for PUT.",13,10
+	DB "  -y           overwrite local file without prompt (GET).",13,10,13,10
+	DB "RFC 2348 blksize=1428 is requested; servers that ignore",13,10
+	DB "options fall back to RFC 1350 512-byte blocks.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE

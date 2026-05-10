@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Minimal TFTP read-only server for stage 7 (TFTP) testing of the
-Sprinter RTL8019AS network kit.
-
-Serves files from a chosen directory over UDP/69. Supports
-RRQ in octet mode with the default 512-byte block size and
-RFC 2348 blksize negotiation (server replies with OACK and
+Minimal TFTP server for stage-7 (TFTP) testing of the Sprinter
+RTL8019AS network kit.  Supports both RRQ (download) and WRQ
+(upload) in octet mode with the default 512-byte block size
+and RFC 2348 blksize negotiation (server replies with OACK and
 the accepted block size, clamped to 8..1468 bytes).  ACK
-handling has a single retransmit on timeout.  Does NOT
-implement write requests, retries beyond the basic cycle, or
-RFC 2349 / RFC 7440 windowsize.
+handling has a few retransmits on timeout.  Does NOT implement
+RFC 2349 timeout/tsize options or RFC 7440 windowsize.
 
 Usage:
     sudo python3 tools/dev/tftp_serve.py
@@ -118,6 +115,98 @@ def serve_file(client_addr, path, options):
         block_no = (block_no + 1) & 0xFFFF
 
 
+def receive_file(client_addr, path, options):
+    """Receive a file from `client_addr` and write it to `path`.
+
+    Mirror of serve_file: send OACK / ACK(0) to start, then loop
+    receiving DATA(N), writing to disk, replying ACK(N).  Stop
+    when DATA shorter than blksize arrives.
+    """
+    block_size = int(options.get("blksize", DEFAULT_BLOCK_SIZE))
+    print(f"[recv] {client_addr[0]}:{client_addr[1]} PUT {path} blksize={block_size}")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("", 0))
+    sock.settimeout(ACK_TIMEOUT)
+
+    if options:
+        oack_payload = b""
+        for k, v in options.items():
+            oack_payload += k.encode("ascii") + b"\x00" + str(v).encode("ascii") + b"\x00"
+        first_reply = struct.pack(">H", OP_OACK) + oack_payload
+    else:
+        first_reply = struct.pack(">HH", OP_ACK, 0)
+
+    try:
+        out = open(path, "wb")
+    except OSError as exc:
+        print(f"[recv] open for write failed: {exc}")
+        err = struct.pack(">HH", OP_ERROR, 2) + str(exc).encode("ascii", "replace") + b"\x00"
+        sock.sendto(err, client_addr)
+        sock.close()
+        return
+
+    try:
+        # Send the start packet (OACK or ACK 0); expect DATA(1) back.
+        expected_block = 1
+        for retry in range(5):
+            sock.sendto(first_reply, client_addr)
+            try:
+                pkt, addr = sock.recvfrom(4 + MAX_BLOCK_SIZE)
+                if addr != client_addr or len(pkt) < 4:
+                    continue
+                op, n = struct.unpack(">HH", pkt[:4])
+                if op == OP_DATA and n == expected_block:
+                    body = pkt[4:]
+                    out.write(body)
+                    sock.sendto(struct.pack(">HH", OP_ACK, expected_block), client_addr)
+                    if len(body) < block_size:
+                        print(f"[recv] done after {expected_block} block(s), "
+                              f"{out.tell()} bytes")
+                        return
+                    expected_block = (expected_block + 1) & 0xFFFF
+                    break
+            except socket.timeout:
+                print(f"[recv] start retry {retry}")
+                continue
+        else:
+            print(f"[recv] giving up at start")
+            return
+
+        # Steady-state loop.
+        while True:
+            for retry in range(5):
+                try:
+                    pkt, addr = sock.recvfrom(4 + MAX_BLOCK_SIZE)
+                except socket.timeout:
+                    print(f"[recv] block {expected_block} timeout (resend ACK)")
+                    sock.sendto(struct.pack(">HH", OP_ACK, expected_block - 1), client_addr)
+                    continue
+                if addr != client_addr or len(pkt) < 4:
+                    continue
+                op, n = struct.unpack(">HH", pkt[:4])
+                if op == OP_DATA and n == expected_block:
+                    body = pkt[4:]
+                    out.write(body)
+                    sock.sendto(struct.pack(">HH", OP_ACK, expected_block), client_addr)
+                    if len(body) < block_size:
+                        print(f"[recv] done after {expected_block} block(s), "
+                              f"{out.tell()} bytes")
+                        return
+                    expected_block = (expected_block + 1) & 0xFFFF
+                    break
+                # Duplicate of previous block: re-ACK silently.
+                if op == OP_DATA and n == ((expected_block - 1) & 0xFFFF):
+                    sock.sendto(struct.pack(">HH", OP_ACK, n), client_addr)
+                    continue
+            else:
+                print(f"[recv] giving up at block {expected_block}")
+                return
+    finally:
+        out.close()
+        sock.close()
+
+
 def parse_rrq(payload):
     """Return (filename, mode, options) or raise ValueError on malformed packet.
 
@@ -197,8 +286,19 @@ def main() -> int:
                 # Spawn (synchronous) transfer.
                 serve_file(addr, full, options)
             elif opcode == OP_WRQ:
-                err = struct.pack(">HH", OP_ERROR, 2) + b"write not supported\x00"
-                sock.sendto(err, addr)
+                try:
+                    fname, mode, options = parse_rrq(packet[2:])
+                except ValueError as exc:
+                    print(f"[recv] {addr}: bad WRQ: {exc}")
+                    continue
+                if mode != "octet":
+                    print(f"[recv] {addr}: refusing mode={mode!r}")
+                    err = struct.pack(">HH", OP_ERROR, 0) + b"only octet mode supported\x00"
+                    sock.sendto(err, addr)
+                    continue
+                safe = os.path.basename(fname)
+                full = os.path.join(args.root, safe)
+                receive_file(addr, full, options)
             else:
                 print(f"[recv] {addr}: opcode {opcode} ignored")
     except KeyboardInterrupt:

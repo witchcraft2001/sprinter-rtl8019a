@@ -214,7 +214,7 @@ in this release:
 | Utility   | Banner     |
 |-----------|------------|
 | ARP       | v0.2       |
-| FTP       | v0.1       |
+| FTP       | v0.2       |
 | IFUP      | v0.2       |
 | ISAPROBE  | v0.1       |
 | NETCFG    | v0.1       |
@@ -226,7 +226,7 @@ in this release:
 | NSLOOKUP  | v0.1       |
 | NTP       | v0.3       |
 | PING      | v0.2       |
-| TFTP      | v0.4       |
+| TFTP      | v0.5       |
 | UDPTEST   | v0.2       |
 | WGET      | v0.2.1     |
 
