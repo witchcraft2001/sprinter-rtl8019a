@@ -59,7 +59,7 @@ Download:
 
 ```
 FTP 192.168.7.1 IM2.TXT -y
-RTL8019AS FTP v0.5
+RTL8019AS FTP v0.6
 Resolved 192.168.7.1 -> 192.168.7.1
 Connecting...ok.
 220 pyftpdlib 2.2.0 ready.
@@ -82,7 +82,7 @@ Upload (`PUT`):
 
 ```
 FTP 192.168.7.1 PUT BOOT.BIN -u alice -p secret
-RTL8019AS FTP v0.5
+RTL8019AS FTP v0.6
 ...
 227 Entering passive mode (192,168,7,1,226,99).
 Opening data connection...
@@ -99,7 +99,7 @@ Verbose listing (`-l`):
 
 ```
 FTP 192.168.7.1 -l -u alice -p secret
-RTL8019AS FTP v0.5
+RTL8019AS FTP v0.6
 ...
 227 Entering passive mode (192,168,7,1,226,68).
 Opening data connection...
@@ -117,7 +117,7 @@ Terse listing (`-n`, NLST -- just filenames):
 
 ```
 FTP 192.168.7.1 -n
-RTL8019AS FTP v0.5
+RTL8019AS FTP v0.6
 ...
 fformat.txt
 2k.bin
@@ -138,6 +138,10 @@ is opened); progress dots are not emitted.
 | 0    | OK                                                       |
 | 1    | Usage                                                    |
 | 2    | RTL8019AS not detected                                   |
-| 3    | Network / FTP reply error / unsupported reply            |
+| 3    | Network unreachable (ARP / TCP connect / control-channel |
+|      | recv timeout / DNS)                                      |
 | 4    | Config                                                   |
-| 5    | File create / write failure                              |
+| 5    | Local file create / write / close failure                |
+| 6    | Server rejected: 5xx / 4xx control reply (incl. 550),    |
+|      | malformed PASV reply, login failure                      |
+| 7    | Cancelled by user (Esc / Ctrl+C)                         |

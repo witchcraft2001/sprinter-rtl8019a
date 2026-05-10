@@ -181,5 +181,9 @@ EX_NO_HW	EQU 2
 EX_NIC_ERR	EQU 3				; alias of EX_NET_ERR (driver-level fail)
 EX_NET_ERR	EQU 3				; ARP/ICMP/UDP/TCP timeout, no route, etc.
 EX_CFG_ERR	EQU 4
+EX_FILE_ERR	EQU 5				; local file create / write / close failure
+EX_SRV_ERR	EQU 6				; server-side rejection (HTTP 4xx/5xx,
+						; FTP non-2xx incl. 550, TFTP OP_ERROR)
+EX_CANCEL	EQU 7				; user pressed Esc / Ctrl+C
 
 	ENDIF

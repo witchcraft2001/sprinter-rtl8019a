@@ -31,10 +31,14 @@ Every utility writes one of these values to `ERRORLEVEL` on exit
 | 0    | OK                                                            |
 | 1    | Usage error (unknown / missing / malformed argument)          |
 | 2    | RTL8019AS not detected at the configured I/O base             |
-| 3    | Network error (ARP / ICMP / UDP / TCP timeout, no route, etc.)|
+| 3    | Network unreachable (ARP / TCP connect / RX timeout, no link, |
+|      | DNS resolution failure)                                       |
 | 4    | Configuration error (`NET.CFG` missing, or `NET_*` env var    |
 |      | not set -- run `NETCFG -i` first)                             |
-| 5    | File create / write / close failure (download utilities)      |
+| 5    | Local file create / write / close / delete failure            |
+| 6    | Server-side rejection (HTTP 4xx/5xx, FTP non-2xx incl. 550,   |
+|      | TFTP OP_ERROR, redirect failure)                              |
+| 7    | Cancelled by user (Esc / Ctrl+C)                              |
 
 Each utility prints `RESULT OK` (`B=0`) or `RESULT FAIL` (`B != 0`)
 as its last line, so visual inspection in MAME and machine-readable
@@ -45,7 +49,7 @@ batch checks agree.
 
 Utilities that wait for the network respond to **Esc** and
 **Ctrl+C** while polling for replies.  A cancelled run prints
-`Aborted by user (Esc/Ctrl+C).` and returns `B=3`.
+`Aborted by user (Esc/Ctrl+C).` and returns `B=7`.
 
 
 ## Hostnames vs IPv4 literals
@@ -217,7 +221,7 @@ in this release:
 | Utility   | Banner     |
 |-----------|------------|
 | ARP       | v0.2       |
-| FTP       | v0.5       |
+| FTP       | v0.6       |
 | IFUP      | v0.2       |
 | ISAPROBE  | v0.1       |
 | NETCFG    | v0.1       |
@@ -229,9 +233,9 @@ in this release:
 | NSLOOKUP  | v0.1       |
 | NTP       | v0.3       |
 | PING      | v0.2       |
-| TFTP      | v0.7       |
+| TFTP      | v0.8       |
 | UDPTEST   | v0.2       |
-| WGET      | v0.2.2     |
+| WGET      | v0.2.3     |
 
 Major behavioural changes bump the second digit; the first digit
 moves to `v1.0` after a real-hardware bring-up pass on the

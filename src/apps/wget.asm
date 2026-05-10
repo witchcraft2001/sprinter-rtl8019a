@@ -833,7 +833,7 @@ FILE_FAIL
 	RST	DSS
 .NF
 	CALL	@ISA.ISA_CLOSE
-	LD	B,1
+	LD	B,EX_FILE_ERR
 	JP	@UTIL.EXIT_FAIL
 
 
@@ -852,7 +852,8 @@ TCP_FAIL
 ; gracefully (no flush -- the buffered bytes are the
 ; server's error body, not the user's file), delete the
 ; freshly-created output file so a 404 doesn't leave a
-; truncated/empty file behind, then exit B=EX_NET_ERR.
+; truncated/empty file behind, then exit B=EX_SRV_ERR (the
+; transport was fine; the server rejected the request).
 ; ------------------------------------------------------
 HTTP_FAIL
 	; Drop any body bytes we accidentally let in before the
@@ -879,7 +880,7 @@ HTTP_FAIL
 	; TCP close (best-effort -- peer may already FIN).
 	CALL	@TCP.CLOSE
 	CALL	@ISA.ISA_CLOSE
-	LD	B,EX_NET_ERR
+	LD	B,EX_SRV_ERR
 	JP	@UTIL.EXIT_FAIL
 
 
@@ -1254,7 +1255,7 @@ ARP_TIMEOUT
 .CAN
 	PRINTLN MSG_ABORTED
 	CALL	@ISA.ISA_CLOSE
-	LD	B,EX_NET_ERR
+	LD	B,EX_CANCEL
 	JP	@UTIL.EXIT_FAIL
 
 TCP_OPEN_FAIL
@@ -1484,7 +1485,7 @@ HDR_LINE_BUF	EQU WGET_BUF_LEN + 2		; HDR_LINE_BUF_SIZE bytes
 REDIRECT_URL_BUF EQU HDR_LINE_BUF + HDR_LINE_BUF_SIZE	; REDIRECT_URL_BUF_SIZE bytes
 
 
-MSG_BANNER	DB "RTL8019AS WGET v0.2.2",0
+MSG_BANNER	DB "RTL8019AS WGET v0.2.3",0
 MSG_RESOLVED_PRE DB "Resolved ",0
 MSG_TO		DB " -> ",0
 MSG_PORT	DB " port ",0

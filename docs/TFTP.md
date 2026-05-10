@@ -2,7 +2,7 @@
 
 TFTP client, octet mode (RFC 1350) with RFC 2348 `blksize`
 option negotiation.  Both `GET` (download) and `PUT` (upload)
-are supported in v0.7.
+are supported in v0.8.
 
 ## Usage
 
@@ -42,7 +42,7 @@ printing one `.` per buffer flush as a progress indicator.
 Download:
 
 ```
-RTL8019AS TFTP v0.7
+RTL8019AS TFTP v0.8
 
 GET IM2.TXT from 192.168.7.1
 .................................................
@@ -55,7 +55,7 @@ Upload (one dot per sent block):
 
 ```
 TFTP 192.168.7.1 PUT BOOT.BIN -o /tmp/boot.bin
-RTL8019AS TFTP v0.7
+RTL8019AS TFTP v0.8
 
 PUT BOOT.BIN to 192.168.7.1
 .....
@@ -75,8 +75,12 @@ tracked as a follow-up.
 | Code | Meaning                                              |
 |------|------------------------------------------------------|
 | 0    | OK                                                   |
-| 1    | Usage (including `PUT`)                              |
+| 1    | Usage (including bad GET/PUT verb)                   |
 | 2    | RTL8019AS not detected                               |
-| 3    | ARP / TFTP timeout / server error                    |
-| 4    | Config                                               |
-| 5    | File create / write failure                          |
+| 3    | Network unreachable (ARP / TFTP timeout, no link,    |
+|      | DNS resolution failure)                              |
+| 4    | Config (`NET_DNS1` / `NET_GW` missing for hostnames) |
+| 5    | Local file create / write / close failure            |
+| 6    | Server replied OP_ERROR (e.g. file not found, access |
+|      | violation)                                           |
+| 7    | Cancelled by user (Esc / Ctrl+C)                     |

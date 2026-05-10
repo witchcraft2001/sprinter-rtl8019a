@@ -38,7 +38,7 @@ WGET /?
 Direct download:
 
 ```
-RTL8019AS WGET v0.2.2
+RTL8019AS WGET v0.2.3
 Resolved tr-dos.ru -> 188.127.239.141 port 80
 Connecting to 188.127.239.141 port 80...ESTABLISHED.
 .....
@@ -51,7 +51,7 @@ Following a redirect (`http://`->`http://`):
 
 ```
 WGET http://192.168.7.1:8080/redir-abs
-RTL8019AS WGET v0.2.2
+RTL8019AS WGET v0.2.3
 Resolved 192.168.7.1 -> 192.168.7.1 port 8080
 Connecting to 192.168.7.1 port 8080...ESTABLISHED.
 Redirect: HTTP/1.0 302 Found
@@ -73,7 +73,10 @@ file.
 | 0    | OK                                                       |
 | 1    | Usage (bad URL, missing argument)                        |
 | 2    | RTL8019AS not detected                                   |
-| 3    | Network error / HTTP 4xx-5xx / `https://` redirect /     |
-|      | too many redirects                                       |
-| 4    | Config                                                   |
-| 5    | File create / write failure                              |
+| 3    | Network unreachable (ARP / TCP connect / RX timeout,     |
+|      | DNS resolution failure)                                  |
+| 4    | Config (`NET.CFG` missing or `NET_*` env unset)          |
+| 5    | Local file create / write / close / delete failure       |
+| 6    | Server-side: HTTP 4xx-5xx, `https://` redirect (no TLS), |
+|      | too many redirects, malformed `Location` header          |
+| 7    | Cancelled by user (Esc / Ctrl+C)                         |
