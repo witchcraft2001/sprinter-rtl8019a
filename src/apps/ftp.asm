@@ -221,18 +221,32 @@ START
 	LD	A,(HL)
 	OR	A
 	JP	Z,USAGE_ERROR
-	; Local-side path stays as typed; the wire-side default
-	; depends on mode.  PUT: send only the basename (the
-	; server has no concept of our DSS path).  GET / LIST:
-	; pass the server-side path verbatim (sub-directories on
-	; the server are perfectly valid).  -o overrides whichever
-	; side is mode-relevant just below.
-	LD	(OUTPUT_PTR),HL
+	; Wire-side and local-side defaults depend on mode:
+	;   GET: wire = positional verbatim (server path is OK);
+	;        local = basename of positional, so a server-side
+	;        `pub/foo.zip` saves as `foo.zip` in CWD instead
+	;        of trying to CHDIR pub\ locally.
+	;   PUT: local = positional verbatim (file_lib CHDIRs
+	;        into the directory before opening); wire =
+	;        basename only (server has no concept of DSS
+	;        paths and would otherwise create
+	;        `C:\docs\foo.bin`).
+	; -o overrides whichever side is mode-relevant just below.
 	LD	A,(PUT_MODE)
 	OR	A
-	JR	Z,.WIRE_FULL
+	JR	NZ,.PUT_NAMES
+	; GET path.
+	LD	(FILENAME_PTR),HL
+	CALL	STRLEN_FROM_HL
+	LD	(FILENAME_LEN),A
+	LD	HL,(FILENAME_PTR)
 	CALL	@FILE.BASENAME
-.WIRE_FULL
+	LD	(OUTPUT_PTR),HL
+	JR	.NAME_OK
+.PUT_NAMES
+	; PUT path.
+	LD	(OUTPUT_PTR),HL
+	CALL	@FILE.BASENAME
 	LD	(FILENAME_PTR),HL
 	CALL	STRLEN_FROM_HL
 	LD	(FILENAME_LEN),A
@@ -1756,7 +1770,7 @@ FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
 FTP_PUT_CHUNK	  EQU 536		; one TCP MSS per STOR send
 
 
-MSG_BANNER	DB "RTL8019AS FTP v0.4",0
+MSG_BANNER	DB "RTL8019AS FTP v0.5",0
 MSG_RESOLVED	DB "Resolved ",0
 MSG_TO		DB " -> ",0
 MSG_CONNECTING	DB "Connecting...",0

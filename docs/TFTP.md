@@ -2,7 +2,7 @@
 
 TFTP client, octet mode (RFC 1350) with RFC 2348 `blksize`
 option negotiation.  Both `GET` (download) and `PUT` (upload)
-are supported in v0.6.
+are supported in v0.7.
 
 ## Usage
 
@@ -20,10 +20,12 @@ TFTP /?
 |              | side supports directory prefix per "Output paths"  |
 |              | in HOWTO.TXT.                                      |
 | `-o name`    | Override the OTHER side's name: local output for   |
-|              | GET, remote name on the server for PUT.  When PUT  |
-|              | is given without `-o`, the wire-side name is the   |
-|              | basename of the local path -- a `PUT C:\docs\a.txt`|
-|              | uploads as `a.txt`, not `C:\docs\a.txt`.           |
+|              | GET, remote name on the server for PUT.  Defaults  |
+|              | (no `-o`):                                         |
+|              |   GET: local = basename of the remote path         |
+|              |        (`GET pub/foo.bin` saves as `foo.bin`).     |
+|              |   PUT: wire = basename of the local path           |
+|              |        (`PUT C:\docs\a.txt` uploads as `a.txt`).   |
 | `-y`         | Overwrite local file without prompt (GET only)     |
 
 The RRQ asks for `blksize=1428` (Ethernet MTU minus the IP /
@@ -40,7 +42,7 @@ printing one `.` per buffer flush as a progress indicator.
 Download:
 
 ```
-RTL8019AS TFTP v0.6
+RTL8019AS TFTP v0.7
 
 GET IM2.TXT from 192.168.7.1
 .................................................
@@ -53,7 +55,7 @@ Upload (one dot per sent block):
 
 ```
 TFTP 192.168.7.1 PUT BOOT.BIN -o /tmp/boot.bin
-RTL8019AS TFTP v0.6
+RTL8019AS TFTP v0.7
 
 PUT BOOT.BIN to 192.168.7.1
 .....

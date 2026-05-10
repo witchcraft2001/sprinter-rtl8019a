@@ -1130,11 +1130,19 @@ TOLOWER
 
 ; ------------------------------------------------------
 ; DERIVE_OUTPUT: pick output filename from PATH_BUF
-; (basename after last '/').  Stub for stage 1: use
-; "OUTPUT.BIN" placeholder.
+; (basename after last '/').  PATH_BUF is "/..." (always
+; starts with '/') or empty.  When the basename comes out
+; empty (path is "/" or ends with '/') fall back to
+; OUTPUT.BIN.
 ; ------------------------------------------------------
 DERIVE_OUTPUT
+	LD	HL,PATH_BUF
+	CALL	@FILE.BASENAME
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.OK
 	LD	HL,DEFAULT_OUTPUT
+.OK
 	LD	(OUTPUT_PTR),HL
 	RET
 
@@ -1476,7 +1484,7 @@ HDR_LINE_BUF	EQU WGET_BUF_LEN + 2		; HDR_LINE_BUF_SIZE bytes
 REDIRECT_URL_BUF EQU HDR_LINE_BUF + HDR_LINE_BUF_SIZE	; REDIRECT_URL_BUF_SIZE bytes
 
 
-MSG_BANNER	DB "RTL8019AS WGET v0.2.1",0
+MSG_BANNER	DB "RTL8019AS WGET v0.2.2",0
 MSG_RESOLVED_PRE DB "Resolved ",0
 MSG_TO		DB " -> ",0
 MSG_PORT	DB " port ",0

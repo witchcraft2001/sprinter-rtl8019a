@@ -38,7 +38,7 @@ WGET /?
 Direct download:
 
 ```
-RTL8019AS WGET v0.2.1
+RTL8019AS WGET v0.2.2
 Resolved tr-dos.ru -> 188.127.239.141 port 80
 Connecting to 188.127.239.141 port 80...ESTABLISHED.
 .....
@@ -51,7 +51,7 @@ Following a redirect (`http://`->`http://`):
 
 ```
 WGET http://192.168.7.1:8080/redir-abs
-RTL8019AS WGET v0.2.1
+RTL8019AS WGET v0.2.2
 Resolved 192.168.7.1 -> 192.168.7.1 port 8080
 Connecting to 192.168.7.1 port 8080...ESTABLISHED.
 Redirect: HTTP/1.0 302 Found

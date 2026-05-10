@@ -190,10 +190,17 @@ START
 	; GET: wire is positional 2 -- copy into FILENAME_BUF.
 	LD	HL,(LOCAL_NAME_PTR)
 	CALL	COPY_TO_FILENAME_BUF
-	; LOCAL stays at LOCAL_NAME_PTR if no override; -o swaps it.
 	LD	A,(HAS_OVERRIDE)
 	OR	A
-	JR	Z,.NAMES_OK
+	JR	NZ,.GET_USE_OVR
+	; GET no -o: LOCAL = basename(positional 2) so that
+	; e.g. `tftp host GET pub/foo.zip` saves as foo.zip in
+	; CWD instead of trying to CHDIR pub\ locally.
+	LD	HL,(LOCAL_NAME_PTR)
+	CALL	@FILE.BASENAME
+	LD	(LOCAL_NAME_PTR),HL
+	JR	.NAMES_OK
+.GET_USE_OVR
 	LD	HL,(OVERRIDE_PTR)
 	LD	(LOCAL_NAME_PTR),HL
 	JR	.NAMES_OK
@@ -1637,7 +1644,7 @@ SAW_TFTP_ERR	 EQU ACK_BLOCK + 2		; 1 byte (1 if we got an OP_ERROR)
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS TFTP v0.6",0
+MSG_BANNER	DB "RTL8019AS TFTP v0.7",0
 MSG_GET_HDR	DB "GET ",0
 MSG_PUT_HDR	DB "PUT ",0
 MSG_FROM_HOST	DB " from ",0

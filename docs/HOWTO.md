@@ -69,7 +69,10 @@ inline resolver in the other utilities uses the same library.
 ## Output paths (`-o`)
 
 Utilities that download (`WGET`, `FTP`, `TFTP`) accept an output
-filename that may include a directory part:
+filename that may include a directory part.  The default
+(when `-o` is omitted) is the *basename* of the source --
+`WGET http://host/pub/foo.zip` saves as `foo.zip`, `FTP host
+pub/foo.zip` saves as `foo.zip`.  Override with `-o`:
 
 | Form                           | Effect                          |
 |--------------------------------|---------------------------------|
@@ -214,7 +217,7 @@ in this release:
 | Utility   | Banner     |
 |-----------|------------|
 | ARP       | v0.2       |
-| FTP       | v0.4       |
+| FTP       | v0.5       |
 | IFUP      | v0.2       |
 | ISAPROBE  | v0.1       |
 | NETCFG    | v0.1       |
@@ -226,9 +229,9 @@ in this release:
 | NSLOOKUP  | v0.1       |
 | NTP       | v0.3       |
 | PING      | v0.2       |
-| TFTP      | v0.6       |
+| TFTP      | v0.7       |
 | UDPTEST   | v0.2       |
-| WGET      | v0.2.1     |
+| WGET      | v0.2.2     |
 
 Major behavioural changes bump the second digit; the first digit
 moves to `v1.0` after a real-hardware bring-up pass on the

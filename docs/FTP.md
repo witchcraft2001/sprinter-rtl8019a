@@ -32,6 +32,10 @@ FTP /?
 | `-p pass`    | FTP password (default `anonymous@`; empty when     |
 |              | `-u` is given without `-p`)                        |
 | `-o name`    | GET: alternate local output filename (path-aware). |
+|              | Without `-o`, the local file is the basename of    |
+|              | the remote path -- `FTP host pub/foo.zip` saves    |
+|              | as `foo.zip`, not into a non-existent local        |
+|              | `pub\` directory.                                  |
 |              | PUT: alternate name on the server (overrides STOR  |
 |              | argument).  Without `-o` the STOR argument is the  |
 |              | basename of the local path -- `PUT C:\docs\a.txt`  |
@@ -55,7 +59,7 @@ Download:
 
 ```
 FTP 192.168.7.1 IM2.TXT -y
-RTL8019AS FTP v0.4
+RTL8019AS FTP v0.5
 Resolved 192.168.7.1 -> 192.168.7.1
 Connecting...ok.
 220 pyftpdlib 2.2.0 ready.
@@ -78,7 +82,7 @@ Upload (`PUT`):
 
 ```
 FTP 192.168.7.1 PUT BOOT.BIN -u alice -p secret
-RTL8019AS FTP v0.4
+RTL8019AS FTP v0.5
 ...
 227 Entering passive mode (192,168,7,1,226,99).
 Opening data connection...
@@ -95,7 +99,7 @@ Verbose listing (`-l`):
 
 ```
 FTP 192.168.7.1 -l -u alice -p secret
-RTL8019AS FTP v0.4
+RTL8019AS FTP v0.5
 ...
 227 Entering passive mode (192,168,7,1,226,68).
 Opening data connection...
@@ -113,7 +117,7 @@ Terse listing (`-n`, NLST -- just filenames):
 
 ```
 FTP 192.168.7.1 -n
-RTL8019AS FTP v0.4
+RTL8019AS FTP v0.5
 ...
 fformat.txt
 2k.bin
