@@ -116,6 +116,39 @@ START
 	CALL	@CMDL.IS_HELP
 	JP	NC,SHOW_HELP
 
+	; --- Parse flags FIRST so their value tokens are marked
+	; consumed before GET_POSITIONAL runs.  Otherwise
+	;   TFTP host -o name PUT file
+	; would have positional 1 = "name" (the unconsumed -o
+	; value) instead of "PUT".
+
+	; -o name : optional override for the OTHER side of the
+	; transfer.  GET: alternate local output filename.  PUT:
+	; alternate name on the server.
+	LD	A,'o'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_OVERRIDE
+	LD	(OVERRIDE_PTR),HL
+	LD	A,1
+	LD	(HAS_OVERRIDE),A
+	JR	.OVERRIDE_OK
+.NO_OVERRIDE
+	XOR	A
+	LD	(HAS_OVERRIDE),A
+.OVERRIDE_OK
+
+	; -y / --yes: force overwrite without prompt (GET only).
+	XOR	A
+	LD	(FORCE_FLAG),A
+	LD	A,'y'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_FORCE
+	LD	A,1
+	LD	(FORCE_FLAG),A
+.NO_FORCE
+
+	; --- Now positionals (flag values are already consumed).
+
 	; positional 0: host (IPv4 literal or hostname)
 	LD	B,0
 	CALL	@CMDL.GET_POSITIONAL
@@ -145,21 +178,6 @@ START
 	JP	C,USAGE_ERROR
 	LD	(LOCAL_NAME_PTR),HL
 
-	; -o name : optional override for the OTHER side of the
-	; transfer.  GET: alternate local output filename.  PUT:
-	; alternate name on the server.
-	LD	A,'o'
-	CALL	@CMDL.GET_FLAG_VALUE
-	JR	C,.NO_OVERRIDE
-	LD	(OVERRIDE_PTR),HL
-	LD	A,1
-	LD	(HAS_OVERRIDE),A
-	JR	.OVERRIDE_OK
-.NO_OVERRIDE
-	XOR	A
-	LD	(HAS_OVERRIDE),A
-.OVERRIDE_OK
-
 	; Resolve which name goes on the wire (RRQ/WRQ) and which
 	; one is the local file path.
 	;   GET: wire = positional 2; local = -o (if any) else
@@ -187,20 +205,15 @@ START
 	LD	HL,(OVERRIDE_PTR)
 	JR	.PUT_COPY
 .PUT_NO_OV
+	; PUT without -o: send only the basename of the local
+	; path on the wire.  The server has no concept of DSS
+	; paths and would otherwise create a file literally
+	; called "C:\docs\foo.bin".
 	LD	HL,(LOCAL_NAME_PTR)
+	CALL	@FILE.BASENAME
 .PUT_COPY
 	CALL	COPY_TO_FILENAME_BUF
 .NAMES_OK
-
-	; -y / --yes: force overwrite without prompt (GET only).
-	XOR	A
-	LD	(FORCE_FLAG),A
-	LD	A,'y'
-	CALL	@CMDL.HAS_FLAG
-	JR	C,.NO_FORCE
-	LD	A,1
-	LD	(FORCE_FLAG),A
-.NO_FORCE
 
 	; Pull NET_IP / NET_MAC from env (populated by NETCFG -i).
 	LD	HL,N_NET_IP
@@ -1624,7 +1637,7 @@ SAW_TFTP_ERR	 EQU ACK_BLOCK + 2		; 1 byte (1 if we got an OP_ERROR)
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS TFTP v0.5",0
+MSG_BANNER	DB "RTL8019AS TFTP v0.6",0
 MSG_GET_HDR	DB "GET ",0
 MSG_PUT_HDR	DB "PUT ",0
 MSG_FROM_HOST	DB " from ",0

@@ -81,21 +81,14 @@ START
 	CALL	@CMDL.IS_HELP
 	JP	NC,SHOW_HELP
 
-	; positional 0: host
-	LD	B,0
-	CALL	@CMDL.GET_POSITIONAL
-	JP	C,USAGE_ERROR
-	LD	A,(HL)
-	OR	A
-	JP	Z,USAGE_ERROR
-	LD	(HOST_PTR),HL
+	; --- Parse all flags FIRST so that GET_FLAG_VALUE consumes
+	; their value tokens.  Otherwise something like
+	;   FTP host -u alice -p secret PUT file.bin
+	; would have GET_POSITIONAL B=1 return "alice" (the value
+	; of -u, still unconsumed at that point) and we'd treat it
+	; as the filename / verb.
 
 	; -l / -n: directory-listing mode (no file download).
-	;   -l -> LIST  (verbose, "ls -l" style with metadata)
-	;   -n -> NLST  (terse, just names; useful for scripting)
-	; Either flag implies LIST_MODE; -n additionally sets
-	; NLST_MODE to swap the wire command.  Detect both first
-	; so the filename positional can be optional in either.
 	XOR	A
 	LD	(LIST_MODE),A
 	LD	(NLST_MODE),A
@@ -113,65 +106,15 @@ START
 	LD	(NLST_MODE),A
 .NO_NFLAG
 
-	; positional 1: filename, "PUT" verb, or (in list mode) the
-	; directory path -- the latter is optional.
+	; -y / --yes: force overwrite without prompt.
 	XOR	A
-	LD	(PUT_MODE),A
-	LD	B,1
-	CALL	@CMDL.GET_POSITIONAL
-	JR	NC,.HAVE_POS1
-	; No positional: only valid in listing modes.
-	LD	A,(LIST_MODE)
-	OR	A
-	JP	Z,USAGE_ERROR
-	LD	HL,EMPTY_STR
-	LD	(FILENAME_PTR),HL
-	XOR	A
-	LD	(FILENAME_LEN),A
-	JR	.OUT_OK
-.HAVE_POS1
-	; Is positional 1 the keyword "PUT"?  If so the caller
-	; wants an upload; the filename is positional 2.
-	CALL	IS_PUT_KW
-	JR	NZ,.NOT_PUT
-	; PUT + listing flags don't combine.
-	LD	A,(LIST_MODE)
-	OR	A
-	JP	NZ,USAGE_ERROR
+	LD	(FORCE_FLAG),A
+	LD	A,'y'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_FORCE
 	LD	A,1
-	LD	(PUT_MODE),A
-	LD	B,2
-	CALL	@CMDL.GET_POSITIONAL
-	JP	C,USAGE_ERROR
-.NOT_PUT
-	LD	A,(HL)
-	OR	A
-	JP	Z,USAGE_ERROR
-	; By default both the wire name (RETR/STOR/LIST/NLST arg)
-	; and the local name (file we open) start out as the same
-	; positional argument; -o flips one of them depending on
-	; mode.
-	LD	(FILENAME_PTR),HL
-	LD	(OUTPUT_PTR),HL
-	CALL	STRLEN_FROM_HL
-	LD	(FILENAME_LEN),A
-
-	; -o flag.  GET: alternate local output filename.  PUT:
-	; alternate name on the server (overrides STOR argument).
-	; Listing modes ignore -o.
-	LD	A,'o'
-	CALL	@CMDL.GET_FLAG_VALUE
-	JR	C,.OUT_OK
-	LD	A,(PUT_MODE)
-	OR	A
-	JR	NZ,.OVR_WIRE
-	LD	(OUTPUT_PTR),HL
-	JR	.OUT_OK
-.OVR_WIRE
-	LD	(FILENAME_PTR),HL
-	CALL	STRLEN_FROM_HL
-	LD	(FILENAME_LEN),A
-.OUT_OK
+	LD	(FORCE_FLAG),A
+.NO_FORCE
 
 	; -u user (optional, default = anonymous)
 	XOR	A
@@ -219,15 +162,101 @@ START
 	LD	(PASS_LEN),A
 .PASS_OK
 
-	; -y / --yes: force overwrite without prompt.
+	; -o name (optional).  Stored for application after we
+	; have determined GET vs PUT (the same flag flips the
+	; local- or wire-side name depending on the mode).
 	XOR	A
-	LD	(FORCE_FLAG),A
-	LD	A,'y'
-	CALL	@CMDL.HAS_FLAG
-	JR	C,.NO_FORCE
+	LD	(HAS_OVR_O),A
+	LD	A,'o'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JR	C,.NO_O
+	LD	(OVR_O_PTR),HL
 	LD	A,1
-	LD	(FORCE_FLAG),A
-.NO_FORCE
+	LD	(HAS_OVR_O),A
+.NO_O
+
+	; --- Now positionals.  Flag values are already marked
+	; consumed, so GET_POSITIONAL skips over them.
+
+	; positional 0: host.
+	LD	B,0
+	CALL	@CMDL.GET_POSITIONAL
+	JP	C,USAGE_ERROR
+	LD	A,(HL)
+	OR	A
+	JP	Z,USAGE_ERROR
+	LD	(HOST_PTR),HL
+
+	; positional 1: filename, "PUT" verb, or (in list mode) the
+	; directory path -- the latter is optional.
+	XOR	A
+	LD	(PUT_MODE),A
+	LD	B,1
+	CALL	@CMDL.GET_POSITIONAL
+	JR	NC,.HAVE_POS1
+	; No positional: only valid in listing modes.
+	LD	A,(LIST_MODE)
+	OR	A
+	JP	Z,USAGE_ERROR
+	LD	HL,EMPTY_STR
+	LD	(FILENAME_PTR),HL
+	XOR	A
+	LD	(FILENAME_LEN),A
+	JR	.NAME_OK
+.HAVE_POS1
+	; Is positional 1 the keyword "PUT"?  If so the caller
+	; wants an upload; the filename is positional 2.
+	CALL	IS_PUT_KW
+	JR	NZ,.NOT_PUT
+	; PUT + listing flags don't combine.
+	LD	A,(LIST_MODE)
+	OR	A
+	JP	NZ,USAGE_ERROR
+	LD	A,1
+	LD	(PUT_MODE),A
+	LD	B,2
+	CALL	@CMDL.GET_POSITIONAL
+	JP	C,USAGE_ERROR
+.NOT_PUT
+	LD	A,(HL)
+	OR	A
+	JP	Z,USAGE_ERROR
+	; Local-side path stays as typed; the wire-side default
+	; depends on mode.  PUT: send only the basename (the
+	; server has no concept of our DSS path).  GET / LIST:
+	; pass the server-side path verbatim (sub-directories on
+	; the server are perfectly valid).  -o overrides whichever
+	; side is mode-relevant just below.
+	LD	(OUTPUT_PTR),HL
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	Z,.WIRE_FULL
+	CALL	@FILE.BASENAME
+.WIRE_FULL
+	LD	(FILENAME_PTR),HL
+	CALL	STRLEN_FROM_HL
+	LD	(FILENAME_LEN),A
+.NAME_OK
+
+	; Apply -o (already parsed and stored above).
+	; Listing modes ignore it.
+	LD	A,(HAS_OVR_O)
+	OR	A
+	JR	Z,.OVR_DONE
+	LD	A,(LIST_MODE)
+	OR	A
+	JR	NZ,.OVR_DONE
+	LD	HL,(OVR_O_PTR)
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.OVR_WIRE
+	LD	(OUTPUT_PTR),HL
+	JR	.OVR_DONE
+.OVR_WIRE
+	LD	(FILENAME_PTR),HL
+	CALL	STRLEN_FROM_HL
+	LD	(FILENAME_LEN),A
+.OVR_DONE
 
 	; Pull NET_IP / NET_MAC.
 	LD	HL,N_NET_IP
@@ -952,7 +981,14 @@ SEND_CMD_ARG
 	LD	C,A
 	LD	B,0
 	LDIR				; copy arg
+	JR	.CRLF
 .NOARG
+	; Empty arg: drop the verb's trailing space so we send a
+	; bare "LIST\r\n" / "NLST\r\n".  pyftpdlib 2.2.0 does not
+	; trim the trailing whitespace and otherwise treats it as
+	; a path " " that does not exist (550).
+	DEC	DE
+.CRLF
 	LD	A,13
 	LD	(DE),A
 	INC	DE
@@ -1712,13 +1748,15 @@ PASS_LEN	EQU PASS_PTR + 2		; 1
 LIST_MODE	EQU PASS_LEN + 1		; 1 (1 if -l or -n was given)
 NLST_MODE	EQU LIST_MODE + 1		; 1 (1 if -n was given)
 PUT_MODE	EQU NLST_MODE + 1		; 1 (1 if "PUT" verb was given)
+HAS_OVR_O	EQU PUT_MODE + 1		; 1 (1 if -o was given)
+OVR_O_PTR	EQU HAS_OVR_O + 1		; 2 (-> argv when HAS_OVR_O=1)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
 FTP_PUT_CHUNK	  EQU 536		; one TCP MSS per STOR send
 
 
-MSG_BANNER	DB "RTL8019AS FTP v0.3",0
+MSG_BANNER	DB "RTL8019AS FTP v0.4",0
 MSG_RESOLVED	DB "Resolved ",0
 MSG_TO		DB " -> ",0
 MSG_CONNECTING	DB "Connecting...",0

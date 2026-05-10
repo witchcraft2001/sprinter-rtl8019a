@@ -262,6 +262,43 @@ RESTORE_CWD
 	RET
 
 
+; ------------------------------------------------------
+; BASENAME: HL = ASCIIZ path. Skip past the last '/', '\'
+; or ':' (DSS drive separator).  Returns HL pointing at
+; the basename portion (or unchanged if no separator).
+; Preserves AF, BC, DE.
+; ------------------------------------------------------
+BASENAME
+	PUSH	AF
+	PUSH	BC
+	PUSH	DE
+	LD	D,H
+	LD	E,L			; DE = best-so-far basename ptr
+.SCAN
+	LD	A,(HL)
+	OR	A
+	JR	Z,.DONE
+	CP	'/'
+	JR	Z,.SEP
+	CP	0x5C
+	JR	Z,.SEP
+	CP	':'
+	JR	Z,.SEP
+	INC	HL
+	JR	.SCAN
+.SEP
+	INC	HL
+	LD	D,H
+	LD	E,L
+	JR	.SCAN
+.DONE
+	EX	DE,HL
+	POP	DE
+	POP	BC
+	POP	AF
+	RET
+
+
 FULL_PTR	DW 0
 NAME_PTR	DW 0
 FORCE_FLAG_BS	DB 0
