@@ -55,6 +55,13 @@
 ; Timeouts in arbitrary inner-loop units, calibrated empirically.
 RTL_RESET_LOOPS		EQU 8000		; ~ ISR.RST poll budget
 RTL_RDC_LOOPS		EQU 4000		; remote DMA complete budget
+RTL_PROBE_TRIES		EQU 3			; presence-probe attempts (cold HW)
+RTL_PROBE_SETTLE	EQU 64			; DJNZ count: ISA settle before read-back
+; Remote-DMA data-port settle (DJNZ count).  Inserted on remote-DMA startup
+; and around each data-port byte.  A 2026-06-01 hardware test with SETTLE=100
+; showed the data port still returns 0xFF on the FIRST byte, so the failure is
+; NOT FIFO-readiness/timing -- left at 0 (no delay).  Kept as a tunable knob.
+RTL_DMA_SETTLE		EQU 0
 
 	MODULE RTL
 
@@ -406,6 +413,25 @@ N_RTL_HW	DB "NET_RTL_HW",0
 ; Trashes A, BC, DE, HL.  IX preserved.
 ; ------------------------------------------------------
 PROBE_AT_IX
+	; Retry the R/W test a few times.  On a cold real RTL8019AS the
+	; very first ISA accesses can return stale/floating data (and a
+	; read-back issued immediately after a write may sample before
+	; the bus settles), so a single pass produced false "absent"
+	; results on hardware while MAME -- which makes registers R/W
+	; instantly -- always passed.  Each pass inserts a short
+	; settling delay before the read-back; a single good pass is
+	; enough to declare the chip present.  See followup: cold probe.
+	LD	B,RTL_PROBE_TRIES
+.ATTEMPT
+	PUSH	BC
+	CALL	.ONE_PASS
+	POP	BC
+	RET	NC			; chip responded
+	DJNZ	.ATTEMPT
+	SCF				; all attempts failed -> absent
+	RET
+
+.ONE_PASS
 	PUSH	IX
 	POP	HL			; HL = base
 	; CR (offset 0x00).
@@ -418,8 +444,9 @@ PROBE_AT_IX
 	; TPSR (offset 0x04).
 	INC	HL
 	LD	(HL),0x55
-	; Read BNRY back.
+	; Read BNRY back (after a settling delay).
 	DEC	HL
+	CALL	.SETTLE
 	LD	A,(HL)
 	CP	0xAA
 	JR	NZ,.MISS
@@ -428,6 +455,7 @@ PROBE_AT_IX
 	INC	HL
 	LD	(HL),0xAA
 	DEC	HL
+	CALL	.SETTLE
 	LD	A,(HL)
 	POP	HL
 	CP	0x55
@@ -438,6 +466,16 @@ PROBE_AT_IX
 	POP	HL
 .MISS_NOPOP
 	SCF
+	RET
+
+; Short ISA-settling busy-wait.  No DSS calls -- safe with the ISA
+; window open.  Preserves every register the probe relies on.
+.SETTLE
+	PUSH	BC
+	LD	B,RTL_PROBE_SETTLE
+.SD
+	DJNZ	.SD
+	POP	BC
 	RET
 
 ; ------------------------------------------------------
@@ -580,7 +618,9 @@ DMA_READ
 	LD	(IX+RTL_RSAR0_OFF),E
 	LD	(IX+RTL_RSAR1_OFF),D
 	LD	(IX+RTL_CR_OFF),CR_DMA_READ
+	CALL	DMA_SETTLE		; let the chip prefetch the first FIFO byte
 .LOOP
+	CALL	DMA_SETTLE		; let the FIFO present the next byte
 	LD	A,(IX+RTL_DATA_OFF)
 	LD	(HL),A
 	INC	HL
@@ -601,6 +641,7 @@ DMA_READ
 	RET
 .OK
 	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT	; leave a clean, non-DMA state
 	OR	A
 	RET
 
@@ -628,9 +669,11 @@ DMA_WRITE
 	LD	(IX+RTL_RSAR0_OFF),E
 	LD	(IX+RTL_RSAR1_OFF),D
 	LD	(IX+RTL_CR_OFF),CR_DMA_WRITE
+	CALL	DMA_SETTLE		; let the chip arm the remote-write FIFO
 .LOOP
 	LD	A,(HL)
 	LD	(IX+RTL_DATA_OFF),A
+	CALL	DMA_SETTLE		; let the FIFO drain to packet RAM
 	INC	HL
 	DEC	BC
 	LD	A,B
@@ -649,7 +692,27 @@ DMA_WRITE
 	RET
 .OK
 	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT	; leave a clean, non-DMA state
 	OR	A
+	RET
+
+
+; ------------------------------------------------------
+; DMA_SETTLE: short busy-wait giving the chip's remote-DMA FIFO
+; time to present (read) or accept (write) a byte.  No DSS calls,
+; no chip access -- safe with the ISA window open.  Preserves all
+; registers the DMA loops rely on (A, BC, DE, HL, IX).
+; ------------------------------------------------------
+DMA_SETTLE
+	IF RTL_DMA_SETTLE > 0
+	PUSH	AF
+	PUSH	BC
+	LD	B,RTL_DMA_SETTLE
+.SD
+	DJNZ	.SD
+	POP	BC
+	POP	AF
+	ENDIF
 	RET
 
 

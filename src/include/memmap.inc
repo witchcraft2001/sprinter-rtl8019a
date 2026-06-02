@@ -69,11 +69,19 @@ NETCFG_NTP		EQU 0xA21A	; 32 bytes
 NETCFG_TZ		EQU 0xA23A	; 1 byte
 NETCFG_DHCP_MODE	EQU 0xA23C	; 1 byte (1 if IP=DHCP, 0 otherwise)
 NETCFG_LOAD_FH		EQU 0xA23B	; 1 byte
-NETCFG_LOAD_BUF		EQU 0xA240	; 1024 bytes
-NETCFG_LOAD_BUF_SIZE	EQU 1024
-NETCFG_TMP_IP		EQU 0xA640	; 4 bytes (parser scratch)
-NETCFG_TMP_MAC		EQU 0xA644	; 6 bytes (parser scratch)
-NETCFG_OUR_RTL_HW	EQU 0xA64A	; 8 bytes ASCIIZ "S/#HHH" or empty
+; Parser scratch placed BEFORE the big file buffer so the buffer
+; can be enlarged without colliding.
+NETCFG_TMP_IP		EQU 0xA240	; 4 bytes (parser scratch)
+NETCFG_TMP_MAC		EQU 0xA244	; 6 bytes (parser scratch)
+NETCFG_OUR_RTL_HW	EQU 0xA24A	; 8 bytes ASCIIZ "S/#HHH" or empty
+NETCFG_PATH_BUF		EQU 0xA254	; 280 bytes: "<appdir>\NET.CFG",0 (APPINFO)
+; File read buffer: 2 KB so a fully-commented NET.CFG template
+; (the shipped sample is ~1.2 KB) is read whole, not truncated.
+; Truncation silently dropped trailing keys (DNS/TZ/NTP).  NETCFG.EXE
+; pulls no other big-buffer library, so 0xA380..0xAB80 is free here
+; and stays below APP_BSS_BASE (0xB000).
+NETCFG_LOAD_BUF		EQU 0xA380	; 2048 bytes
+NETCFG_LOAD_BUF_SIZE	EQU 2048
 
 ; dhcp_lib: parsed-field outputs.  Active only in IFUP.EXE.
 DHCP_XID		EQU 0xA800	; 4 bytes (transaction id, host order)

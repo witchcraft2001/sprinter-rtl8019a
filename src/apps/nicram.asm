@@ -61,10 +61,19 @@ START
 	LD	(STAGE_NO),A
 
 	; Iterate through TEST_SIZES (DW list ending with 0).
-	LD	IX,TEST_SIZES
+	; The walker pointer lives in memory, NOT a register: DMA_WRITE /
+	; DMA_READ clobber IX (LD IX,(RTL_BASE_PTR)), so an IX-based walker
+	; read a bogus size on the 2nd pass -> 0x55FF-byte DMA -> system RAM
+	; corruption / power-off.  Reload from TEST_PTR each iteration.
+	LD	HL,TEST_SIZES
+	LD	(TEST_PTR),HL
 .NEXT_TEST
-	LD	E,(IX+0)
-	LD	D,(IX+1)
+	LD	HL,(TEST_PTR)
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	INC	HL
+	LD	(TEST_PTR),HL		; advance past this entry now
 	LD	A,D
 	OR	E
 	JP	Z,ALL_OK		; 0 marks list end
@@ -123,8 +132,6 @@ START
 	CALL	CMP_PATTERN
 	JP	C,MISMATCH
 
-	INC	IX
-	INC	IX
 	JP	.NEXT_TEST
 
 ALL_OK
@@ -400,6 +407,7 @@ LINE_END	DB 13,10,0
 ; -------- in-EXE state (small fields kept in image) --------
 STAGE_NO	DB 0
 CUR_SIZE	DW 0
+TEST_PTR	DW 0
 MISS_ADDR	DW 0
 MISS_EXP	DB 0
 MISS_GOT	DB 0

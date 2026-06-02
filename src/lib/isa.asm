@@ -24,6 +24,11 @@
 ; Saves MMU page 3 in SAVE_MMU3 for ISA_CLOSE to restore.
 ; ------------------------------------------------------
 ISA_OPEN
+	DI				; MMU3 now maps ISA, not the system page the
+					; 50Hz ISR runs from -- an interrupt here would
+					; execute over the ISA window and corrupt the
+					; chip (incl. reset/data ports).  Match the
+					; espprobe pattern: keep IRQs off while open.
 	PUSH	AF,BC
 	LD	BC,PAGE3
 	IN	A,(C)
@@ -56,6 +61,7 @@ ISA_CLOSE
 	LD	A,(SAVE_MMU3)
 	OUT	(C),A
 	POP	BC,AF
+	EI				; system page restored -- safe to take IRQs again
 	RET
 
 SAVE_MMU3	DB 0

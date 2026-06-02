@@ -254,7 +254,29 @@ SHOW_HELP
 WAIT_FOR_DHCP
 .LP
 	CALL	@RTL.RING_HAS_PACKET
-	JP	NZ,.HAVE
+	JP	Z,.TICK			; ring empty: spend a tick, then retry
+	; A frame is waiting.  Drain exactly ONE per loop iteration,
+	; then fall through to .TICK so the timeout budget and the
+	; Esc/Ctrl+C poll are honoured on EVERY pass -- not just when
+	; the ring happens to be empty.  On a real LAN background
+	; broadcast traffic keeps the ring non-empty, so skipping the
+	; tick here would starve the timeout and hang forever.
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	JR	C,.TICK			; DMA error: BNRY may not advance -- still tick
+	LD	HL,RX_BUF
+	LD	DE,0
+	CALL	@DHCP.PARSE_REPLY
+	JR	C,.TICK
+	LD	A,(@DHCP.MSG_TYPE)
+	LD	HL,EXPECT_TYPE
+	CP	(HL)
+	JR	NZ,.TICK
+	OR	A
+	RET
+.TICK
 	CALL	TICK_AND_CHECK_KEY
 	JP	C,.TIMEOUT
 	LD	HL,(TIMEOUT_MS_LEFT)
@@ -263,23 +285,6 @@ WAIT_FOR_DHCP
 	LD	A,H
 	OR	L
 	JP	NZ,.LP
-	JP	.TIMEOUT
-.HAVE
-	LD	HL,RX_HDR
-	LD	DE,RX_BUF
-	LD	BC,RX_BUF_SIZE
-	CALL	@RTL.READ_PACKET
-	JR	C,.LP
-	LD	HL,RX_BUF
-	LD	DE,0
-	CALL	@DHCP.PARSE_REPLY
-	JP	C,.LP
-	LD	A,(@DHCP.MSG_TYPE)
-	LD	HL,EXPECT_TYPE
-	CP	(HL)
-	JP	NZ,.LP
-	OR	A
-	RET
 .TIMEOUT
 	SCF
 	RET
@@ -477,8 +482,8 @@ COPY_ASCIIZ
 ; TICK_AND_CHECK_KEY: ~1 ms wait + Esc/Ctrl+C poll.
 ; ------------------------------------------------------
 TICK_AND_CHECK_KEY
-	CALL	@UTIL.DELAY_1MS
-	CALL	@ISA.ISA_CLOSE
+	CALL	@ISA.ISA_CLOSE		; close window + EI BEFORE the delay so the
+	CALL	@UTIL.DELAY_1MS		; 50Hz system IRQ is serviced during the wait
 	LD	C,DSS_SCANKEY
 	RST	DSS
 	JR	Z,.NO_KEY

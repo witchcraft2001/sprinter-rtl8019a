@@ -48,6 +48,7 @@ DSS_FREEMEM			EQU	0x3E
 DSS_RESIZE_MEM		EQU 0x3F
 DSS_EXIT            EQU 0x41
 DSS_ENVIRON         EQU 0x46							; environment variables (PAGE 2 @ 0xE400)
+DSS_APPINFO         EQU 0x47							; B=subfn, HL=buf: 0=cmdline 1=app dir 2=full EXE path
 
 ; ENVIRON sub-functions (selected by B):
 ENV_INIT			EQU 0xFF							; reset env table

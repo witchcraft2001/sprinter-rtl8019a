@@ -600,11 +600,12 @@ MSG_SCAN_HDR	DB "Scan: ",0
 MSG_SCAN_INDENT	DB "      ",0
 MSG_SCAN_OK	DB "ok ",0
 MSG_SCAN_NO	DB "-- ",0
-MSG_E_SCAN	DB "[E04] no chip at default I/O base 0x300.",13,10
-		DB "      If the Scan line shows another base responding, the card",13,10
-		DB "      is jumpered there but the driver is currently hard-wired",13,10
-		DB "      to 0x300 -- rejumper the card or wait for RTL_IOBASE",13,10
-		DB "      override support.  Otherwise the card is missing.",0
+MSG_E_SCAN	DB "[E04] no RTL8019AS responded.",13,10
+		DB "      Scanned all 16 I/O bases (0x200..0x3E0) on both ISA",13,10
+		DB "      slots; none answered the presence probe.  Set NET_RTL_HW",13,10
+		DB "      to force a slot/base, or check the card seating, 5V and",13,10
+		DB "      ISA bus timing.  If IFUP/PING find the card moments later,",13,10
+		DB "      the cold presence probe is marginal -- retest and report.",0
 LINE_END	DB 13,10,0
 
 	ENDMODULE

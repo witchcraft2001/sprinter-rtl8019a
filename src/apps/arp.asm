@@ -214,8 +214,8 @@ USAGE_ERROR
 ;   Out: CF=0 normal; CF=1 cancelled (CANCELLED set).
 ; ------------------------------------------------------
 TICK_AND_CHECK_KEY
-	CALL	@UTIL.DELAY_1MS
-	CALL	@ISA.ISA_CLOSE
+	CALL	@ISA.ISA_CLOSE		; close window + EI BEFORE the delay so the
+	CALL	@UTIL.DELAY_1MS		; 50Hz system IRQ is serviced during the wait
 	LD	C,DSS_SCANKEY
 	RST	DSS
 	JR	Z,.NO_KEY
@@ -259,6 +259,7 @@ WAIT_FOR_ARP_REPLY
 .LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
+.TICK					; reached every pass: tick + key poll
 	CALL	TICK_AND_CHECK_KEY	; ~1 ms + Esc/Ctrl+C poll
 	JR	C,.TIMEOUT		; cancelled
 	LD	HL,(TIMEOUT_MS_LEFT)
@@ -273,27 +274,28 @@ WAIT_FOR_ARP_REPLY
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.LP			; DMA error, drop and continue
-	; Filter: ARP reply for TARGET_IP.
+	JR	C,.TICK			; DMA error: tick (BNRY may not advance)
+	; Filter: ARP reply for TARGET_IP.  Misses fall to .TICK so the
+	; timeout/cancel are honoured even under steady broadcast traffic.
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_ARP
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_ARP
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + 6)
 	OR	A
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + 7)
 	CP	ARP_OP_REPLY
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	HL,RX_BUF + 14 + 14
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPIP
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	INC	HL
 	INC	DE
 	DJNZ	.CMPIP

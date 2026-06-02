@@ -464,6 +464,48 @@ These constraints are non-negotiable until the spec is updated:
 - All waits (reset, RDC, TX complete, RX, ARP, UDP reply, TCP retransmit)
   must have explicit timeouts and emit diagnostic output on expiry.
 
+### ISA window discipline (mandatory)
+
+On Sprinter the RTL8019AS is reached by memory-mapping the ISA card into
+the `0xC000..0xFFFF` window (MMU page 3, port `0xE2`) via `ISA.ISA_OPEN`;
+`ISA.ISA_CLOSE` restores the normal page-3 mapping. This window overlaps
+the exact memory the Sprinter system/DSS uses — including where the ~50 Hz
+system interrupt handler runs and where DSS keeps its state (env at
+`0xE400`, etc.). The following rules are **non-negotiable**; they were
+learned the hard way during real-hardware bring-up (violating them produced
+`0xFF` reads on the remote-DMA data port, on-screen character corruption,
+minute-long hangs that ignored Esc, and spontaneous power-off):
+
+- **Interrupts MUST be disabled the whole time the ISA window is open.**
+  Bracket every open/work/close as `DI` → `ISA_OPEN` → chip access →
+  `ISA_CLOSE` → `EI`. If a system interrupt fires while the window is
+  mapped, the ISR executes *over the ISA card* instead of system RAM and
+  corrupts the chip state (stray writes can even hit the reset/data ports)
+  and/or system memory. `ISA.ISA_OPEN` therefore does `DI` as its first
+  act and `ISA.ISA_CLOSE` does `EI` as its last — do not defeat this.
+- **Keep the open period as SHORT as possible.** Open the window only for
+  the actual chip access (a register read/write, or one remote-DMA burst),
+  then close it again. Holding it open across long stretches starves the
+  system interrupt and destabilises the whole machine. In particular,
+  perform delays/waits/poll-pacing with the window **CLOSED** (interrupts
+  on) — e.g. `TICK_AND_CHECK_KEY` must `ISA_CLOSE` *before* its `DELAY`,
+  then reopen only to touch the chip. Never `DELAY` with the window open.
+- **NEVER call DSS or BIOS while the ISA window is open.** Any DSS/BIOS
+  service (screen print/`PCHARS`, `ENVIRON`/`SETENV`, file I/O, `SCANKEY`,
+  `APPINFO`, paged-memory/EMM calls, etc.) may remap MMU page 3, re-enable
+  interrupts, and/or touch page-3 RAM — all of which trash the open ISA
+  window and the chip data in it. Always `ISA_CLOSE` *before* the DSS/BIOS
+  call and `ISA_OPEN` *after*.
+- **Capture-then-print.** Read everything you need from the chip into plain
+  Z80 RAM with the window open (IRQs off, no DSS calls in between), then
+  `ISA_CLOSE` and only then format/print it. Do not interleave chip reads
+  with DSS prints (the reg dumps in NICINFO/NICRAM/ping that print while the
+  window is open are exactly this anti-pattern and read garbage on real HW).
+- **Driver primitives may assume the caller already opened the window**
+  (they run inside one DI/open/close bracket), but they must not call
+  DSS/BIOS themselves and must not leave the window open longer than the
+  single operation needs.
+
 ## Forbidden Practices
 
 - Do not import x86 packet drivers as binaries; they target a different CPU

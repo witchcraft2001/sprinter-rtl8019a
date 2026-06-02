@@ -63,7 +63,7 @@
 	ENDIF
 	ENDIF
 
-NETCFG_BUF_SIZE	EQU 1024
+NETCFG_BUF_SIZE	EQU 2048		; must match NETCFG_LOAD_BUF in memmap.inc
 
 	MODULE NETCFG
 
@@ -84,18 +84,24 @@ DHCP_MODE	EQU NETCFG_DHCP_MODE
 LOAD_FH		EQU NETCFG_LOAD_FH
 LOAD_BUF	EQU NETCFG_LOAD_BUF
 OUR_RTL_HW	EQU NETCFG_OUR_RTL_HW
+PATH_BUF	EQU NETCFG_PATH_BUF
 
 
 ; ------------------------------------------------------
-; LOAD: applies defaults, then reads NET.CFG from current
-; directory and overrides fields parsed from it.
+; LOAD: applies defaults, then reads NET.CFG and overrides
+; fields parsed from it.  NET.CFG is looked up in the
+; directory the running NETCFG.EXE lives in (via APPINFO),
+; so the tool works no matter what the current directory is
+; -- e.g. invoked through PATH from C:\ while it sits in
+; C:\TOOLS.  Falls back to the current directory if APPINFO
+; is unavailable on the host DSS build.
 ;   Out: CF=0 file present and read OK.
 ;        CF=1 file missing or read error (defaults remain).
 ; ------------------------------------------------------
 LOAD
 	CALL	APPLY_DEFAULTS
-	; Open NET.CFG read-only.
-	LD	HL,.FILENAME
+	; Build "<appdir>\NET.CFG" and open it read-only.
+	CALL	BUILD_CFG_PATH		; HL = path to open
 	LD	A,FM_READ
 	LD	C,DSS_OPEN_FILE
 	RST	DSS
@@ -130,6 +136,57 @@ LOAD
 	RET
 
 .FILENAME	DB "NET.CFG",0
+
+
+; ------------------------------------------------------
+; BUILD_CFG_PATH: compose the full NET.CFG path to open.
+; Queries the application directory via APPINFO (subfn 1)
+; and appends "NET.CFG".  If APPINFO is not supported or
+; returns an empty directory, falls back to the bare
+; "NET.CFG" (current-directory) name so older DSS builds
+; keep working.
+;   Out: HL = pointer to ASCIIZ path to open.
+;   Trashes A, BC, DE.
+; ------------------------------------------------------
+BUILD_CFG_PATH
+	; APPINFO subfn 1 -> application directory into PATH_BUF.
+	; ABI (DSS kernel API/AppInfo.asm): HL = result buffer.
+	LD	HL,PATH_BUF
+	LD	B,1
+	LD	C,DSS_APPINFO
+	RST	DSS
+	JR	C,.fallback		; not supported -> current dir
+	LD	HL,PATH_BUF
+	LD	A,(HL)
+	OR	A
+	JR	Z,.fallback		; empty dir -> current dir
+	; Walk to the ASCIIZ terminator.
+.scan
+	LD	A,(HL)
+	OR	A
+	JR	Z,.eos
+	INC	HL
+	JR	.scan
+.eos
+	; Ensure a trailing path separator before the file name.
+	DEC	HL
+	LD	A,(HL)
+	INC	HL
+	CP	'\'
+	JR	Z,.append
+	LD	(HL),'\'
+	INC	HL
+.append
+	; Copy "NET.CFG",0 (8 bytes) right after the directory.
+	EX	DE,HL			; DE = write cursor
+	LD	HL,LOAD.FILENAME
+	LD	BC,8
+	LDIR
+	LD	HL,PATH_BUF		; full path "<appdir>\NET.CFG"
+	RET
+.fallback
+	LD	HL,LOAD.FILENAME
+	RET
 
 
 ; ------------------------------------------------------

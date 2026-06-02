@@ -426,6 +426,7 @@ WAIT_FOR_ARP_REPLY
 .LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
+.TICK					; reached every pass: tick + key poll
 	CALL	TICK_AND_CHECK_KEY
 	JR	C,.TIMEOUT
 	LD	HL,(TIMEOUT_MS_LEFT)
@@ -440,26 +441,26 @@ WAIT_FOR_ARP_REPLY
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.LP
+	JR	C,.TICK			; DMA error: tick (BNRY may not advance)
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_ARP
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_ARP
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + 6)
 	OR	A
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + 7)
 	CP	ARP_OP_REPLY
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	HL,RX_BUF + 14 + 14
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPIP
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	INC	HL
 	INC	DE
 	DJNZ	.CMPIP
@@ -483,6 +484,7 @@ WAIT_FOR_NTP_REPLY
 .LP
 	CALL	@RTL.RING_HAS_PACKET
 	JP	NZ,.HAVE
+.TICK					; reached every pass: tick + key poll
 	CALL	TICK_AND_CHECK_KEY
 	JP	C,.TIMEOUT
 	LD	HL,(TIMEOUT_MS_LEFT)
@@ -497,19 +499,19 @@ WAIT_FOR_NTP_REPLY
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JP	C,.LP
+	JP	C,.TICK
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_IPV4
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_IPV4
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	LD	A,(RX_BUF + 14)
 	CP	0x45
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	LD	A,(RX_BUF + 14 + 9)
 	CP	IP_PROTO_UDP
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	; src IP must equal TARGET_IP
 	LD	HL,RX_BUF + 14 + 12
 	LD	DE,TARGET_IP
@@ -517,24 +519,24 @@ WAIT_FOR_NTP_REPLY
 .CMPSRC
 	LD	A,(DE)
 	CP	(HL)
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	INC	HL
 	INC	DE
 	DJNZ	.CMPSRC
 	; UDP src port = 123
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
 	CP	NTP_PORT_HI
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 1)
 	CP	NTP_PORT_LO
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	; UDP dst port = OUR_PORT
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 2)
 	CP	OUR_PORT_HI
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 3)
 	CP	OUR_PORT_LO
-	JP	NZ,.LP
+	JP	NZ,.TICK
 	; Capture stratum (NTP byte 1) + transmit timestamp seconds
 	; (NTP bytes 40..43).  NTP payload starts at frame + 14+20+8 = 42.
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN + 1)
@@ -554,8 +556,8 @@ WAIT_FOR_NTP_REPLY
 ; TICK_AND_CHECK_KEY: ~1 ms wait + Esc/Ctrl+C poll.
 ; ------------------------------------------------------
 TICK_AND_CHECK_KEY
-	CALL	@UTIL.DELAY_1MS
-	CALL	@ISA.ISA_CLOSE
+	CALL	@ISA.ISA_CLOSE		; close window + EI BEFORE the delay so the
+	CALL	@UTIL.DELAY_1MS		; 50Hz system IRQ is serviced during the wait
 	LD	C,DSS_SCANKEY
 	RST	DSS
 	JR	Z,.NO_KEY

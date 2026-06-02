@@ -252,6 +252,13 @@ START
 	LD	BC,6
 	LDIR
 
+	; DIAG: show the resolved next-hop MAC (confirms ARP really
+	; extracted the gateway/peer MAC, not a stale/zero value).
+	PRINT MSG_NEXTHOP
+	LD	HL,TARGET_MAC
+	CALL	@UTIL.PRINT_MAC
+	PRINT LINE_END
+
 	; Init counters and ICMP sequence.
 	XOR	A
 	LD	(SENT),A
@@ -323,7 +330,16 @@ PING_LOOP
 	LD	A,(CANCELLED)
 	OR	A
 	JR	NZ,PING_LOOP_END
-	PRINTLN MSG_TIMED_OUT
+	PRINT	MSG_TIMED_OUT		; "Request timed out."
+	PRINT	MSG_RX_PRE		; "  (rx="
+	LD	A,(RX_SEEN)
+	CALL	PRINT_DEC_A
+	PRINTLN	MSG_RX_POST		; " frames)"
+	; DIAG: dump chip state so we see, on a failing ping, whether the
+	; chip is alive, the RX ring is advancing (CURR vs BNRY) and whether
+	; OVW (ISR bit 4) fired.
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	PRINT_REG_DUMP
 
 .NEXT_SEQ
 	LD	HL,SEQ_LO
@@ -601,8 +617,8 @@ BUILD_ICMP_ECHO
 ;   Trashes A, BC, DE.
 ; ------------------------------------------------------
 TICK_AND_CHECK_KEY
-	CALL	@UTIL.DELAY_1MS
-	CALL	@ISA.ISA_CLOSE
+	CALL	@ISA.ISA_CLOSE		; close window + EI BEFORE the delay so the
+	CALL	@UTIL.DELAY_1MS		; 50Hz system IRQ is serviced during the wait
 	LD	C,DSS_SCANKEY
 	RST	DSS
 	JR	Z,.NO_KEY
@@ -645,6 +661,7 @@ WAIT_FOR_ARP_REPLY
 .LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
+.TICK					; reached every pass: tick + key poll
 	CALL	TICK_AND_CHECK_KEY	; ~1ms wait + ESC/Ctrl-C poll
 	JR	C,.TIMEOUT		; cancelled
 	LD	HL,(TIMEOUT_MS_LEFT)
@@ -659,27 +676,28 @@ WAIT_FOR_ARP_REPLY
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.LP			; DMA error, drop and continue
-	; Filter: ARP reply, sender_ip == TARGET_IP
+	JR	C,.TICK			; DMA error: tick (BNRY may not advance)
+	; Filter: ARP reply, sender_ip == TARGET_IP.  Misses fall to
+	; .TICK so timeout/cancel run even under steady broadcast.
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_ARP
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_ARP
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + 6)
 	OR	A
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + 7)
 	CP	ARP_OP_REPLY
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	HL,RX_BUF + 14 + 14
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPIP
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	INC	HL
 	INC	DE
 	DJNZ	.CMPIP
@@ -701,9 +719,12 @@ WAIT_FOR_ARP_REPLY
 ;   Out: CF=0 OK, CF=1 timeout.
 ; ------------------------------------------------------
 WAIT_FOR_ICMP_REPLY
+	XOR	A
+	LD	(RX_SEEN),A		; DIAG: count frames read this wait
 .LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
+.TICK					; reached every pass: tick + key poll
 	CALL	TICK_AND_CHECK_KEY
 	JR	C,.TIMEOUT
 	LD	HL,(TIMEOUT_MS_LEFT)
@@ -718,39 +739,43 @@ WAIT_FOR_ICMP_REPLY
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.LP
-	; Filter: IPv4 / ICMP / echo reply / matching id.
+	JR	C,.TICK			; DMA error: tick (BNRY may not advance)
+	LD	A,(RX_SEEN)		; DIAG: count every frame read
+	INC	A
+	LD	(RX_SEEN),A
+	; Filter: IPv4 / ICMP / echo reply / matching id.  Misses fall
+	; to .TICK so timeout/cancel run even under steady broadcast.
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_IPV4
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_IPV4
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14)
 	CP	0x45
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + 9)
 	CP	IP_PROTO_ICMP
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	HL,RX_BUF + 14 + 12
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPSRC
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	INC	HL
 	INC	DE
 	DJNZ	.CMPSRC
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
 	CP	ICMP_T_ECHO_REP
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
 	CP	ECHO_ID_HI
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
 	CP	ECHO_ID_LO
-	JR	NZ,.LP
+	JR	NZ,.TICK
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
 	LD	(REPLY_ID + 0),A
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
@@ -890,6 +915,7 @@ TTL_VAL		EQU APP_BSS_BASE + 37		; 1 byte (-i TTL, default 64)
 TIMEOUT_MS_VAL	EQU APP_BSS_BASE + 38		; 2 bytes (-w ms, default 1000)
 FOREVER		EQU APP_BSS_BASE + 40		; 1 byte (1 if -t set)
 TARGET_HOST_PTR	EQU APP_BSS_BASE + 41		; 2 bytes (-> argv token)
+RX_SEEN		EQU APP_BSS_BASE + 43		; 1 byte (diag: frames read per wait)
 
 
 ; ------- messages -------
@@ -901,6 +927,9 @@ MSG_REPLY_FROM	DB "Reply from ",0
 MSG_BYTES_EQ	DB ": bytes=",0
 MSG_TIME_TTL_PRE DB " time<1ms TTL=",0
 MSG_TIMED_OUT	DB "Request timed out.",0
+MSG_NEXTHOP	DB "Next-hop MAC=",0
+MSG_RX_PRE	DB "  (rx=",0
+MSG_RX_POST	DB " frames)",0
 MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
 MSG_STATS_HDR	DB "Ping statistics for ",0
 MSG_COLON	DB ":",0
