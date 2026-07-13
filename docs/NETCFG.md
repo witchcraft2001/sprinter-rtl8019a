@@ -15,7 +15,10 @@ NETCFG /?       help (-? -h also accepted)
 ```
 
 `NETCFG.EXE` is the only utility in the kit that opens `NET.CFG`.
-All other utilities read from environment variables only.
+All other utilities read from environment variables only. The file is
+resolved beside the running `NETCFG.EXE` through DSS `APPINFO`, not
+relative to the caller's current directory. `-i` and `-c` print
+`[C0] CFG=<resolved path>` before opening it.
 
 ## Exit codes
 

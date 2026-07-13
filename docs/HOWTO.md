@@ -95,6 +95,21 @@ intermediate directories.
 
 ## Configuration
 
+Before first network use on a physical card, run:
+
+```text
+NICINFO
+NICMODE
+```
+
+If both report `DUPLEX=FULL` while the switch/router port is left at its
+normal auto-negotiation setting, run `NICMODE HALF -y` once, then repeat
+`NICINFO`.  Legacy RTL8019AS does not negotiate duplex; a modern peer can
+parallel-detect 10 Mbit/s but must assume half-duplex.  Keep full-duplex only
+when the peer port is manually forced to 10 Mbit/s full-duplex.  See
+`NICMODE.TXT` for the EEPROM verification and recovery rules.
+
+
 The kit relies on DSS environment variables populated by
 `NETCFG -i` from `NET.CFG`:
 
@@ -215,28 +230,10 @@ FTP server.lan target.zip -u alice -p secret -y
 
 ## Versioning
 
-Per-utility version is printed in the banner.  Current versions
-in this release:
-
-| Utility   | Banner     |
-|-----------|------------|
-| ARP       | v0.2       |
-| FTP       | v0.6       |
-| IFUP      | v0.2       |
-| ISAPROBE  | v0.1       |
-| NETCFG    | v0.1       |
-| NICINFO   | v0.1       |
-| NICLB     | v0.1       |
-| NICRAM    | v0.1       |
-| NICRX     | v0.1       |
-| NICTX     | v0.1       |
-| NSLOOKUP  | v0.1       |
-| NTP       | v0.3       |
-| PING      | v0.2       |
-| TFTP      | v0.8       |
-| UDPTEST   | v0.2       |
-| WGET      | v0.2.3     |
-
-Major behavioural changes bump the second digit; the first digit
-moves to `v1.0` after a real-hardware bring-up pass on the
-physical RTL8019AS card.
+Every utility prints the same package version in its banner.  The
+current package version is `v0.2.16`: `0.2` identifies the common
+package/API feature line and the final `16` is the build/revision.
+Fix-only releases bump the third component.  A package-level API or
+feature-line change bumps the first or second component for every
+utility together.  The value is defined once in
+`src/include/version.inc` and must not be hardcoded per utility.

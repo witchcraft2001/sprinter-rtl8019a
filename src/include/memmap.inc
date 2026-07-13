@@ -37,6 +37,19 @@ UTIL_DEC32_SCRATCH	EQU 0xA004
 UTIL_TPUT_START		EQU 0xA008	; 3 bytes
 UTIL_TPUT_ELAPSED	EQU 0xA00B	; 3 bytes
 
+; Shared RX wait-loop drain counter (1 byte).  Wait loops in the
+; apps/libraries pull packets back-to-back while the ring is
+; non-empty, paying the slow per-tick delay+SCANKEY only when the
+; ring drains empty or this budget is spent.  Only one wait loop is
+; ever active at a time within an EXE, so a single shared byte is
+; safe.  Lives in the otherwise-unused tail of the util scratch gap.
+RX_DRAIN_LEFT		EQU 0xA00E	; 1 byte
+; Max packets pulled back-to-back before forcing a tick (key/timeout
+; poll).  Sized to drain the byte-mode RX ring (PSTOP-PSTART = 26
+; pages, so at most ~26 minimum-size frames) in one pass.  Bounds Esc
+; latency to ~budget x one DMA read.
+RX_DRAIN_BUDGET		EQU 32
+
 ; rtl8019.asm: 10-byte register snapshot scratch.
 RTL_REG_SNAPSHOT	EQU 0xA010
 
@@ -47,14 +60,41 @@ RTL_REG_SNAPSHOT	EQU 0xA010
 ; into IX on entry and access registers as (IX + RTL_xxx_OFF).
 RTL_BASE_PTR		EQU 0xA01A
 
+; rtl8019.asm: last transmit state, captured without DSS calls so
+; a caller can print it after closing the ISA window.
+RTL_TX_LAST_STAGE	EQU 0xA01C	; state/error code (see rtl8019.asm)
+RTL_TX_LAST_ISR		EQU 0xA01D	; raw ISR at completion/failure
+RTL_TX_LAST_TSR		EQU 0xA01E	; raw page-0 TSR
+RTL_TX_LAST_CR		EQU 0xA01F	; raw CR
+
 ; netenv_lib: 256-byte GETENV value buffer.
 NETENV_VAL_BUF		EQU 0xA020
 NETENV_VAL_BUF_SIZE	EQU 256
 
-; cmdline_lib: ARGC + ARGV[16] (32 bytes) + CONSUMED[16].
+; cmdline_lib: entry-time DSS command-line pointer + ARGC +
+; ARGV[16] (32 bytes) + CONSUMED[16].  DSS supplies the pointer
+; in IX; every argument-taking app stores it in CMDL_SOURCE_PTR
+; as its very first START instruction, before any CALL/RST DSS.
 CMDL_ARGC		EQU 0xA100
 CMDL_ARGV		EQU 0xA101
 CMDL_CONSUMED		EQU 0xA121
+CMDL_SOURCE_PTR		EQU 0xA131	; 2 bytes
+
+; rtl8019.asm: SEND_FRAME retry/read-back state.  Kept outside the
+; executable image (rather than local DW/DB storage in the driver).
+RTL_TX_SOURCE_PTR	EQU 0xA134	; 2 bytes, caller's frame buffer
+RTL_TX_LENGTH		EQU 0xA136	; 2 bytes
+RTL_TX_RETRY_LEFT	EQU 0xA138	; 1 byte
+RTL_TX_VERIFY_BUF	EQU 0xA140	; 42 bytes read back from NIC packet RAM
+RTL_TX_VERIFY_SIZE	EQU 42
+RTL_TX_LAST_CLDA	EQU 0xA16A	; 2 bytes, page-0 CLDA0/1 after TX
+RTL_RX_TO_TX_PENDING	EQU 0xA16C	; 1 byte, successful RX since last TX
+RTL_TX_CFG0_PRE	EQU 0xA16D	; page-3 CONFIG0 immediately before TXP
+RTL_TX_CFG3_PRE	EQU 0xA16E	; page-3 CONFIG3 immediately before TXP
+RTL_TX_CFG0_POST	EQU 0xA16F	; page-3 CONFIG0 after PTX/TXE
+RTL_TX_CFG3_POST	EQU 0xA170	; page-3 CONFIG3 after PTX/TXE
+RTL_TX_LAST_NCR	EQU 0xA171	; page-0 collision count for last TX
+RTL_TX_LAST_TPSR EQU 0xA172	; page-2 read-back of TX start page before TXP
 
 ; netcfg_lib: parsed-field outputs + 1024-byte file read
 ; buffer.  Active only in NETCFG.EXE -- no other utility
@@ -113,6 +153,7 @@ RESOLVE_DNS_MSG_LEN	EQU 0xA920	; 2 bytes
 RESOLVE_IP_TOTAL	EQU 0xA922	; 2 bytes
 RESOLVE_UDP_LEN		EQU 0xA924	; 2 bytes
 RESOLVE_DEST_PTR	EQU 0xA926	; 2 bytes (caller's output IP buffer)
+RESOLVE_ARP_RETRY_LEFT	EQU 0xA928	; 1 byte
 
 ; Maximum DNS query/reply Ethernet frame size.  Apps that
 ; pull resolve_lib must size their TX_BUF region to at

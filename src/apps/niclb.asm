@@ -1,17 +1,20 @@
 ; ======================================================
 ; NICLB.EXE - stage 3 of the Sprinter RTL8019AS network kit.
 ; Internal MAC loopback test (TCR=0x02, DCR.LS=0). Builds a
-; 60-byte broadcast Ethernet frame, transmits it, waits for
-; both ISR.PTX and ISR.PRX, then reads the looped frame back
-; from the RX ring and compares it byte-for-byte against the
-; original TX buffer.
+; 60-byte broadcast Ethernet frame and transmits it.  Patched
+; MAME stores the looped frame in RX SRAM, so that path reads
+; and compares it byte-for-byte.  A real RTL8019AS keeps a
+; loopback receive in the diagnostic FIFO instead and does not
+; set ISR.PRX (RTL8019AS datasheet section 6.6.2); that path
+; captures ISR/RSR/FIFO and treats ISR.RXE as the expected
+; receive-side observation after PTX.
 ;
-; Acceptance: PTX OK, PRX OK, RX header STS/LEN as expected,
-; body bytes match. Requires the patched MAME (dp8390.cpp:85)
-; that injects loopback TX into recv().
+; Acceptance: PTX plus either MAME RX-ring payload match, or
+; real-chip FIFO loopback status. External RX SRAM is tested
+; separately by NICRX.EXE.
 ; ======================================================
 
-EXE_VERSION		EQU 1
+EXE_VERSION		EQU 1		; DSS executable format version, not app version
 
 	DEVICE NOSLOT64K
 
@@ -24,9 +27,6 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_INIT_LOOPBACK
 	DEFINE USE_RTL_SEND_FRAME
 	DEFINE USE_RTL_WAIT_PTX
-
-; -- timeouts --
-PRX_LOOPS	EQU 8000
 
 ; -- frame layout in TX_BUF --
 FRAME_LEN	EQU 60			; min Ethernet frame, no FCS
@@ -60,17 +60,22 @@ START
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@RTL.INIT_BASE
 	JP	C,@UTIL.EXIT_NO_NIC
+	CALL	@ISA.ISA_CLOSE
 
 	; [L0] INIT
 	PRINT MSG_L0
+	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.RESET
-	JP	C,RESET_FAIL
+	JP	C,RESET_OPEN_FAIL
+	CALL	@ISA.ISA_CLOSE
 	PRINTLN MSG_OK
 
 	; [L1] CFG -- internal loopback configuration
 	PRINT MSG_L1
 	LD	HL,TEST_MAC
+	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.INIT_LOOPBACK
+	CALL	@ISA.ISA_CLOSE
 	PRINTLN MSG_OK
 
 	; [L2] FRAME -- build 60-byte broadcast frame in TX_BUF
@@ -87,25 +92,74 @@ START
 	PRINT MSG_L3
 	LD	HL,TX_BUF
 	LD	BC,FRAME_LEN
+	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.SEND_FRAME
-	JP	C,WRITE_FAIL
+	JP	C,WRITE_OPEN_FAIL
+	CALL	@ISA.ISA_CLOSE
 	PRINTLN MSG_OK
 
 	; [L4] PTX done by SEND_FRAME above, just confirm.
 	PRINTLN MSG_L4_OK
 
-	; [L5] PRX (loopback frame should already be in RX ring)
+	; [L5] Inspect the completed loopback receive.  Patched MAME sets
+	; PRX and writes RX SRAM.  Real RTL8019AS does not store loopback
+	; frames in SRAM; it exposes the tail in FIFO and, for this test
+	; shape, reports RXE after the already-confirmed PTX.
 	PRINT MSG_L5
-	CALL	WAIT_PRX
-	JP	C,PRX_FAIL
-	PRINTLN MSG_OK
+	CALL	@ISA.ISA_OPEN
+	LD	IX,(RTL_BASE_PTR)
+	LD	A,(IX+RTL_ISR_OFF)
+	LD	(LOOP_ISR),A
+	AND	ISR_PRX
+	JP	NZ,.LOOP_SRAM
+	LD	A,(IX+RTL_RSR_OFF)
+	LD	(LOOP_RSR),A
+	LD	HL,FIFO_BUF
+	LD	B,8
+.FIFO_READ
+	LD	A,(IX+RTL_FIFO_OFF)
+	LD	(HL),A
+	INC	HL
+	DJNZ	.FIFO_READ
+	LD	A,(LOOP_ISR)
+	AND	ISR_RXE
+	JP	Z,PRX_OPEN_FAIL
+	LD	(IX+RTL_ISR_OFF),ISR_RXE
+	CALL	@ISA.ISA_CLOSE
+	PRINT	MSG_FIFO_OK
+	LD	A,(LOOP_ISR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_RSR_EQ
+	LD	A,(LOOP_RSR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_FIFO_EQ
+	LD	HL,FIFO_BUF
+	LD	B,8
+.FIFO_PRINT
+	LD	A,(HL)
+	CALL	@UTIL.PRINT_HEX_A
+	INC	HL
+	DJNZ	.FIFO_PRINT
+	PRINT	LINE_END
+	PRINTLN MSG_L6_NA
+	PRINTLN MSG_L7_NA
+	PRINTLN MSG_L8_NA
+	PRINTLN MSG_RESULT_OK
+	DSS_RETURN EX_OK
+
+.LOOP_SRAM
+	LD	(IX+RTL_ISR_OFF),ISR_PRX
+	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_SRAM_OK
 
 	; [L6] RX HDR -- read 4-byte header from 0x4700 (initial CURR<<8)
 	LD	HL,RX_HDR
 	LD	BC,4
 	LD	DE,0x4700
+	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.DMA_READ
-	JP	C,READ_FAIL
+	JP	C,READ_OPEN_FAIL
+	CALL	@ISA.ISA_CLOSE
 
 	PRINT MSG_L6
 	PRINT MSG_STS_EQ
@@ -139,8 +193,10 @@ START
 	LD	HL,RX_BUF
 	LD	BC,FRAME_LEN
 	LD	DE,0x4704
+	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.DMA_READ
-	JP	C,READ_FAIL
+	JP	C,READ_OPEN_FAIL
+	CALL	@ISA.ISA_CLOSE
 	PRINTLN MSG_OK
 
 	; [L8] CMP body byte-for-byte vs TX_BUF
@@ -153,29 +209,43 @@ START
 	PRINTLN MSG_OK
 
 	PRINTLN MSG_RESULT_OK
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_OK
 
 ; ------- error exits -------
+RESET_OPEN_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 RESET_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_RESET
-	JP	FAIL_NIC
+	JP	FAIL_CAPTURED
+
+WRITE_OPEN_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 
 WRITE_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_WRITE
-	JP	FAIL_NIC
+	JP	FAIL_CAPTURED
+
+PRX_OPEN_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 
 PRX_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_PRX
-	JP	FAIL_NIC
+	JP	FAIL_CAPTURED
+
+READ_OPEN_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 
 READ_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_READ
-	JP	FAIL_NIC
+	JP	FAIL_CAPTURED
 
 STS_BAD
 	PRINT LINE_END
@@ -203,10 +273,12 @@ BODY_BAD
 	; fall through to FAIL_NIC
 
 FAIL_NIC
+	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
+FAIL_CAPTURED
 	CALL	PRINT_REG_DUMP
 	PRINTLN MSG_RESULT_FAIL
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NIC_ERR
 
 
@@ -260,29 +332,6 @@ BUILD_FRAME
 	RET
 
 
-; ------------------------------------------------------
-; WAIT_PRX: poll ISR.PRX. CF=0 OK, CF=1 timeout. Trashes A,BC.
-; ------------------------------------------------------
-WAIT_PRX
-	LD	BC,PRX_LOOPS
-.LP
-	LD	A,(RTL_ISR_A)
-	AND	ISR_PRX
-	JR	NZ,.OK
-	DEC	BC
-	LD	A,B
-	OR	C
-	JR	NZ,.LP
-	SCF
-	RET
-.OK
-	LD	A,ISR_PRX
-	LD	(RTL_ISR_A),A
-	OR	A
-	RET
-
-
-; ------------------------------------------------------
 ; CMP_BUF: compare BC bytes at (HL) vs (DE).
 ; Out: CF=0 match, CF=1 mismatch.
 ; Preserved on mismatch: HL=expected addr, DE=actual addr.
@@ -363,27 +412,34 @@ PAYLOAD_LEN	EQU $ - PAYLOAD
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS NICLB v0.1",0
+MSG_BANNER	DB "RTL8019AS NICLB v",PACKAGE_VERSION,0
 MSG_L0		DB "[L0] INIT ",0
 MSG_OK		DB "OK",0
-MSG_L1		DB "[L1] CFG (DCR=40 RCR=04 TCR=02 PSTART=46 PSTOP=80 BNRY=46 CURR=47) ",0
+MSG_L1		DB "[L1] CFG (DCR=40 RCR=04 TCR=02 PSTART=46 PSTOP=60 BNRY=46 CURR=47) ",0
 MSG_L2		DB "[L2] FRAME LEN=",0
 MSG_TYPE_EQ	DB " TYPE=",0
 MSG_L3		DB "[L3] WRITE TX ",0
 MSG_L4_OK	DB "[L4] PTX OK",0
-MSG_L5		DB "[L5] PRX ",0
+MSG_L5		DB "[L5] LOOP ",0
+MSG_SRAM_OK	DB "SRAM OK",0
+MSG_FIFO_OK	DB "FIFO OK ISR=",0
+MSG_RSR_EQ	DB " RSR=",0
+MSG_FIFO_EQ	DB " FIFO=",0
 MSG_L6		DB "[L6] RX HDR",0
 MSG_STS_EQ	DB " STS=",0
 MSG_NEXT_EQ	DB " NEXT=",0
 MSG_LEN_EQ	DB " LEN=",0
 MSG_L7		DB "[L7] READ RX ",0
 MSG_L8		DB "[L8] CMP ",0
+MSG_L6_NA	DB "[L6] RX SRAM N/A (real RTL8019AS loopback uses FIFO)",0
+MSG_L7_NA	DB "[L7] READ RX N/A",0
+MSG_L8_NA	DB "[L8] CMP N/A; run NICRX for external RX SRAM",0
 MSG_REGS	DB "REGS ",0
 MSG_RESULT_OK	DB "RESULT OK",0
 MSG_RESULT_FAIL	DB "RESULT FAIL",0
 MSG_E_RESET	DB "[E20] RESET timeout",0
 MSG_E_WRITE	DB "[E21] DMA write or PTX timeout",0
-MSG_E_PRX	DB "[E23] PRX timeout (loopback frame did not appear in RX ring)",0
+MSG_E_PRX	DB "[E23] loopback produced neither PRX nor RXE",0
 MSG_E_READ	DB "[E24] DMA read timeout",0
 MSG_E_STS	DB "[E25] RX status mismatch, got STS=",0
 MSG_E_LEN	DB "[E26] RX len mismatch, got LEN=",0
@@ -405,7 +461,10 @@ NICLB_IMAGE_END
 TX_BUF		EQU NICLB_IMAGE_END
 RX_HDR		EQU TX_BUF + FRAME_LEN
 RX_BUF		EQU RX_HDR + 4
-NICLB_BSS_END	EQU RX_BUF + FRAME_LEN
+FIFO_BUF	EQU RX_BUF + FRAME_LEN	; 8-byte real-chip diagnostic FIFO capture
+LOOP_ISR	EQU FIFO_BUF + 8
+LOOP_RSR	EQU LOOP_ISR + 1
+NICLB_BSS_END	EQU LOOP_RSR + 1
 
 	ENDMODULE
 

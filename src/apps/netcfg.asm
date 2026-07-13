@@ -18,7 +18,7 @@
 ; All other tools read NET_* env vars via netenv_lib.
 ; ======================================================
 
-EXE_VERSION	EQU 1
+EXE_VERSION	EQU 1			; DSS executable format version, not app version
 
 	DEVICE NOSLOT64K
 
@@ -51,10 +51,10 @@ EXE_HEADER
 	ORG 0x8100
 @STACK_TOP
 
-CMDLINE_BUF	EQU 0x8080		; DSS overwrites EXE header with cmd line
-					; after entry: byte 0 = length, then ASCIIZ.
-
 START
+	; DSS supplies [length,text...] through IX.  Capture it before
+	; PRINTLN (RST DSS) or any CALL can clobber IX.
+	LD	(CMDL_SOURCE_PTR),IX
 	PRINTLN MSG_BANNER
 
 	CALL	PARSE_FLAG
@@ -74,7 +74,9 @@ START
 
 
 ; ------------------------------------------------------
-; PARSE_FLAG: scan command line for first "-x" or "/x".
+; PARSE_FLAG: scan the length-prefixed command line whose entry-time
+; pointer was captured from IX.  Do not derive the PSP address from the
+; EXE entry point and do not fetch it after a DSS call: IX is volatile.
 ;   Out: A = lowercased flag char ('i','c','d','v','h')
 ;        A = '?' for help (any of /? -? /h -h)
 ;        A = 0  if no flag
@@ -84,11 +86,11 @@ START
 ; are ignored to keep the parser tiny.
 ; ------------------------------------------------------
 PARSE_FLAG
-	LD	HL,CMDLINE_BUF
+	LD	HL,(CMDL_SOURCE_PTR)
 	LD	A,(HL)
 	OR	A
-	RET	Z			; no args
-	LD	B,A			; B = remaining length
+	RET	Z
+	LD	B,A
 	INC	HL
 .SCAN
 	LD	A,B
@@ -312,6 +314,7 @@ COPY_ASCIIZ
 ; DO_CHECK: call NETCFG.LOAD; on failure exit 4.
 ; ------------------------------------------------------
 DO_CHECK
+	CALL	PRINT_CFG_PATH
 	CALL	@NETCFG.LOAD
 	JR	C,.MISS
 	PRINTLN MSG_CHECK_OK
@@ -328,6 +331,7 @@ DO_CHECK
 ; ------------------------------------------------------
 DO_INIT
 	PRINTLN MSG_INITIALIZING
+	CALL	PRINT_CFG_PATH
 	CALL	@NETCFG.LOAD
 	JP	C,.MISS
 	; If NET.CFG had no RTL_MAC= line (or it was empty), the MAC
@@ -405,6 +409,20 @@ DO_INIT
 	PRINTLN MSG_INIT_MISS
 	LD	B,4
 	JP	@UTIL.EXIT_FAIL
+
+
+; ------------------------------------------------------
+; PRINT_CFG_PATH: show the exact path NETCFG.LOAD will open.  This makes
+; APPINFO/path failures diagnosable on a real Sprinter without a debugger.
+; NETCFG.LOAD rebuilds the same path immediately afterwards.
+; ------------------------------------------------------
+PRINT_CFG_PATH
+	PRINT	MSG_CFG_PATH
+	CALL	@NETCFG.BUILD_CFG_PATH
+	LD	C,DSS_PCHARS
+	RST	DSS
+	PRINT	LINE_END
+	RET
 
 
 ; ------------------------------------------------------
@@ -785,13 +803,14 @@ USAGE_ERROR
 ; ------------------------------------------------------
 ; Static data
 ; ------------------------------------------------------
-MSG_BANNER	DB "RTL8019AS NETCFG v0.1",0
+MSG_BANNER	DB "RTL8019AS NETCFG v",PACKAGE_VERSION,0
 MSG_SHOW_HDR	DB "NET.CFG:",0
 MSG_INDENT	DB "  ",0
 MSG_COLON	DB " : ",0
 MSG_NOT_SET	DB "<not set>",0
 MSG_DELETING	DB "Deleting NET_* environment variables...",0
 MSG_INITIALIZING DB "Initializing from NET.CFG...",0
+MSG_CFG_PATH	DB "[C0] CFG=",0
 MSG_INIT_MISS	DB "[E] NET.CFG read failed (file missing or unreadable)",0
 MSG_CHECK_OK	DB "NET.CFG syntax OK",0
 MSG_CHECK_MISS	DB "[E] NET.CFG read failed",0

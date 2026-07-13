@@ -19,7 +19,7 @@ UDPTEST /?
 ## Example
 
 ```
-RTL8019AS UDPTEST v0.2
+RTL8019AS UDPTEST v0.2.16
 
 Sending UDP to 192.168.7.1:7777 from 192.168.7.5
 Reply: len=16 data=SPRINTER UDPTEST

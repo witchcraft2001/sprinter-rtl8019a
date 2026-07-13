@@ -49,10 +49,10 @@ EXE_VERSION		EQU 1
 	DEFINE USE_NETENV
 	DEFINE USE_CMDL
 	DEFINE USE_RESOLVE
-	DEFINE CMDLINE_AT_LARGE			; ORG 0x4100 -> cmd line at IX-0x80 = 0x4180
 
 ARP_TIMEOUT_MS	EQU 3000		; ARP reply budget (ms)
 ICMP_TIMEOUT_MS	EQU 1000		; per-echo reply budget (ms, default Windows -w)
+PING_GAP_MS	EQU 1000		; interval between echo requests
 SCAN_C		EQU 0xAC		; DSS scancode for the C key (observed)
 
 ETH_TYPE_ARP	EQU 0x0806
@@ -79,9 +79,9 @@ ECHO_SEQ_LO	EQU 0x01
 	MODULE MAIN
 
 	; Large-variant EXE header (256 bytes, 0x4100..0x41FF).
-	; Required because the small variant's header sits on top of
-	; the DSS command line at 0x8080; this utility takes a host
-	; argument and must keep that buffer free.
+	; Required because this utility has a multi-token command line
+	; and needs the larger linear code/data area.  The PSP address is
+	; supplied separately in IX and is never derived from this ORG.
 	ORG 0x4100
 
 EXE_HEADER
@@ -101,7 +101,11 @@ EXE_HEADER
 	ORG 0x4200
 
 START
+	LD	(CMDL_SOURCE_PTR),IX	; must precede every CALL/RST DSS
 	PRINTLN MSG_BANNER
+	IFDEF RTL_ALT_TX_LAYOUT
+	PRINTLN MSG_ALT_LAYOUT
+	ENDIF
 
 	; Init CANCELLED (BSS; not zeroed by loader).
 	XOR	A
@@ -113,7 +117,7 @@ START
 	JP	NC,SHOW_HELP
 
 	; Defaults: count=4 send, payload=32, TTL=64, timeout=1000ms,
-	; forever=off.
+	; forever=off, diagnostic L2 broadcast=off.
 	LD	A,4
 	LD	(COUNT),A
 	LD	A,32
@@ -124,6 +128,9 @@ START
 	LD	(TIMEOUT_MS_VAL),HL
 	XOR	A
 	LD	(FOREVER),A
+	LD	(FORCE_BCAST),A
+	LD	(FORCE_MCAST),A
+	LD	(REINIT_TX),A
 
 	; -t: ping forever.
 	LD	A,'t'
@@ -132,6 +139,44 @@ START
 	LD	A,1
 	LD	(FOREVER),A
 .NO_T
+
+	; -b: diagnostic only.  Keep the target IPv4 address but force the
+	; Ethernet destination to FF:FF:FF:FF:FF:FF.  This distinguishes a
+	; real-hardware unicast TX problem from a general MAC/PHY TX problem.
+	LD	A,'b'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_B
+	LD	A,1
+	LD	(FORCE_BCAST),A
+.NO_B
+
+	; -m: diagnostic L2 multicast.  01:00:5E:00:00:01 is the IPv4
+	; all-hosts group, so a bridge should forward it while its zero
+	; bits expose a destination/FIFO data-path problem hidden by FF*6.
+	LD	A,'m'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_M
+	LD	A,1
+	LD	(FORCE_MCAST),A
+.NO_M
+	; -r: diagnostic reset/reinit after ARP and before every ICMP TX.
+	; This tests whether an RX -> local-DMA/TX transition leaves the real
+	; RTL8019AS in a state where it reports PTX without putting a frame on
+	; the wire.  TARGET_MAC remains valid in ordinary Z80 RAM across reset.
+	LD	A,'r'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_R
+	LD	A,1
+	LD	(REINIT_TX),A
+.NO_R
+	; -b and -m are intentionally exclusive.
+	LD	A,(FORCE_BCAST)
+	OR	A
+	JR	Z,.L2_MODE_OK
+	LD	A,(FORCE_MCAST)
+	OR	A
+	JP	NZ,USAGE_ERROR
+.L2_MODE_OK
 
 	; -n count (default 4, max 255).  Ignored when -t set.
 	LD	A,'n'
@@ -216,6 +261,12 @@ START
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
 	LD	HL,OUR_MAC
+	; RCR_AB (broadcast + PAR-filtered unicast), NOT promiscuous.
+	; ICMP echo replies are unicast to our MAC and ARP/who-has is
+	; broadcast, so the hardware filter passes everything ping needs.
+	; Promiscuous capture floods the RX ring with unrelated segment
+	; traffic, overflowing the ring (-> RX wedge) and lengthening the
+	; IRQ-off DMA reads -- the main source of the observed instability.
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
 	LD	HL,OUR_MAC
@@ -230,6 +281,7 @@ START
 	JP	C,RESOLVE_FAIL
 
 	; "Pinging X with N bytes of data:"
+	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
 	PRINT MSG_PINGING
 	LD	HL,TARGET_IP
@@ -238,6 +290,11 @@ START
 	LD	A,(PAYLOAD_LEN)
 	CALL	PRINT_DEC_A
 	PRINTLN MSG_BYTES_DATA
+	PRINT MSG_OUR_IP
+	LD	HL,OUR_IP
+	CALL	PRINT_IPV4
+	PRINT LINE_END
+	CALL	@ISA.ISA_OPEN
 
 	; ARP the next hop for TARGET_IP -- itself when on-subnet,
 	; NET_GW otherwise.  RESOLVE.NEXT_HOP_FOR reads NET_MASK /
@@ -254,15 +311,23 @@ START
 
 	; DIAG: show the resolved next-hop MAC (confirms ARP really
 	; extracted the gateway/peer MAC, not a stale/zero value).
+	CALL	@ISA.ISA_CLOSE
 	PRINT MSG_NEXTHOP
 	LD	HL,TARGET_MAC
 	CALL	@UTIL.PRINT_MAC
 	PRINT LINE_END
+	LD	A,(REINIT_TX)
+	OR	A
+	JR	Z,.NO_REINIT_MSG
+	PRINTLN MSG_REINIT_TX
+.NO_REINIT_MSG
+	CALL	@ISA.ISA_OPEN
 
 	; Init counters and ICMP sequence.
 	XOR	A
 	LD	(SENT),A
 	LD	(RECVD),A
+	LD	(ARP_REPLIED),A
 	LD	A,1
 	LD	(SEQ_LO),A
 	XOR	A
@@ -278,6 +343,17 @@ PING_LOOP
 	CP	(HL)
 	JP	NC,PING_LOOP_END
 .LIVE
+	; Diagnostic A/B: put the NIC into a freshly initialized normal state
+	; after ARP RX but before constructing/issuing this unicast ICMP TX.
+	LD	A,(REINIT_TX)
+	OR	A
+	JR	Z,.NO_REINIT
+	CALL	@RTL.RESET
+	JP	C,RESET_FAIL
+	LD	HL,OUR_MAC
+	LD	A,RCR_AB
+	CALL	@RTL.INIT_NORMAL
+.NO_REINIT
 	; Build and send ICMP echo with current SEQ.
 	CALL	BUILD_ICMP_ECHO
 	LD	HL,TX_BUF
@@ -291,6 +367,10 @@ PING_LOOP
 .NO_HC
 	CALL	@RTL.SEND_FRAME
 	JP	C,SEND_FAIL
+	; Preserve this ICMP transmit's complete capture before the receive
+	; wait.  HANDLE_ARP_REQUEST may send a later ARP reply through the
+	; same common driver and overwrite RTL_TX_* while we are waiting.
+	CALL	SAVE_ICMP_TX_DIAG
 	; Saturate SENT counter at 255 (overflow stays at 255 in -t mode).
 	LD	A,(SENT)
 	CP	255
@@ -306,6 +386,7 @@ PING_LOOP
 	JR	C,.TIMED_OUT
 
 	; "Reply from X.X.X.X: bytes=N time<1ms TTL=...".
+	CALL	@ISA.ISA_CLOSE
 	PRINT MSG_REPLY_FROM
 	LD	HL,TARGET_IP
 	CALL	PRINT_IPV4
@@ -316,6 +397,7 @@ PING_LOOP
 	LD	A,(TTL_VAL)
 	CALL	PRINT_DEC_A
 	PRINT LINE_END
+	CALL	@ISA.ISA_OPEN
 	LD	A,(RECVD)
 	CP	255
 	JR	Z,.RECVD_SAT
@@ -330,26 +412,50 @@ PING_LOOP
 	LD	A,(CANCELLED)
 	OR	A
 	JR	NZ,PING_LOOP_END
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 	PRINT	MSG_TIMED_OUT		; "Request timed out."
 	PRINT	MSG_RX_PRE		; "  (rx="
 	LD	A,(RX_SEEN)
 	CALL	PRINT_DEC_A
 	PRINTLN	MSG_RX_POST		; " frames)"
+	CALL	PRINT_LAST_RX_DIAG
+	; Restore the capture made immediately after the ICMP SEND_FRAME.
+	; Any ARP reply transmitted during WAIT_FOR_ICMP_REPLY has legitimately
+	; overwritten the driver's shared RTL_TX_* scratch by this point.
+	CALL	RESTORE_ICMP_TX_DIAG
+	CALL	PRINT_TX_DIAG
+	CALL	PRINT_TX_RAM_DIAG
 	; DIAG: dump chip state so we see, on a failing ping, whether the
 	; chip is alive, the RX ring is advancing (CURR vs BNRY) and whether
 	; OVW (ISR bit 4) fired.
-	CALL	@RTL.SNAPSHOT_REGS
 	CALL	PRINT_REG_DUMP
+	CALL	@ISA.ISA_OPEN
 
 .NEXT_SEQ
 	LD	HL,SEQ_LO
 	INC	(HL)
-	JP	NZ,PING_LOOP
+	JR	NZ,.SEQ_DONE
 	INC	HL			; HL = SEQ_HI (adjacent)
 	INC	(HL)
+.SEQ_DONE
+	; Keep the normal ping cadence.  Without this, four requests
+	; are sent back-to-back, which can trigger ICMP/NAT throttling
+	; on small routers and makes loss diagnostics noisy.
+	LD	A,(FOREVER)
+	OR	A
+	JR	NZ,.DO_GAP
+	LD	A,(SENT)
+	LD	HL,COUNT
+	CP	(HL)
+	JP	NC,PING_LOOP
+.DO_GAP
+	CALL	WAIT_PING_GAP
+	JP	C,PING_LOOP_END
 	JP	PING_LOOP
 
 PING_LOOP_END
+	CALL	@ISA.ISA_CLOSE
 	; If user cancelled mid-loop, mention it before stats.
 	LD	A,(CANCELLED)
 	OR	A
@@ -384,40 +490,52 @@ PING_LOOP_END
 	LD	A,(RECVD)
 	OR	A
 	JR	Z,.ALL_LOST
-	CALL	@ISA.ISA_CLOSE
 	JP	@UTIL.EXIT_OK
 .ALL_LOST
-	CALL	@ISA.ISA_CLOSE
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
 
 RESET_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
 	PRINTLN MSG_E_RESET
-	JP	FAIL_NIC
+	CALL	PRINT_REG_DUMP
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
 
 SEND_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
 	PRINTLN MSG_E_SEND
-	JP	FAIL_NIC
+	CALL	PRINT_TX_DIAG
+	CALL	PRINT_TX_RAM_DIAG
+	CALL	PRINT_REG_DUMP
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
 
 ARP_TIMEOUT
 	LD	A,(CANCELLED)
 	OR	A
 	JR	NZ,.CANCEL
-	PRINTLN MSG_E_ARP
-	JP	FAIL_NIC
-.CANCEL
-	PRINTLN MSG_ABORTED
+	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_E_ARP
+	CALL	PRINT_REG_DUMP
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+.CANCEL
+	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_ABORTED
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
 FAIL_NIC
 	CALL	@RTL.SNAPSHOT_REGS
-	CALL	PRINT_REG_DUMP
 	CALL	@ISA.ISA_CLOSE
+	CALL	PRINT_REG_DUMP
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
@@ -435,26 +553,26 @@ RESOLVE_FAIL
 	CP	7
 	JR	Z,.CAN
 	; 4/5/6 -> generic resolve error.
-	PRINTLN MSG_E_RESOLVE
 	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_E_RESOLVE
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 .USG
 	CALL	@ISA.ISA_CLOSE
 	JP	USAGE_ERROR
 .NDNS
-	PRINTLN MSG_E_NO_DNS1
 	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_E_NO_DNS1
 	LD	B,4
 	JP	@UTIL.EXIT_FAIL
 .NGW
-	PRINTLN MSG_E_NO_GW
 	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_E_NO_GW
 	LD	B,4
 	JP	@UTIL.EXIT_FAIL
 .CAN
-	PRINTLN MSG_ABORTED
 	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_ABORTED
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
@@ -478,9 +596,27 @@ USAGE_ERROR
 ; ------------------------------------------------------
 ; BUILD_ICMP_ECHO: 74-byte ICMP echo request frame in TX_BUF.
 ; ------------------------------------------------------
+; GET_TX_DEST_PTR: HL = resolved unicast MAC, or the fixed
+; broadcast MAC in -b mode.  Used by both diagnostics and
+; frame construction so both modes take the same code path.
+GET_TX_DEST_PTR
+	LD	HL,TARGET_MAC
+	LD	A,(FORCE_BCAST)
+	OR	A
+	JR	Z,.CHECK_MCAST
+	LD	HL,BCAST_MAC
+	RET
+.CHECK_MCAST
+	LD	A,(FORCE_MCAST)
+	OR	A
+	RET	Z
+	LD	HL,MCAST_MAC
+	RET
+
+
 BUILD_ICMP_ECHO
 	LD	DE,TX_BUF
-	LD	HL,TARGET_MAC
+	CALL	GET_TX_DEST_PTR
 	LD	BC,6
 	LDIR
 	LD	HL,OUR_MAC
@@ -722,60 +858,69 @@ WAIT_FOR_ICMP_REPLY
 	XOR	A
 	LD	(RX_SEEN),A		; DIAG: count frames read this wait
 .LP
+	; Drain the RX ring back-to-back: pull up to RX_DRAIN_BUDGET
+	; packets per pass while the ring is non-empty, paying the slow
+	; tick (delay + SCANKEY) only when the ring drains empty or the
+	; budget is spent.  A per-packet tick caps drain at ~tens of
+	; frames/sec, so a broadcast burst (gateway ARP scan) buries or
+	; overflows the ICMP reply before we reach it.
+	LD	A,RX_DRAIN_BUDGET
+	LD	(RX_DRAIN_LEFT),A
+.DRAIN
 	CALL	@RTL.RING_HAS_PACKET
-	JR	NZ,.HAVE
-.TICK					; reached every pass: tick + key poll
-	CALL	TICK_AND_CHECK_KEY
-	JR	C,.TIMEOUT
-	LD	HL,(TIMEOUT_MS_LEFT)
-	DEC	HL
-	LD	(TIMEOUT_MS_LEFT),HL
-	LD	A,H
-	OR	L
-	JR	NZ,.LP
-	JR	.TIMEOUT
-.HAVE
+	JP	Z,.TICK			; ring empty: pace + key + timeout
 	LD	HL,RX_HDR
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.TICK			; DMA error: tick (BNRY may not advance)
+	JP	C,.MISS			; DMA error: count vs budget, keep draining
 	LD	A,(RX_SEEN)		; DIAG: count every frame read
 	INC	A
 	LD	(RX_SEEN),A
-	; Filter: IPv4 / ICMP / echo reply / matching id.  Misses fall
-	; to .TICK so timeout/cancel run even under steady broadcast.
+	CALL	CAPTURE_RX_DIAG
+	CALL	HANDLE_ARP_REQUEST
+	JR	NC,.MISS
+	; Filter: IPv4 / ICMP / echo reply / matching id.  Misses keep
+	; draining; the timeout/cancel poll happens on the .TICK path.
 	LD	A,(RX_BUF + 12)
 	CP	HIGH ETH_TYPE_IPV4
-	JR	NZ,.TICK
+	JR	NZ,.MISS
 	LD	A,(RX_BUF + 13)
 	CP	LOW ETH_TYPE_IPV4
-	JR	NZ,.TICK
+	JR	NZ,.MISS
 	LD	A,(RX_BUF + 14)
 	CP	0x45
-	JR	NZ,.TICK
+	JR	NZ,.MISS
 	LD	A,(RX_BUF + 14 + 9)
 	CP	IP_PROTO_ICMP
-	JR	NZ,.TICK
+	JR	NZ,.MISS
 	LD	HL,RX_BUF + 14 + 12
 	LD	DE,TARGET_IP
 	LD	B,4
 .CMPSRC
 	LD	A,(DE)
 	CP	(HL)
-	JR	NZ,.TICK
+	JR	NZ,.MISS
 	INC	HL
 	INC	DE
 	DJNZ	.CMPSRC
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
 	CP	ICMP_T_ECHO_REP
-	JR	NZ,.TICK
+	JR	NZ,.MISS
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
 	CP	ECHO_ID_HI
-	JR	NZ,.TICK
+	JP	NZ,.MISS
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
 	CP	ECHO_ID_LO
-	JR	NZ,.TICK
+	JP	NZ,.MISS
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 6)
+	LD	HL,SEQ_HI
+	CP	(HL)
+	JP	NZ,.MISS
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 7)
+	LD	HL,SEQ_LO
+	CP	(HL)
+	JP	NZ,.MISS
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
 	LD	(REPLY_ID + 0),A
 	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
@@ -786,8 +931,498 @@ WAIT_FOR_ICMP_REPLY
 	LD	(REPLY_SEQ + 1),A
 	OR	A
 	RET
+.MISS
+	; Charge one timeout unit per frame processed.  The timeout is
+	; counted in ticks, but we now drain many frames per tick; under a
+	; sustained broadcast flood (which keeps the ring non-empty) the
+	; tick -- and thus the timeout -- would otherwise barely advance,
+	; stretching the effective timeout to tens of seconds.
+	LD	HL,(TIMEOUT_MS_LEFT)
+	DEC	HL
+	LD	(TIMEOUT_MS_LEFT),HL
+	LD	A,H
+	OR	L
+	JP	Z,.TIMEOUT
+	; Non-matching frame (or DMA glitch): spend one unit of the drain
+	; budget and keep pulling from the ring.  Only fall to .TICK when
+	; the budget is exhausted, so the ring is drained fast.
+	LD	A,(RX_DRAIN_LEFT)
+	DEC	A
+	LD	(RX_DRAIN_LEFT),A
+	JP	NZ,.DRAIN
+.TICK					; ring empty or budget spent: tick + key poll
+	CALL	TICK_AND_CHECK_KEY
+	JP	C,.TIMEOUT
+	LD	HL,(TIMEOUT_MS_LEFT)
+	DEC	HL
+	LD	(TIMEOUT_MS_LEFT),HL
+	LD	A,H
+	OR	L
+	JP	NZ,.LP
 .TIMEOUT
 	SCF
+	RET
+
+
+; ------------------------------------------------------
+; HANDLE_ARP_REQUEST: answer "who-has OUR_IP" while higher
+; level waits are in progress.  Routers often ARP for the
+; sender before returning ICMP replies; ignoring that request
+; makes ping look like RX loss even though ARP traffic is seen.
+;   In: RX_BUF holds an Ethernet frame.
+;   Out: CF=0 if a reply was sent (or attempted), CF=1 if not ours.
+; ------------------------------------------------------
+HANDLE_ARP_REQUEST
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_ARP
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_ARP
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 14 + 0)
+	OR	A
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 14 + 1)
+	CP	1
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 14 + 2)
+	CP	HIGH ETH_TYPE_IPV4
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 14 + 3)
+	CP	LOW ETH_TYPE_IPV4
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 14 + 4)
+	CP	6
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 14 + 5)
+	CP	4
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 14 + 6)
+	OR	A
+	JP	NZ,.NO
+	LD	A,(RX_BUF + 14 + 7)
+	CP	ARP_OP_REQUEST
+	JP	NZ,.NO
+	LD	HL,RX_BUF + 14 + 24	; target protocol address
+	LD	DE,OUR_IP
+	LD	B,4
+.CMP_TPA
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,.NO
+	INC	HL
+	INC	DE
+	DJNZ	.CMP_TPA
+
+	; Ethernet header.
+	LD	DE,TX_BUF
+	LD	HL,RX_BUF + 14 + 8	; requester SHA
+	LD	BC,6
+	LDIR
+	LD	HL,OUR_MAC
+	LD	BC,6
+	LDIR
+	LD	A,HIGH ETH_TYPE_ARP
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW ETH_TYPE_ARP
+	LD	(DE),A
+	INC	DE
+	; ARP body.
+	XOR	A
+	LD	(DE),A			; htype hi
+	INC	DE
+	LD	A,1
+	LD	(DE),A			; htype lo
+	INC	DE
+	LD	A,HIGH ETH_TYPE_IPV4
+	LD	(DE),A
+	INC	DE
+	LD	A,LOW ETH_TYPE_IPV4
+	LD	(DE),A
+	INC	DE
+	LD	A,6
+	LD	(DE),A
+	INC	DE
+	LD	A,4
+	LD	(DE),A
+	INC	DE
+	XOR	A
+	LD	(DE),A			; op hi
+	INC	DE
+	LD	A,ARP_OP_REPLY
+	LD	(DE),A			; op lo
+	INC	DE
+	LD	HL,OUR_MAC		; sender MAC
+	LD	BC,6
+	LDIR
+	LD	HL,OUR_IP		; sender IP
+	LD	BC,4
+	LDIR
+	LD	HL,RX_BUF + 14 + 8	; target MAC = requester SHA
+	LD	BC,6
+	LDIR
+	LD	HL,RX_BUF + 14 + 14	; target IP = requester SPA
+	LD	BC,4
+	LDIR
+	XOR	A
+	LD	B,18
+.PAD
+	LD	(DE),A
+	INC	DE
+	DJNZ	.PAD
+	LD	HL,TX_BUF
+	LD	BC,ARP_FRAME_LEN
+	CALL	@RTL.SEND_FRAME
+	LD	A,(ARP_REPLIED)
+	CP	255
+	JR	Z,.ARP_REP_SAT
+	INC	A
+	LD	(ARP_REPLIED),A
+.ARP_REP_SAT
+	OR	A
+	RET
+.NO
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; CAPTURE_RX_DIAG / PRINT_LAST_RX_DIAG: keep a compact
+; summary of the last frame seen during an ICMP wait.  This
+; makes timeout screenshots actionable: we can tell whether
+; the ring carried only ARP/broadcast, an ICMP reply with the
+; wrong id/seq, or unrelated IP traffic.
+; ------------------------------------------------------
+CAPTURE_RX_DIAG
+	LD	A,(RX_BUF + 12)
+	LD	(RX_LAST_TYPE + 0),A
+	LD	A,(RX_BUF + 13)
+	LD	(RX_LAST_TYPE + 1),A
+	LD	A,0xFF
+	LD	(RX_LAST_PROTO),A
+	LD	(RX_LAST_ICMP_TYPE),A
+	XOR	A
+	LD	(RX_LAST_ID + 0),A
+	LD	(RX_LAST_ID + 1),A
+	LD	(RX_LAST_SEQ + 0),A
+	LD	(RX_LAST_SEQ + 1),A
+	LD	(RX_LAST_ARP_OP + 0),A
+	LD	(RX_LAST_ARP_OP + 1),A
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_ARP
+	JR	NZ,.NOT_ARP
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_ARP
+	JR	NZ,.NOT_ARP
+	LD	A,(RX_BUF + 14 + 6)
+	LD	(RX_LAST_ARP_OP + 0),A
+	LD	A,(RX_BUF + 14 + 7)
+	LD	(RX_LAST_ARP_OP + 1),A
+	LD	HL,RX_BUF + 14 + 14
+	LD	DE,RX_LAST_ARP_SPA
+	LD	BC,4
+	LDIR
+	LD	HL,RX_BUF + 14 + 24
+	LD	DE,RX_LAST_ARP_TPA
+	LD	BC,4
+	LDIR
+	RET
+.NOT_ARP
+	LD	A,(RX_BUF + 12)
+	CP	HIGH ETH_TYPE_IPV4
+	RET	NZ
+	LD	A,(RX_BUF + 13)
+	CP	LOW ETH_TYPE_IPV4
+	RET	NZ
+	LD	A,(RX_BUF + 14)
+	CP	0x45
+	RET	NZ
+	LD	A,(RX_BUF + 14 + 9)
+	LD	(RX_LAST_PROTO),A
+	LD	HL,RX_BUF + 14 + 12
+	LD	DE,RX_LAST_SRC
+	LD	BC,4
+	LDIR
+	LD	A,(RX_LAST_PROTO)
+	CP	IP_PROTO_ICMP
+	RET	NZ
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 0)
+	LD	(RX_LAST_ICMP_TYPE),A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 4)
+	LD	(RX_LAST_ID + 0),A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 5)
+	LD	(RX_LAST_ID + 1),A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 6)
+	LD	(RX_LAST_SEQ + 0),A
+	LD	A,(RX_BUF + 14 + IP_HDR_LEN + 7)
+	LD	(RX_LAST_SEQ + 1),A
+	RET
+
+
+PRINT_LAST_RX_DIAG
+	LD	A,(RX_SEEN)
+	OR	A
+	RET	Z
+	PRINT	MSG_LAST_PRE
+	LD	A,(RX_LAST_TYPE + 0)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RX_LAST_TYPE + 1)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RX_LAST_TYPE + 0)
+	CP	HIGH ETH_TYPE_ARP
+	JR	NZ,.TRY_IP
+	LD	A,(RX_LAST_TYPE + 1)
+	CP	LOW ETH_TYPE_ARP
+	JR	NZ,.TRY_IP
+	PRINT	MSG_ARP_OP_EQ
+	LD	A,(RX_LAST_ARP_OP + 0)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RX_LAST_ARP_OP + 1)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_SPA_EQ
+	LD	HL,RX_LAST_ARP_SPA
+	CALL	PRINT_IPV4
+	PRINT	MSG_TPA_EQ
+	LD	HL,RX_LAST_ARP_TPA
+	CALL	PRINT_IPV4
+	PRINT	MSG_ARPREP_EQ
+	LD	A,(ARP_REPLIED)
+	CALL	PRINT_DEC_A
+	JR	.DONE
+.TRY_IP
+	LD	A,(RX_LAST_TYPE + 0)
+	CP	HIGH ETH_TYPE_IPV4
+	JP	NZ,.DONE
+.IP
+	LD	A,(RX_LAST_TYPE + 1)
+	CP	LOW ETH_TYPE_IPV4
+	JR	NZ,.DONE
+	PRINT	MSG_PROTO_EQ
+	LD	A,(RX_LAST_PROTO)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_SRC_EQ
+	LD	HL,RX_LAST_SRC
+	CALL	PRINT_IPV4
+	LD	A,(RX_LAST_PROTO)
+	CP	IP_PROTO_ICMP
+	JR	NZ,.DONE
+	PRINT	MSG_ICMP_EQ
+	LD	A,(RX_LAST_ICMP_TYPE)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_ID_EQ
+	LD	A,(RX_LAST_ID + 0)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RX_LAST_ID + 1)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_SEQ_EQ
+	LD	A,(RX_LAST_SEQ + 0)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RX_LAST_SEQ + 1)
+	CALL	@UTIL.PRINT_HEX_A
+.DONE
+	PRINT	LINE_END
+	RET
+
+
+; ------------------------------------------------------
+; SAVE/RESTORE_ICMP_TX_DIAG: keep the ICMP SEND_FRAME
+; capture independent from later ARP replies sent while
+; PING drains the RX ring.  All sources/destinations are
+; ordinary CPU RAM; no ISA access or DSS call occurs here.
+; ------------------------------------------------------
+SAVE_ICMP_TX_DIAG
+	LD	HL,RTL_TX_LAST_STAGE
+	LD	DE,ICMP_TX_STAGE
+	LD	BC,4
+	LDIR
+	LD	HL,RTL_TX_LENGTH
+	LD	DE,ICMP_TX_LENGTH
+	LD	BC,2
+	LDIR
+	LD	HL,RTL_TX_VERIFY_BUF
+	LD	DE,ICMP_TX_VERIFY
+	LD	BC,RTL_TX_VERIFY_SIZE
+	LDIR
+	LD	HL,RTL_TX_LAST_CLDA
+	LD	DE,ICMP_TX_CLDA
+	LD	BC,2
+	LDIR
+	LD	HL,RTL_TX_CFG0_PRE
+	LD	DE,ICMP_TX_PHY
+	LD	BC,6
+	LDIR
+	RET
+
+RESTORE_ICMP_TX_DIAG
+	LD	HL,ICMP_TX_STAGE
+	LD	DE,RTL_TX_LAST_STAGE
+	LD	BC,4
+	LDIR
+	LD	HL,ICMP_TX_LENGTH
+	LD	DE,RTL_TX_LENGTH
+	LD	BC,2
+	LDIR
+	LD	HL,ICMP_TX_VERIFY
+	LD	DE,RTL_TX_VERIFY_BUF
+	LD	BC,RTL_TX_VERIFY_SIZE
+	LDIR
+	LD	HL,ICMP_TX_CLDA
+	LD	DE,RTL_TX_LAST_CLDA
+	LD	BC,2
+	LDIR
+	LD	HL,ICMP_TX_PHY
+	LD	DE,RTL_TX_CFG0_PRE
+	LD	BC,6
+	LDIR
+	RET
+
+
+; ------------------------------------------------------
+; PRINT_TX_DIAG: print the capture made by RTL.SEND_FRAME.
+; ISA must be closed (all values are ordinary RAM snapshots).
+; ------------------------------------------------------
+PRINT_TX_DIAG
+	PRINT	MSG_TX_STAGE
+	LD	A,(RTL_TX_LAST_STAGE)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TX_ISR
+	LD	A,(RTL_TX_LAST_ISR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TX_TSR
+	LD	A,(RTL_TX_LAST_TSR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TX_CR
+	LD	A,(RTL_TX_LAST_CR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TX_CLDA
+	LD	HL,(RTL_TX_LAST_CLDA)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	LINE_END
+	PRINT	MSG_TX_PHY
+	LD	A,(RTL_TX_CFG0_PRE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,'>'
+	CALL	PUTCHAR
+	LD	A,(RTL_TX_CFG0_POST)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TX_CFG3
+	LD	A,(RTL_TX_CFG3_PRE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,'>'
+	CALL	PUTCHAR
+	LD	A,(RTL_TX_CFG3_POST)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TX_NCR
+	LD	A,(RTL_TX_LAST_NCR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TX_TPSR
+	LD	A,(RTL_TX_LAST_TPSR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	LINE_END
+	RET
+
+
+; ------------------------------------------------------
+; PRINT_TX_RAM_DIAG: print the prefix actually read back
+; from NIC packet RAM before TXP.  This is independent of
+; the app's TX_BUF after SEND_FRAME returns.
+; ------------------------------------------------------
+PRINT_TX_RAM_DIAG
+	; E0/E1 fail before a valid read-back exists.
+	LD	A,(RTL_TX_LAST_STAGE)
+	CP	0xE0
+	RET	Z
+	CP	0xE1
+	RET	Z
+	LD	HL,(RTL_TX_LENGTH)
+	LD	DE,RTL_TX_VERIFY_SIZE
+	OR	A
+	SBC	HL,DE
+	RET	C
+	PRINT	MSG_TXRAM_LEN
+	LD	HL,(RTL_TX_LENGTH)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_TXRAM_DST
+	LD	HL,RTL_TX_VERIFY_BUF + 0
+	CALL	@UTIL.PRINT_MAC
+	PRINT	LINE_END
+	PRINT	MSG_TXRAM_SRC
+	LD	HL,RTL_TX_VERIFY_BUF + 6
+	CALL	@UTIL.PRINT_MAC
+	PRINT	MSG_TXRAM_TYPE
+	LD	A,(RTL_TX_VERIFY_BUF + 12)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RTL_TX_VERIFY_BUF + 13)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	LINE_END
+	; The shared TX snapshot may have been overwritten by a later ARP
+	; reply while PING was waiting.  Print its Ethernet header, but do
+	; not decode non-IPv4 bytes as an IP/ICMP header.
+	LD	A,(RTL_TX_VERIFY_BUF + 12)
+	CP	0x08
+	RET	NZ
+	LD	A,(RTL_TX_VERIFY_BUF + 13)
+	OR	A
+	RET	NZ
+	PRINT	MSG_TXRAM_IP
+	LD	A,(RTL_TX_VERIFY_BUF + 16)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RTL_TX_VERIFY_BUF + 17)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TXRAM_PROTO
+	LD	A,(RTL_TX_VERIFY_BUF + 23)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TXRAM_IPSRC
+	LD	HL,RTL_TX_VERIFY_BUF + 26
+	CALL	PRINT_IPV4
+	PRINT	MSG_TXRAM_IPDST
+	LD	HL,RTL_TX_VERIFY_BUF + 30
+	CALL	PRINT_IPV4
+	PRINT	LINE_END
+	PRINT	MSG_TXRAM_ICMP
+	LD	A,(RTL_TX_VERIFY_BUF + 34)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TXRAM_CODE
+	LD	A,(RTL_TX_VERIFY_BUF + 35)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TXRAM_SUM
+	LD	A,(RTL_TX_VERIFY_BUF + 36)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RTL_TX_VERIFY_BUF + 37)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TXRAM_ID
+	LD	A,(RTL_TX_VERIFY_BUF + 38)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RTL_TX_VERIFY_BUF + 39)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TXRAM_SEQ
+	LD	A,(RTL_TX_VERIFY_BUF + 40)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,(RTL_TX_VERIFY_BUF + 41)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	LINE_END
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_PING_GAP: wait PING_GAP_MS between echo requests.
+; Uses the same close-delay-scan-open tick as reply waits.
+;   Out: CF=0 normal; CF=1 cancelled.
+; ------------------------------------------------------
+WAIT_PING_GAP
+	LD	HL,PING_GAP_MS
+	LD	(TIMEOUT_MS_LEFT),HL
+.LP
+	CALL	TICK_AND_CHECK_KEY
+	RET	C
+	LD	HL,(TIMEOUT_MS_LEFT)
+	DEC	HL
+	LD	(TIMEOUT_MS_LEFT),HL
+	LD	A,H
+	OR	L
+	JR	NZ,.LP
+	OR	A
 	RET
 
 
@@ -916,13 +1551,44 @@ TIMEOUT_MS_VAL	EQU APP_BSS_BASE + 38		; 2 bytes (-w ms, default 1000)
 FOREVER		EQU APP_BSS_BASE + 40		; 1 byte (1 if -t set)
 TARGET_HOST_PTR	EQU APP_BSS_BASE + 41		; 2 bytes (-> argv token)
 RX_SEEN		EQU APP_BSS_BASE + 43		; 1 byte (diag: frames read per wait)
+RX_LAST_TYPE	EQU APP_BSS_BASE + 44		; 2 bytes (EtherType)
+RX_LAST_PROTO	EQU APP_BSS_BASE + 46		; 1 byte (IPv4 protocol or FF)
+RX_LAST_SRC	EQU APP_BSS_BASE + 47		; 4 bytes (IPv4 source)
+RX_LAST_ICMP_TYPE EQU APP_BSS_BASE + 51		; 1 byte
+RX_LAST_ID	EQU APP_BSS_BASE + 52		; 2 bytes
+RX_LAST_SEQ	EQU APP_BSS_BASE + 54		; 2 bytes
+RX_LAST_ARP_OP	EQU APP_BSS_BASE + 56		; 2 bytes
+RX_LAST_ARP_SPA	EQU APP_BSS_BASE + 58		; 4 bytes
+RX_LAST_ARP_TPA	EQU APP_BSS_BASE + 62		; 4 bytes
+ARP_REPLIED	EQU APP_BSS_BASE + 66		; 1 byte
+FORCE_BCAST	EQU APP_BSS_BASE + 67		; 1 byte (-b diagnostic mode)
+FORCE_MCAST	EQU APP_BSS_BASE + 68		; 1 byte (-m diagnostic mode)
+REINIT_TX	EQU APP_BSS_BASE + 69		; 1 byte (-r reset/reinit before ICMP)
+; Private copy of the common driver's TX capture.  Keep it away from the
+; compact command/RX state above; total size is 4+2+42+2+6 = 56 bytes.
+ICMP_TX_STAGE	EQU APP_BSS_BASE + 128		; stage, ISR, TSR, CR
+ICMP_TX_LENGTH	EQU APP_BSS_BASE + 132		; 2 bytes
+ICMP_TX_VERIFY	EQU APP_BSS_BASE + 134		; RTL_TX_VERIFY_SIZE bytes
+ICMP_TX_CLDA	EQU APP_BSS_BASE + 176		; 2 bytes
+ICMP_TX_PHY	EQU APP_BSS_BASE + 178		; cfg0/3 pre/post, NCR, TPSR
+
+
+; ------- initialized data -------
+BCAST_MAC	DB 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+MCAST_MAC	DB 0x01,0x00,0x5E,0x00,0x00,0x01
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS PING v0.2",0
+	IFDEF RTL_ALT_TX_LAYOUT
+MSG_BANNER	DB "RTL8019AS PINGALT v",PACKAGE_VERSION,0
+MSG_ALT_LAYOUT	DB "[D] TX=46 RX=4C..5F (alternate packet RAM layout)",0
+	ELSE
+MSG_BANNER	DB "RTL8019AS PING v",PACKAGE_VERSION,0
+	ENDIF
 MSG_PINGING	DB "Pinging ",0
 MSG_WITH	DB " with ",0
 MSG_BYTES_DATA	DB " bytes of data:",0
+MSG_OUR_IP	DB "Our IP=",0
 MSG_REPLY_FROM	DB "Reply from ",0
 MSG_BYTES_EQ	DB ": bytes=",0
 MSG_TIME_TTL_PRE DB " time<1ms TTL=",0
@@ -930,6 +1596,39 @@ MSG_TIMED_OUT	DB "Request timed out.",0
 MSG_NEXTHOP	DB "Next-hop MAC=",0
 MSG_RX_PRE	DB "  (rx=",0
 MSG_RX_POST	DB " frames)",0
+MSG_LAST_PRE	DB "  last type=",0
+MSG_PROTO_EQ	DB " p=",0
+MSG_SRC_EQ	DB " src=",0
+MSG_ICMP_EQ	DB " icmp=",0
+MSG_ID_EQ	DB " id=",0
+MSG_SEQ_EQ	DB " seq=",0
+MSG_ARP_OP_EQ	DB " op=",0
+MSG_SPA_EQ	DB " spa=",0
+MSG_TPA_EQ	DB " tpa=",0
+MSG_ARPREP_EQ	DB " arprep=",0
+MSG_TX_STAGE	DB "TX stage=",0
+MSG_TX_ISR	DB " ISR=",0
+MSG_TX_TSR	DB " TSR=",0
+MSG_TX_CR	DB " CR=",0
+MSG_TX_CLDA	DB " CLDA=",0
+MSG_TX_PHY	DB "PHY C0=",0
+MSG_TX_CFG3	DB " C3=",0
+MSG_TX_NCR	DB " NCR=",0
+MSG_TX_TPSR	DB " TPSR=",0
+MSG_REINIT_TX	DB "[D] reset/reinit before every ICMP TX",0
+MSG_TXRAM_LEN	DB "TXRAM len=",0
+MSG_TXRAM_DST	DB " dst=",0
+MSG_TXRAM_SRC	DB "  src=",0
+MSG_TXRAM_TYPE	DB " type=",0
+MSG_TXRAM_IP	DB "  IP tot=",0
+MSG_TXRAM_PROTO	DB " p=",0
+MSG_TXRAM_IPSRC	DB " src=",0
+MSG_TXRAM_IPDST	DB " dst=",0
+MSG_TXRAM_ICMP	DB "  ICMP t=",0
+MSG_TXRAM_CODE	DB " c=",0
+MSG_TXRAM_SUM	DB " sum=",0
+MSG_TXRAM_ID	DB " id=",0
+MSG_TXRAM_SEQ	DB " seq=",0
 MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
 MSG_STATS_HDR	DB "Ping statistics for ",0
 MSG_COLON	DB ":",0
@@ -939,7 +1638,7 @@ MSG_LOST_EQ	DB ", Lost = ",0
 MSG_LOSS_END	DB ".",0
 MSG_REGS	DB "REGS ",0
 MSG_E_RESET	DB "[E60] RESET timeout",0
-MSG_E_SEND	DB "[E61] DMA write or PTX timeout",0
+MSG_E_SEND	DB "[E61] TX failed",0
 MSG_E_ARP	DB "[E62] ARP reply timeout",0
 MSG_USAGE_ERR	DB "[E] usage: missing or invalid target",0
 MSG_E_RESOLVE	DB "[E] could not resolve host (DNS / ARP timeout or NXDOMAIN).",0
@@ -947,9 +1646,12 @@ MSG_E_NO_DNS1	DB "[E] NET_DNS1 not set; pass an IPv4 literal or run NETCFG/IFUP 
 MSG_E_NO_GW	DB "[E] DNS server is off-subnet but NET_GW is not set.",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  PING [-t] [-n count] [-l size] [-i TTL] [-w ms] target",13,10
+	DB "  PING [-t] [-b|-m] [-r] [-n count] [-l size] [-i TTL] [-w ms] target",13,10
 	DB "  PING /?",13,10,13,10
 	DB "  -t        ping until interrupted (Esc/Ctrl+C).",13,10
+	DB "  -b        diagnostic: force Ethernet destination broadcast.",13,10
+	DB "  -m        diagnostic: force L2 IPv4 all-hosts multicast.",13,10
+	DB "  -r        diagnostic: reset/reinit NIC before every ICMP TX.",13,10
 	DB "  -n count  number of echo requests (default 4, max 255).",13,10
 	DB "  -l size   payload size in bytes (default 32, max 255).",13,10
 	DB "  -i TTL    IP TTL on outgoing requests (default 64).",13,10

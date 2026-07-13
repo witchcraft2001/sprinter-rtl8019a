@@ -21,7 +21,7 @@ NTP /?
 ## Example
 
 ```
-RTL8019AS NTP v0.3
+RTL8019AS NTP v0.2.16
 
 Querying NTP at pool.ntp.org from 192.168.7.119
 Reply: stratum=2

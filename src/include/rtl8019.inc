@@ -49,6 +49,12 @@ RTL_TCR_OFF	EQU 0x0D	; W: Transmit Configuration
 RTL_DCR_OFF	EQU 0x0E	; W: Data Configuration
 RTL_IMR_OFF	EQU 0x0F	; W: Interrupt Mask
 
+; Page 0 read aliases at offsets which have different write registers.
+RTL_TSR_OFF	EQU RTL_TPSR_OFF	; R: Transmit Status
+RTL_NCR_OFF	EQU RTL_TBCR0_OFF	; R: Number of Collisions
+RTL_FIFO_OFF	EQU RTL_TBCR1_OFF	; R: receive FIFO diagnostic byte
+RTL_RSR_OFF	EQU RTL_RCR_OFF		; R: Receive Status
+
 ; Page 0 ID-register aliases (read-only on RTL8019AS).
 RTL_ID0_OFF	EQU RTL_RBCR0_OFF
 RTL_ID1_OFF	EQU RTL_RBCR1_OFF
@@ -63,6 +69,57 @@ RTL_PAR5_OFF	EQU 0x06
 RTL_CURR_OFF	EQU 0x07
 RTL_MAR0_OFF	EQU 0x08
 RTL_MAR7_OFF	EQU 0x0F
+
+; -- Page 3 RTL8019AS configuration registers (CR.PS = 11) -------
+; These registers describe the board/EEPROM configuration.  Normal
+; driver operation only reads them; writes require 9346 config-write
+; enable and are deliberately not performed by the common driver.
+RTL_9346CR_OFF	EQU 0x01
+RTL_BPAGE_OFF	EQU 0x02
+RTL_CONFIG0_OFF	EQU 0x03
+RTL_CONFIG1_OFF	EQU 0x04
+RTL_CONFIG2_OFF	EQU 0x05
+RTL_CONFIG3_OFF	EQU 0x06
+RTL_CSNSAV_OFF	EQU 0x08
+RTL_INTR_OFF	EQU 0x0B
+RTL_CONFIG4_OFF	EQU 0x0D
+
+; 9346CR operating modes and Microwire pin images.  The common driver only
+; uses normal operation; the optional rtl8019_eeprom.asm helper uses the
+; other values for an explicitly requested, verified EEPROM operation.
+EE_MODE_NORMAL	EQU 0x00
+EE_MODE_AUTOLOAD EQU 0x40
+EE_MODE_PROGRAM EQU 0x80
+EE_MODE_CFGWRITE EQU 0xC0
+EE_PIN_CS	EQU 0x08
+EE_PIN_SK	EQU 0x04
+EE_PIN_DI	EQU 0x02
+EE_PIN_DO	EQU 0x01
+
+; CONFIG0: board mode pins and the medium currently selected.
+CFG0_AUI	EQU 0x20
+CFG0_PNPJP	EQU 0x10
+CFG0_JP		EQU 0x08
+CFG0_BNC	EQU 0x04
+
+; CONFIG1: IRQ enable and encoded IRQ/I/O-base selections.
+CFG1_IRQEN	EQU 0x80
+
+; CONFIG2: PL1:PL0 selects the requested network medium.
+CFG2_PL_MASK	EQU 0xC0
+CFG2_PL_AUTO	EQU 0x00	; TP/CX auto-detect, link test enabled
+CFG2_PL_10BT_NLT EQU 0x40	; 10BaseT, link test disabled
+CFG2_PL_10B5	EQU 0x80	; 10Base5 / AUI
+CFG2_PL_10B2	EQU 0xC0	; 10Base2 / BNC
+
+; CONFIG3: operating mode, duplex and power state.
+CFG3_PNP	EQU 0x80
+CFG3_FUDUP	EQU 0x40
+CFG3_SLEEP	EQU 0x04
+CFG3_PWRDN	EQU 0x02
+CFG3_ACTIVEB	EQU 0x01
+
+CFG4_IOMS	EQU 0x01
 
 ; -- Backward-compat absolute addresses (default base 0x300) --------
 ; These resolve to fixed memory addresses; do NOT use them in
@@ -114,6 +171,9 @@ CR_PAGE0_START	EQU 0x22	; page 0, start, DMA abort
 CR_PAGE1_STOP	EQU 0x61	; page 1, stop, DMA abort
 CR_PAGE1_START	EQU 0x62	; page 1, start, DMA abort
 CR_PAGE2_STOP	EQU 0xA1	; page 2, stop, DMA abort
+CR_PAGE2_START	EQU 0xA2	; page 2, start, DMA abort
+CR_PAGE3_STOP	EQU 0xE1	; page 3, stop, DMA abort
+CR_PAGE3_START	EQU 0xE2	; page 3, start, DMA abort
 
 ; Remote DMA commands (low 6 bits, OR with page select bits if needed).
 ; All include STA so the chip stays running.
@@ -149,6 +209,10 @@ RCR_PRO		EQU 0x10	; Promiscuous physical
 RCR_MON		EQU 0x20	; Monitor mode (no RX into ring)
 
 RCR_NORMAL	EQU RCR_AB	; broadcast accept, others off
+RCR_BRINGUP	EQU RCR_AB | RCR_PRO
+				; real-HW bring-up: accept broadcast plus all
+				; physical frames while PAR/filter stability is
+				; being verified.
 
 ; -- TCR (Transmit Configuration Register) / loopback modes --------
 TCR_NORMAL	EQU 0x00	; normal TX, FCS appended, no loopback
@@ -162,13 +226,26 @@ TCR_LB_EXT_MAU	EQU 0x06	; mode 3: external loopback (MAU)
 RTL_ID0_VAL	EQU 0x50
 RTL_ID1_VAL	EQU 0x70
 
-; -- Packet RAM layout (NE2000-compatible) -------------------------
-; Internal packet RAM occupies pages 0x40..0x7F (16 KiB at 0x4000..0x7FFF).
+; -- Packet RAM layout (RTL8019AS byte-wide mode) ------------------
+; DCR.WTS=0 exposes pages 0x40..0x5F.  The RTL8019AS datasheet
+; explicitly limits PSTOP to 0x60 in 8-bit mode; 0x80 is valid only
+; in 16-bit mode and makes real-hardware RX walk outside usable RAM.
+	IFDEF RTL_ALT_TX_LAYOUT
+; Diagnostic A/B layout used only by PINGALT.EXE.  Moving the six-page TX
+; buffer from 0x4000 to 0x4600 tests the RTL8019AS internal local-DMA path;
+; the common PING.EXE and every other utility retain the standard layout.
+RTL_TPSR_INIT	EQU 0x46		; alternate TX buffer: 0x4600..0x4BFF
+RTL_PSTART_INIT	EQU 0x4C		; alternate RX ring start
+RTL_PSTOP_INIT	EQU 0x60		; RX ring end (exclusive, WTS=0)
+RTL_BNRY_INIT	EQU 0x4C		; initial RX boundary
+RTL_CURR_INIT	EQU 0x4D		; initial CURR (BNRY+1, marks empty ring)
+	ELSE
 RTL_TPSR_INIT	EQU 0x40		; TX buffer start page
 RTL_PSTART_INIT	EQU 0x46		; RX ring start page (TX uses 6 pages)
-RTL_PSTOP_INIT	EQU 0x80		; RX ring end (exclusive)
+RTL_PSTOP_INIT	EQU 0x60		; RX ring end (exclusive, WTS=0)
 RTL_BNRY_INIT	EQU 0x46		; initial RX boundary
 RTL_CURR_INIT	EQU 0x47		; initial CURR (BNRY+1, marks empty ring)
+	ENDIF
 
 ; -- Ethernet frame size limits ------------------------------------
 ETH_FRAME_MIN	EQU 60			; pad TX to this many bytes (no FCS)

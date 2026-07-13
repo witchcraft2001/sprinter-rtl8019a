@@ -32,9 +32,9 @@ EXE_VERSION	EQU 1
 	DEFINE USE_NETENV
 	DEFINE USE_CMDL
 	DEFINE USE_DHCP
-	DEFINE CMDLINE_AT_LARGE
 
 DHCP_TIMEOUT_MS	EQU 10000		; total OFFER wait budget
+DHCP_RETRIES	EQU 3			; DISCOVER / REQUEST attempts
 SCAN_C		EQU 0xAC
 
 	MODULE MAIN
@@ -58,6 +58,7 @@ EXE_HEADER
 	ORG 0x4200
 
 START
+	LD	(CMDL_SOURCE_PTR),IX	; must precede every CALL/RST DSS
 	PRINTLN MSG_BANNER
 
 	XOR	A
@@ -101,6 +102,12 @@ START
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
 	LD	HL,OUR_MAC
+	; RCR_AB (broadcast + PAR-filtered unicast), NOT promiscuous:
+	; the DHCP OFFER/ACK come back broadcast (we set the BOOTP
+	; broadcast flag), so the chip's hardware filter passes exactly
+	; what we need.  Promiscuous capture floods the RX ring with the
+	; whole segment's traffic, which on a real LAN overflows the ring
+	; and starves the system IRQ during the long IRQ-off DMA reads.
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
 
@@ -118,8 +125,13 @@ START
 	JP	@UTIL.EXIT_OK
 
 .DHCP_FLOW
+	LD	A,DHCP_RETRIES
+	LD	(RETRY_LEFT),A
+.DISCOVER_TRY
+	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
 	PRINTLN MSG_DISCOVER
+	CALL	@ISA.ISA_OPEN
 
 	; -- DISCOVER --
 	LD	DE,TX_BUF
@@ -136,8 +148,17 @@ START
 	LD	A,2				; DHCPOFFER
 	LD	(EXPECT_TYPE),A
 	CALL	WAIT_FOR_DHCP
-	JP	C,DHCP_TIMEOUT
+	JR	NC,.HAVE_OFFER
+	LD	A,(CANCELLED)
+	OR	A
+	JP	NZ,DHCP_TIMEOUT
+	LD	HL,RETRY_LEFT
+	DEC	(HL)
+	JP	NZ,.DISCOVER_TRY
+	JP	DHCP_TIMEOUT
 
+.HAVE_OFFER
+	CALL	@ISA.ISA_CLOSE
 	PRINT MSG_OFFER_PRE
 	LD	HL,@DHCP.OFFERED_IP
 	CALL	PRINT_IPV4
@@ -145,8 +166,12 @@ START
 	LD	HL,@DHCP.SERVER_ID
 	CALL	PRINT_IPV4
 	PRINTLN MSG_CLOSE_PAREN
+	CALL	@ISA.ISA_OPEN
 
 	; -- REQUEST --
+	LD	A,DHCP_RETRIES
+	LD	(RETRY_LEFT),A
+.REQUEST_TRY
 	LD	DE,TX_BUF
 	LD	HL,OUR_MAC
 	CALL	@DHCP.BUILD_REQUEST
@@ -161,8 +186,16 @@ START
 	LD	A,5				; DHCPACK
 	LD	(EXPECT_TYPE),A
 	CALL	WAIT_FOR_DHCP
-	JP	C,DHCP_TIMEOUT
+	JR	NC,.HAVE_ACK
+	LD	A,(CANCELLED)
+	OR	A
+	JP	NZ,DHCP_TIMEOUT
+	LD	HL,RETRY_LEFT
+	DEC	(HL)
+	JP	NZ,.REQUEST_TRY
+	JP	DHCP_TIMEOUT
 
+.HAVE_ACK
 	; -- Phase 3: ACK in hand.  Close ISA so subsequent DSS
 	; SETENV calls don't fight over MMU3.
 
@@ -208,31 +241,43 @@ START
 
 
 RESET_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
 	PRINTLN MSG_E_RESET
-	JP	FAIL
+	CALL	PRINT_REG_DUMP
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
 
 SEND_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
 	PRINTLN MSG_E_SEND
-	JP	FAIL
+	CALL	PRINT_REG_DUMP
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
 
 DHCP_TIMEOUT
 	LD	A,(CANCELLED)
 	OR	A
 	JR	NZ,.CANCEL
-	PRINTLN MSG_E_DHCP
-	JP	FAIL
-.CANCEL
-	PRINTLN MSG_ABORTED
+	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_E_DHCP
+	CALL	PRINT_REG_DUMP
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+.CANCEL
+	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_ABORTED
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
 FAIL
 	CALL	@RTL.SNAPSHOT_REGS
-	CALL	PRINT_REG_DUMP
 	CALL	@ISA.ISA_CLOSE
+	CALL	PRINT_REG_DUMP
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
@@ -253,29 +298,47 @@ SHOW_HELP
 ; ------------------------------------------------------
 WAIT_FOR_DHCP
 .LP
+	; Drain the RX ring back-to-back (up to RX_DRAIN_BUDGET frames)
+	; while it is non-empty, paying the slow tick (delay + SCANKEY)
+	; only when the ring drains empty or the budget is spent.  On a
+	; real LAN background broadcast keeps the ring non-empty; a
+	; per-packet tick capped drain at ~tens of frames/sec, so a
+	; broadcast burst could bury or overflow the OFFER/ACK before we
+	; reached it.  The .TICK path still honours timeout and Esc/Ctrl+C.
+	LD	A,RX_DRAIN_BUDGET
+	LD	(RX_DRAIN_LEFT),A
+.DRAIN
 	CALL	@RTL.RING_HAS_PACKET
-	JP	Z,.TICK			; ring empty: spend a tick, then retry
-	; A frame is waiting.  Drain exactly ONE per loop iteration,
-	; then fall through to .TICK so the timeout budget and the
-	; Esc/Ctrl+C poll are honoured on EVERY pass -- not just when
-	; the ring happens to be empty.  On a real LAN background
-	; broadcast traffic keeps the ring non-empty, so skipping the
-	; tick here would starve the timeout and hang forever.
+	JP	Z,.TICK			; ring empty: pace + key + timeout
 	LD	HL,RX_HDR
 	LD	DE,RX_BUF
 	LD	BC,RX_BUF_SIZE
 	CALL	@RTL.READ_PACKET
-	JR	C,.TICK			; DMA error: BNRY may not advance -- still tick
+	JR	C,.MISS			; DMA error: count vs budget, keep draining
 	LD	HL,RX_BUF
 	LD	DE,0
 	CALL	@DHCP.PARSE_REPLY
-	JR	C,.TICK
+	JR	C,.MISS
 	LD	A,(@DHCP.MSG_TYPE)
 	LD	HL,EXPECT_TYPE
 	CP	(HL)
-	JR	NZ,.TICK
+	JR	NZ,.MISS
 	OR	A
 	RET
+.MISS
+	; Charge one timeout unit per frame processed so a sustained
+	; broadcast flood (ring never empties) cannot stall the
+	; tick-counted timeout into tens of seconds.
+	LD	HL,(TIMEOUT_MS_LEFT)
+	DEC	HL
+	LD	(TIMEOUT_MS_LEFT),HL
+	LD	A,H
+	OR	L
+	JP	Z,.TIMEOUT
+	LD	A,(RX_DRAIN_LEFT)
+	DEC	A
+	LD	(RX_DRAIN_LEFT),A
+	JP	NZ,.DRAIN
 .TICK
 	CALL	TICK_AND_CHECK_KEY
 	JP	C,.TIMEOUT
@@ -684,11 +747,12 @@ MODE_DHCP	EQU APP_BSS_BASE + 12		; 1 byte (1=DHCP, 0=STATIC)
 STATIC_IP	EQU APP_BSS_BASE + 13		; 4 bytes (NET_IP for static mode)
 DEC_BUF		EQU APP_BSS_BASE + 17		; 4 bytes
 SRC_BUF		EQU APP_BSS_BASE + 21		; 16 bytes (NET_IP_SRC reader)
+RETRY_LEFT	EQU APP_BSS_BASE + 37		; 1 byte
 SET_BUF		EQU APP_BSS_BASE + 40		; 64 bytes (NAME=VALUE for SETENV)
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS IFUP v0.2",0
+MSG_BANNER	DB "RTL8019AS IFUP v",PACKAGE_VERSION,0
 MSG_STATIC_PRE	DB "Interface up: IP=",0
 MSG_STATIC_POST	DB " (static).",0
 MSG_DISCOVER	DB "DHCP: sending DISCOVER...",0

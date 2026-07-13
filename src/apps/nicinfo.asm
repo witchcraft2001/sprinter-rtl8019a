@@ -51,6 +51,7 @@ START
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@RTL.INIT_BASE
 	JP	C,SCAN_FAIL
+	CALL	@ISA.ISA_CLOSE		; all formatting/DSS calls require MMU3 restored
 
 	; [N0] Slot/Addr: N/#HHH  -- canonical form, matches the
 	; NET_RTL_HW env var written by INIT_BASE.
@@ -76,31 +77,41 @@ START
 	CALL	PRINT_HEX_NIBBLE
 	PRINT LINE_END
 
-	; Diagnostic scan of all 16 candidate bases on the active
-	; slot.  RTL_BASE_PTR is already set by INIT_BASE.
-	CALL	SCAN_BASES
-
 	; [N1] RESET
 	PRINT MSG_N1
+	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.RESET
-	JP	C,RESET_FAIL
-	PRINTLN MSG_OK
+	JP	C,RESET_OPEN_FAIL
 
 	; Mandatory: DCR=0x48 via the runtime base.
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_DCR_OFF),DCR_INIT
+	LD	A,(IX+RTL_CR_OFF)
+	LD	(CR_RAW),A
+	LD	A,(IX+RTL_ISR_OFF)
+	LD	(ISR_RAW),A
+
+	; Capture ID, PROM and actual registers while ISA is open;
+	; formatting starts only after the window is closed again.
+	CALL	@RTL.PROBE_ID
+	LD	HL,PROM_BUF
+	CALL	@RTL.READ_PROM
+	JP	C,PROM_OPEN_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	CAPTURE_PAGE3
+	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_OK
 
 	; [N2] CR=xx ISR=xx
 	PRINT MSG_N2
-	LD	A,(IX+RTL_CR_OFF)
+	LD	A,(CR_RAW)
 	CALL	@UTIL.PRINT_HEX_A
 	PRINT MSG_ISR_EQ
-	LD	A,(IX+RTL_ISR_OFF)
+	LD	A,(ISR_RAW)
 	CALL	@UTIL.PRINT_HEX_A
 	PRINT LINE_END
 
 	; [N3] RTL ID
-	CALL	@RTL.PROBE_ID
 	PRINT MSG_N3
 	LD	A,(@RTL.ID0_RAW)
 	CALL	PRINT_PRINTABLE
@@ -115,11 +126,6 @@ START
 	CALL	@UTIL.PRINT_HEX_A
 	PRINT MSG_PAREN_CLOSE
 	PRINT LINE_END
-
-	; PROM read (32 bytes from address 0x0000)
-	LD	HL,PROM_BUF
-	CALL	@RTL.READ_PROM
-	JP	C,PROM_FAIL
 
 	CALL	DETECT_LAYOUT
 	LD	(LAYOUT),A
@@ -168,9 +174,15 @@ START
 .LY_DONE
 	PRINT LINE_END
 
-	; [N5] register snapshot
-	CALL	@RTL.SNAPSHOT_REGS
+	; [N5] register snapshot captured before ISA_CLOSE.
 	CALL	PRINT_REG_DUMP
+
+	; [N6..N8] RTL8019AS board/EEPROM configuration.  This is
+	; especially important on real hardware: an accidental full-duplex
+	; setting or TP/CX fallback can lose frames even though TSR reports
+	; PTX success.  Capture happened above while ISA was open; all
+	; formatting is deliberately done with the system mapping restored.
+	CALL	PRINT_PAGE3
 
 	; -- determine RESULT --
 	LD	A,(@RTL.ID0_RAW)
@@ -189,13 +201,11 @@ START
 	JR	NZ,SIG_WARN
 
 	PRINTLN MSG_RESULT_OK
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_OK
 
 SIG_WARN
 	PRINTLN MSG_W_SIG
 	PRINTLN MSG_RESULT_OK
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_OK
 
 ID_BAD
@@ -204,24 +214,20 @@ ID_BAD
 	JR	C,NO_HW
 	PRINTLN MSG_W_NO_ID
 	PRINTLN MSG_RESULT_OK
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_OK
 
 NO_HW
 	PRINTLN MSG_RESULT_FAIL
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NO_HW
 
 RESET_FAIL
 	PRINTLN MSG_E_RESET
 	PRINTLN MSG_RESULT_FAIL
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NIC_ERR
 
 PROM_FAIL
 	PRINTLN MSG_E_PROM
 	PRINTLN MSG_RESULT_FAIL
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NIC_ERR
 
 SCAN_FAIL
@@ -232,8 +238,16 @@ SCAN_FAIL
 	; 0x300, so we cannot continue here either way.
 	PRINTLN MSG_E_SCAN
 	PRINTLN MSG_RESULT_FAIL
-	CALL	@ISA.ISA_CLOSE
 	DSS_RETURN EX_NO_HW
+
+RESET_OPEN_FAIL
+	CALL	@ISA.ISA_CLOSE
+	JP	RESET_FAIL
+
+PROM_OPEN_FAIL
+	CALL	@RTL.SNAPSHOT_REGS
+	CALL	@ISA.ISA_CLOSE
+	JP	PROM_FAIL
 
 
 ; ------------------------------------------------------
@@ -558,6 +572,178 @@ PRINT_REG_DUMP
 	PRINT LINE_END
 	RET
 
+
+; ------------------------------------------------------
+; CAPTURE_PAGE3: read the RTL8019AS-specific configuration
+; registers.  Caller has the ISA window open.  No DSS/BIOS calls.
+; The common driver remains in normal page 0/start state on return.
+; ------------------------------------------------------
+CAPTURE_PAGE3
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE3_START
+	LD	A,(IX+RTL_9346CR_OFF)
+	LD	(P3_9346),A
+	LD	A,(IX+RTL_CONFIG0_OFF)
+	LD	(P3_CFG0),A
+	LD	A,(IX+RTL_CONFIG1_OFF)
+	LD	(P3_CFG1),A
+	LD	A,(IX+RTL_CONFIG2_OFF)
+	LD	(P3_CFG2),A
+	LD	A,(IX+RTL_CONFIG3_OFF)
+	LD	(P3_CFG3),A
+	LD	A,(IX+RTL_CONFIG4_OFF)
+	LD	(P3_CFG4),A
+	LD	A,(IX+RTL_INTR_OFF)
+	LD	(P3_INTR),A
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	RET
+
+
+; ------------------------------------------------------
+; PRINT_PAGE3: print raw CONFIG values and a compact decode.
+; A full-duplex or non-UTP selection is a warning, not a fatal
+; NICINFO result: it may be intentional on another board/network.
+; ------------------------------------------------------
+PRINT_PAGE3
+	PRINT	MSG_N6
+	LD	A,(P3_9346)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_CFG0
+	LD	A,(P3_CFG0)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_CFG1
+	LD	A,(P3_CFG1)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_CFG2
+	LD	A,(P3_CFG2)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_CFG3
+	LD	A,(P3_CFG3)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_CFG4
+	LD	A,(P3_CFG4)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_INTR
+	LD	A,(P3_INTR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	LINE_END
+
+	PRINT	MSG_N7
+	LD	A,(P3_CFG0)
+	AND	CFG0_JP
+	JR	NZ,.MODE_JUMPER
+	LD	A,(P3_CFG3)
+	AND	CFG3_PNP
+	JR	NZ,.MODE_PNP
+	PRINT	MSG_MODE_RT
+	JR	.MODE_DONE
+.MODE_JUMPER
+	PRINT	MSG_MODE_JUMPER
+	JR	.MODE_DONE
+.MODE_PNP
+	PRINT	MSG_MODE_PNP
+.MODE_DONE
+	PRINT	MSG_MEDIA
+	LD	A,(P3_CFG0)
+	AND	CFG0_AUI
+	JR	NZ,.MEDIA_AUI
+	LD	A,(P3_CFG0)
+	AND	CFG0_BNC
+	JR	NZ,.MEDIA_BNC
+	PRINT	MSG_MEDIA_UTP
+	JR	.MEDIA_DONE
+.MEDIA_AUI
+	PRINT	MSG_MEDIA_AUI
+	JR	.MEDIA_DONE
+.MEDIA_BNC
+	PRINT	MSG_MEDIA_BNC
+.MEDIA_DONE
+	PRINT	MSG_PL
+	LD	A,(P3_CFG2)
+	AND	CFG2_PL_MASK
+	CP	CFG2_PL_10BT_NLT
+	JR	Z,.PL_UTP_NLT
+	CP	CFG2_PL_10B5
+	JR	Z,.PL_AUI
+	CP	CFG2_PL_10B2
+	JR	Z,.PL_BNC
+	PRINT	MSG_PL_AUTO
+	JR	.PL_DONE
+.PL_UTP_NLT
+	PRINT	MSG_PL_UTP_NLT
+	JR	.PL_DONE
+.PL_AUI
+	PRINT	MSG_PL_AUI
+	JR	.PL_DONE
+.PL_BNC
+	PRINT	MSG_PL_BNC
+.PL_DONE
+	PRINT	MSG_DUPLEX
+	LD	A,(P3_CFG3)
+	AND	CFG3_FUDUP
+	JR	Z,.DUPLEX_HALF
+	PRINT	MSG_DUPLEX_FULL
+	JR	.DUPLEX_DONE
+.DUPLEX_HALF
+	PRINT	MSG_DUPLEX_HALF
+.DUPLEX_DONE
+	PRINT	LINE_END
+
+	PRINT	MSG_N8
+	LD	A,(P3_CFG3)
+	AND	CFG3_PWRDN
+	JR	NZ,.POWER_DOWN
+	LD	A,(P3_CFG3)
+	AND	CFG3_SLEEP
+	JR	NZ,.POWER_SLEEP
+	PRINT	MSG_POWER_NORMAL
+	JR	.POWER_DONE
+.POWER_DOWN
+	PRINT	MSG_POWER_DOWN
+	JR	.POWER_DONE
+.POWER_SLEEP
+	PRINT	MSG_POWER_SLEEP
+.POWER_DONE
+	PRINT	MSG_ACTIVEB
+	LD	A,(P3_CFG3)
+	AND	CFG3_ACTIVEB
+	CALL	PRINT_BOOL
+	PRINT	MSG_IRQEN
+	LD	A,(P3_CFG1)
+	AND	CFG1_IRQEN
+	CALL	PRINT_BOOL
+	PRINT	MSG_IOMS
+	LD	A,(P3_CFG4)
+	AND	CFG4_IOMS
+	CALL	PRINT_BOOL
+	PRINT	LINE_END
+
+	LD	A,(P3_CFG3)
+	AND	CFG3_FUDUP
+	JR	Z,.NO_FUDUP_WARN
+	PRINTLN MSG_W_FUDUP
+.NO_FUDUP_WARN
+	LD	A,(P3_CFG0)
+	AND	CFG0_AUI | CFG0_BNC
+	JR	Z,.NO_MEDIA_WARN
+	PRINTLN MSG_W_MEDIA
+.NO_MEDIA_WARN
+	LD	A,(P3_CFG3)
+	AND	CFG3_PWRDN
+	RET	Z
+	PRINTLN MSG_W_PWRDN
+	RET
+
+
+; A=0 -> '0', A!=0 -> '1'.
+PRINT_BOOL
+	OR	A
+	LD	A,'0'
+	JR	Z,.OUT
+	INC	A
+.OUT
+	JP	PUTCHAR
+
 REG_NAMES
 	DB "CR",0
 	DB "ISR",0
@@ -572,7 +758,7 @@ REG_NAMES
 
 
 ; ------- messages -------
-MSG_BANNER	DB "RTL8019AS NICINFO v0.1",0
+MSG_BANNER	DB "RTL8019AS NICINFO v",PACKAGE_VERSION,0
 MSG_N0		DB "[N0] Slot/Addr: ",0
 MSG_N0_SEP	DB "/#",0
 MSG_N1		DB "[N1] RESET ",0
@@ -588,7 +774,37 @@ MSG_LAYOUT	DB "PROM_LAYOUT=",0
 MSG_DIRECT	DB "direct",0
 MSG_DOUBLED	DB "doubled",0
 MSG_UNKNOWN	DB "unknown",0
-MSG_N5		DB "[N5] REG ",0
+MSG_N5		DB "[N5] REG RAW ",0
+MSG_N6		DB "[N6] P3 9346=",0
+MSG_CFG0	DB " C0=",0
+MSG_CFG1	DB " C1=",0
+MSG_CFG2	DB " C2=",0
+MSG_CFG3	DB " C3=",0
+MSG_CFG4	DB " C4=",0
+MSG_INTR	DB " INTR=",0
+MSG_N7		DB "[N7] MODE=",0
+MSG_MODE_JUMPER DB "JUMPER",0
+MSG_MODE_PNP	DB "PNP",0
+MSG_MODE_RT	DB "RT-JUMPERLESS",0
+MSG_MEDIA	DB " MEDIA=",0
+MSG_MEDIA_UTP	DB "UTP",0
+MSG_MEDIA_AUI	DB "AUI",0
+MSG_MEDIA_BNC	DB "BNC",0
+MSG_PL		DB " PL=",0
+MSG_PL_AUTO	DB "AUTO",0
+MSG_PL_UTP_NLT DB "UTP-NOLINK",0
+MSG_PL_AUI	DB "AUI",0
+MSG_PL_BNC	DB "BNC",0
+MSG_DUPLEX	DB " DUPLEX=",0
+MSG_DUPLEX_HALF DB "HALF",0
+MSG_DUPLEX_FULL DB "FULL",0
+MSG_N8		DB "[N8] POWER=",0
+MSG_POWER_NORMAL DB "NORMAL",0
+MSG_POWER_SLEEP DB "SLEEP",0
+MSG_POWER_DOWN DB "DOWN",0
+MSG_ACTIVEB	DB " ACTIVEB=",0
+MSG_IRQEN	DB " IRQEN=",0
+MSG_IOMS	DB " IOMS=",0
 MSG_RESULT_OK	DB "RESULT OK",0
 MSG_RESULT_FAIL	DB "RESULT FAIL",0
 MSG_E_ID	DB "[E02] RTL ID mismatch",0
@@ -596,6 +812,9 @@ MSG_E_RESET	DB "[E01] RESET timeout",0
 MSG_E_PROM	DB "[E03] PROM read failed",0
 MSG_W_SIG	DB "[W01] PROM[0E..0F] != 57 57 (NE2000 signature mismatch)",0
 MSG_W_NO_ID	DB "[W02] ID mismatch but MAC plausible -- continuing",0
+MSG_W_FUDUP	DB "[W03] FUDUP=1: peer switch port must be forced 10M/full",0
+MSG_W_MEDIA	DB "[W04] selected medium is not UTP; check PL/link/cable",0
+MSG_W_PWRDN	DB "[W05] PWRDN=1: Ethernet transceiver is disabled",0
 MSG_SCAN_HDR	DB "Scan: ",0
 MSG_SCAN_INDENT	DB "      ",0
 MSG_SCAN_OK	DB "ok ",0
@@ -617,17 +836,30 @@ LINE_END	DB 13,10,0
 	INCLUDE "rtl8019.asm"
 
 
-; Root-scope marker at end of emitted image. BSS labels live past
-; this point so they never overlap with lib code or data.
+; Root-scope marker at end of emitted image (size diagnostics only).
 NICINFO_IMAGE_END
 
 ; -------- runtime BSS (no bytes emitted) --------
 	MODULE MAIN
 
-PROM_BUF	EQU NICINFO_IMAGE_END
+; Do not place writable state immediately after this small EXE.  DSS uses
+; memory in the 0x9xxx area while formatting output on real hardware; the
+; old P3_CFG3 at 0x910F changed from raw 0x20 to a value with bit 0x40 set
+; between two PRINT calls and falsely reported full duplex.  APP_BSS_BASE is
+; the project-wide reserved per-app region and remains below the ISA window.
+PROM_BUF	EQU APP_BSS_BASE
 MAC_BUF		EQU PROM_BUF + 32
 LAYOUT		EQU MAC_BUF + 6
-NICINFO_BSS_END	EQU LAYOUT + 1
+CR_RAW		EQU LAYOUT + 1
+ISR_RAW		EQU CR_RAW + 1
+P3_9346		EQU ISR_RAW + 1
+P3_CFG0		EQU P3_9346 + 1
+P3_CFG1		EQU P3_CFG0 + 1
+P3_CFG2		EQU P3_CFG1 + 1
+P3_CFG3		EQU P3_CFG2 + 1
+P3_CFG4		EQU P3_CFG3 + 1
+P3_INTR		EQU P3_CFG4 + 1
+NICINFO_BSS_END	EQU P3_INTR + 1
 
 	ENDMODULE
 

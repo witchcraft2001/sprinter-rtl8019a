@@ -108,7 +108,10 @@ for rel_path in "${DIST_EXTRA_FILES[@]}"; do
 done
 
 rm -f "$zip_path"
-cd "$repo_root/build/package"
-zip -qr "$zip_path" "$DIST_NAME"
+# Keep the archive flat, exactly like the FAT image.  A long top-level
+# directory named after DIST_NAME would itself violate the target's strict
+# 8.3 namespace when the zip is unpacked directly onto the Sprinter disk.
+cd "$package_root"
+zip -qr "$zip_path" .
 
 echo "Created $zip_path"

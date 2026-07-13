@@ -15,6 +15,7 @@ DIST_DIR_NAME="SPRTL"
 BUILD_APPS=(
   hello
   nicinfo
+  nicmode
   isaprobe
   nicram
   niclb
@@ -22,6 +23,7 @@ BUILD_APPS=(
   nicrx
   arp
   ping
+  pingalt
   udptest
   tftp
   netcfg
@@ -51,6 +53,7 @@ DIST_DOC_FILES=(
   docs/FTP.md
   docs/TFTP.md
   docs/ISAPROBE.md
+  docs/NICMODE.md
   LICENSE
 )
 

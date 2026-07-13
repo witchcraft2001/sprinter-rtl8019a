@@ -23,7 +23,9 @@
 - Этап 2: `NICRAM.EXE` — round-trip remote DMA в packet RAM.
 - Этап 3: `NICLB.EXE` — internal MAC loopback (`TCR=0x02`). Сейчас MAME
   возвращает loopback frame в RX ring, поэтому этап проверяется без какого
-  бы то ни было хостового сетевого backend.
+  бы то ни было хостового сетевого backend. Это расширение модели MAME:
+  физический RTL8019AS в loopback держит данные в diagnostic FIFO, не пишет
+  их в SRAM и не устанавливает `ISR.PRX`; `NICLB` поддерживает оба варианта.
 
 Запускать эти стейджи можно с `-networkprovider none` или вообще без флага.
 

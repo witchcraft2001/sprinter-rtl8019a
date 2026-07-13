@@ -2,7 +2,7 @@
 
 TFTP client, octet mode (RFC 1350) with RFC 2348 `blksize`
 option negotiation.  Both `GET` (download) and `PUT` (upload)
-are supported in v0.8.
+are supported by the current package.
 
 ## Usage
 
@@ -42,7 +42,7 @@ printing one `.` per buffer flush as a progress indicator.
 Download:
 
 ```
-RTL8019AS TFTP v0.8
+RTL8019AS TFTP v0.2.16
 
 GET IM2.TXT from 192.168.7.1
 .................................................
@@ -55,7 +55,7 @@ Upload (one dot per sent block):
 
 ```
 TFTP 192.168.7.1 PUT BOOT.BIN -o /tmp/boot.bin
-RTL8019AS TFTP v0.8
+RTL8019AS TFTP v0.2.16
 
 PUT BOOT.BIN to 192.168.7.1
 .....

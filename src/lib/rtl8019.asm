@@ -57,10 +57,10 @@ RTL_RESET_LOOPS		EQU 8000		; ~ ISR.RST poll budget
 RTL_RDC_LOOPS		EQU 4000		; remote DMA complete budget
 RTL_PROBE_TRIES		EQU 3			; presence-probe attempts (cold HW)
 RTL_PROBE_SETTLE	EQU 64			; DJNZ count: ISA settle before read-back
-; Remote-DMA data-port settle (DJNZ count).  Inserted on remote-DMA startup
-; and around each data-port byte.  A 2026-06-01 hardware test with SETTLE=100
-; showed the data port still returns 0xFF on the FIRST byte, so the failure is
-; NOT FIFO-readiness/timing -- left at 0 (no delay).  Kept as a tunable knob.
+RTL_HDR_RETRIES	EQU 4			; RX header re-read attempts before drop
+; Inter-byte busy waits do not lengthen the active ISA strobe.  They only keep
+; MMU3 mapped to ISA with interrupts disabled; SETTLE=32 held a max-frame DMA
+; open for longer than a 50 Hz system tick on real Sprinter hardware.
 RTL_DMA_SETTLE		EQU 0
 
 	MODULE RTL
@@ -460,6 +460,23 @@ PROBE_AT_IX
 	POP	HL
 	CP	0x55
 	JR	NZ,.MISS_NOPOP
+	; A floating or mirrored ISA window can pass the simple R/W
+	; test above.  The real target is RTL8019AS, so require the
+	; page-0 ID bytes as well before accepting an auto-scan hit.
+	PUSH	IX
+	POP	HL
+	LD	(HL),CR_PAGE0_STOP
+	LD	DE,RTL_ID0_OFF
+	ADD	HL,DE
+	CALL	.SETTLE
+	LD	A,(HL)
+	CP	RTL_ID0_VAL
+	JR	NZ,.MISS_NOPOP
+	INC	HL
+	CALL	.SETTLE
+	LD	A,(HL)
+	CP	RTL_ID1_VAL
+	JR	NZ,.MISS_NOPOP
 	OR	A
 	RET
 .MISS
@@ -509,9 +526,15 @@ RESET
 	ADD	HL,DE			; HL = RESET port addr
 	LD	A,(HL)			; read RESET (release in MAME -> device_reset)
 	LD	(HL),A			; write back (no-op on MAME)
-	PUSH	HL
+	; MMU3 must not remain mapped to ISA across millisecond delays.
+	; RESET is a public primitive that enters/exits with ISA open, so
+	; briefly close it for pacing and reopen before the second access.
+	CALL	@ISA.ISA_CLOSE
 	CALL	UTIL.DELAY_2MS
-	POP	HL
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(RTL_BASE_PTR)
+	LD	DE,RTL_RESET_OFF
+	ADD	HL,DE
 	LD	A,(HL)			; read RESET again -> device_reset
 	; Switch HL to ISR.
 	LD	HL,(RTL_BASE_PTR)
@@ -569,7 +592,7 @@ ID1_RAW		DB 0
 ; ------------------------------------------------------
 SNAPSHOT_REGS
 	LD	IX,(RTL_BASE_PTR)
-	; Page 0 reads.
+	; Page 0 readable state.
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
 	LD	A,(IX+RTL_CR_OFF)
 	LD	(REG_SNAPSHOT+0),A
@@ -581,7 +604,9 @@ SNAPSHOT_REGS
 	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
 	LD	A,(IX+RTL_CURR_OFF)
 	LD	(REG_SNAPSHOT+9),A
-	; Page 2 reads (DCR/RCR/TCR/IMR/PSTART/PSTOP).
+	; Page 2 provides the actual readable values for the page-0
+	; write-side configuration registers.  Read hardware, not software
+	; shadows, so a lost/corrupt write remains visible in diagnostics.
 	LD	(IX+RTL_CR_OFF),CR_PAGE2_STOP
 	LD	A,(IX+RTL_DCR_OFF)
 	LD	(REG_SNAPSHOT+2),A
@@ -721,6 +746,43 @@ DMA_SETTLE
 ; ======================================================
 
 PTX_LOOPS	EQU 16000
+TX_IDLE_LOOPS	EQU 16000
+TX_CLEAR_TRIES	EQU 32
+TX_DMA_TRIES	EQU 3
+TX_VERIFY_PREFIX EQU 42			; ETH + IPv4/ARP header prefix
+TX_STATUS_BITS	EQU ISR_PTX | ISR_TXE
+RX_TO_TX_GUARD_MS EQU 20		; one 50 Hz system-tick interval
+
+; TX_LAST_STAGE values.  Success walks 01 -> 04; E* values
+; identify the exact failed transition for capture-then-print
+; diagnostics after the caller closes the ISA window.
+TX_STAGE_IDLE	EQU 0x01
+TX_STAGE_DMA	EQU 0x02
+TX_STAGE_ARMED	EQU 0x03
+TX_STAGE_DONE	EQU 0x04
+TX_ERR_DMA	EQU 0xE0
+TX_ERR_BUSY	EQU 0xE1
+TX_ERR_STALE_ISR EQU 0xE2
+TX_ERR_CMD	EQU 0xE3			; reserved: old TXP re-trigger probe
+TX_ERR_TIMEOUT	EQU 0xE4
+TX_ERR_TXE	EQU 0xE5
+TX_ERR_VERIFY	EQU 0xE6
+
+TX_LAST_STAGE	EQU RTL_TX_LAST_STAGE
+TX_LAST_ISR	EQU RTL_TX_LAST_ISR
+TX_LAST_TSR	EQU RTL_TX_LAST_TSR
+TX_LAST_CR	EQU RTL_TX_LAST_CR
+TX_SOURCE_PTR	EQU RTL_TX_SOURCE_PTR
+TX_LENGTH	EQU RTL_TX_LENGTH
+TX_RETRY_LEFT	EQU RTL_TX_RETRY_LEFT
+TX_VERIFY_BUF	EQU RTL_TX_VERIFY_BUF
+TX_LAST_CLDA	EQU RTL_TX_LAST_CLDA
+TX_CFG0_PRE	EQU RTL_TX_CFG0_PRE
+TX_CFG3_PRE	EQU RTL_TX_CFG3_PRE
+TX_CFG0_POST	EQU RTL_TX_CFG0_POST
+TX_CFG3_POST	EQU RTL_TX_CFG3_POST
+TX_LAST_NCR	EQU RTL_TX_LAST_NCR
+TX_LAST_TPSR	EQU RTL_TX_LAST_TPSR
 
 ; ------------------------------------------------------
 ; INIT_NORMAL: full chip init for normal TX/RX.
@@ -731,15 +793,19 @@ PTX_LOOPS	EQU 16000
 	IFDEF USE_RTL_INIT_NORMAL
 INIT_NORMAL
 	LD	(.RCR_VALUE),A
+	XOR	A
+	LD	(RTL_RX_TO_TX_PENDING),A
 	PUSH	HL
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP
 	LD	(IX+RTL_DCR_OFF),DCR_INIT
 	LD	(IX+RTL_RBCR0_OFF),0
 	LD	(IX+RTL_RBCR1_OFF),0
-	LD	A,(.RCR_VALUE)
-	LD	(IX+RTL_RCR_OFF),A
-	LD	(IX+RTL_TCR_OFF),TCR_NORMAL
+	; Keep RX out of the ring while PAR/CURR/MAR are still being
+	; programmed.  Enabling normal receive too early is harmless in
+	; MAME but unstable on real DP8390/RTL8019AS hardware.
+	LD	(IX+RTL_RCR_OFF),RCR_MON
+	LD	(IX+RTL_TCR_OFF),TCR_LB_INTERNAL
 	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
 	LD	(IX+RTL_PSTART_OFF),RTL_PSTART_INIT
 	LD	(IX+RTL_PSTOP_OFF),RTL_PSTOP_INIT
@@ -770,6 +836,9 @@ INIT_NORMAL
 	LD	(IX+RTL_MAR0_OFF + 6),0
 	LD	(IX+RTL_MAR0_OFF + 7),0
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	(IX+RTL_TCR_OFF),TCR_NORMAL
+	LD	A,(.RCR_VALUE)
+	LD	(IX+RTL_RCR_OFF),A
 	RET
 .RCR_VALUE	DB 0
 	ENDIF
@@ -782,6 +851,8 @@ INIT_NORMAL
 ; ------------------------------------------------------
 	IFDEF USE_RTL_INIT_LOOPBACK
 INIT_LOOPBACK
+	XOR	A
+	LD	(RTL_RX_TO_TX_PENDING),A
 	PUSH	HL
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP
@@ -823,7 +894,11 @@ INIT_LOOPBACK
 
 
 ; ------------------------------------------------------
-; WAIT_PTX: poll ISR.PTX with timeout.
+; WAIT_PTX: wait for a NEW transmit result.  SEND_FRAME has
+; already verified that stale PTX/TXE bits were clear before
+; issuing TXP, so either bit here belongs to this transmission.
+; PTX succeeds; TXE is an immediate failure (do not burn the
+; whole timeout waiting for PTX after the chip reported an error).
 ; ------------------------------------------------------
 	IFDEF USE_RTL_WAIT_PTX
 WAIT_PTX
@@ -831,40 +906,296 @@ WAIT_PTX
 	LD	BC,PTX_LOOPS
 .LP
 	LD	A,(IX+RTL_ISR_OFF)
-	AND	ISR_PTX
-	JR	NZ,.OK
+	AND	TX_STATUS_BITS
+	JR	NZ,.EVENT
 	DEC	BC
 	LD	A,B
 	OR	C
 	JR	NZ,.LP
+	LD	A,TX_ERR_TIMEOUT
+	LD	(TX_LAST_STAGE),A
+	CALL	CAPTURE_TX_STATE
 	SCF
 	RET
-.OK
-	LD	(IX+RTL_ISR_OFF),ISR_PTX
+.EVENT
+	CALL	CAPTURE_TX_STATE
+	CALL	CAPTURE_TX_PHY_POST
+	LD	A,(TX_LAST_ISR)
+	AND	ISR_TXE
+	JR	NZ,.TX_ERROR
+	LD	A,TX_STATUS_BITS
+	LD	(IX+RTL_ISR_OFF),A
+	LD	A,TX_STAGE_DONE
+	LD	(TX_LAST_STAGE),A
 	OR	A
+	RET
+.TX_ERROR
+	LD	A,TX_STATUS_BITS
+	LD	(IX+RTL_ISR_OFF),A
+	LD	A,TX_ERR_TXE
+	LD	(TX_LAST_STAGE),A
+	SCF
 	RET
 	ENDIF
 
 
 ; ------------------------------------------------------
-; SEND_FRAME: DMA-write BC bytes from (HL) to packet RAM
-; 0x4000, set TBCR, trigger TX, wait PTX.
+; SEND_FRAME: DMA-write BC bytes from (HL) to the packet RAM
+; page selected by RTL_TPSR_INIT, set TBCR, trigger TX, wait PTX.
 ;   In: HL = source, BC = length.
 ; ------------------------------------------------------
 	IFDEF USE_RTL_SEND_FRAME
 SEND_FRAME
-	LD	(.LEN),BC
-	LD	DE,0x4000
+	LD	(TX_SOURCE_PTR),HL
+	LD	(TX_LENGTH),BC
+	; Mark per-attempt PHY diagnostics invalid until their exact phase is
+	; reached.  This prevents a pre-TX failure from printing values left by
+	; an older frame.
+	LD	A,0xFF
+	LD	(TX_CFG0_PRE),A
+	LD	(TX_CFG3_PRE),A
+	LD	(TX_CFG0_POST),A
+	LD	(TX_CFG3_POST),A
+	LD	(TX_LAST_NCR),A
+	LD	(TX_LAST_TPSR),A
+	; A successful RX immediately followed by TX is unreliable on the
+	; real Sprinter/RTL8019AS combination.  The v0.2.6 A/B test proved
+	; that one extra post-ARP screen line makes the same unicast ICMP
+	; frame work.  Replace that accidental delay with an explicit guard
+	; while the ISA window is CLOSED and system interrupts are enabled.
+	LD	A,(RTL_RX_TO_TX_PENDING)
+	OR	A
+	JR	Z,.NO_RX_GUARD
+	XOR	A
+	LD	(RTL_RX_TO_TX_PENDING),A
+	CALL	@ISA.ISA_CLOSE
+	LD	HL,RX_TO_TX_GUARD_MS
+	CALL	UTIL.DELAY_MS
+	CALL	@ISA.ISA_OPEN
+.NO_RX_GUARD
+	LD	IX,(RTL_BASE_PTR)
+	; Never overwrite TPSR packet RAM while an earlier transmit is
+	; still active.  More importantly, this establishes a clean
+	; transition instead of treating the previous packet's PTX as
+	; completion of the new one.
+	LD	BC,TX_IDLE_LOOPS
+.WAIT_IDLE
+	LD	A,(IX+RTL_CR_OFF)
+	AND	CR_TXP
+	JR	Z,.IDLE
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.WAIT_IDLE
+	LD	A,TX_ERR_BUSY
+	LD	(TX_LAST_STAGE),A
+	CALL	CAPTURE_TX_STATE
+	SCF
+	RET
+.IDLE
+	LD	A,TX_STAGE_IDLE
+	LD	(TX_LAST_STAGE),A
+	LD	A,TX_DMA_TRIES
+	LD	(TX_RETRY_LEFT),A
+.DMA_ATTEMPT
+	LD	HL,(TX_SOURCE_PTR)
+	LD	D,RTL_TPSR_INIT
+	LD	E,0
+	LD	BC,(TX_LENGTH)
 	CALL	DMA_WRITE
-	RET	C
-	; DMA_WRITE loaded IX; reuse it for TBCR/CR.
-	LD	BC,(.LEN)
+	JR	C,.DMA_ERROR
+	; A successful RDC only proves that the byte count reached zero.
+	; Read back the protocol/header prefix before TXP so a marginal ISA
+	; write cannot silently turn into PTX=success for a malformed frame.
+	; The short (max 42-byte) verification keeps the ISA-open interval
+	; bounded; it covers both MAC addresses, EtherType and the complete
+	; IPv4 header (or most of an ARP body).
+	LD	HL,(TX_SOURCE_PTR)
+	LD	BC,(TX_LENGTH)
+	CALL	VERIFY_TX_PREFIX
+	JR	NC,.DMA_OK
+	LD	A,TX_ERR_VERIFY
+	JR	.DMA_RETRY
+.DMA_ERROR
+	LD	A,TX_ERR_DMA
+.DMA_RETRY
+	LD	(TX_LAST_STAGE),A
+	LD	HL,TX_RETRY_LEFT
+	DEC	(HL)
+	JR	NZ,.DMA_ATTEMPT
+	CALL	CAPTURE_TX_STATE
+	SCF
+	RET
+.DMA_OK
+	; Stage 02 now means DMA write AND prefix read-back both passed.
+	LD	A,TX_STAGE_DMA
+	LD	(TX_LAST_STAGE),A
+	; DMA_WRITE loaded IX; reuse it for status/TBCR/CR.
+	LD	IX,(RTL_BASE_PTR)
+	LD	BC,(TX_LENGTH)
 	LD	(IX+RTL_TBCR0_OFF),C
 	LD	(IX+RTL_TBCR1_OFF),B
+	; ISR is write-one-to-clear.  Clear BOTH terminal TX bits and
+	; read them back until clear.  The old code wrote PTX once and
+	; immediately polled it after TXP; a delayed or lost clear can let
+	; the previous ARP's PTX masquerade as completion of the following
+	; ICMP frame.  The field retest will show whether this was the
+	; observed failure or only a latent repeat-TX bug.
+	LD	B,TX_CLEAR_TRIES
+.CLEAR_STATUS
+	LD	A,TX_STATUS_BITS
+	LD	(IX+RTL_ISR_OFF),A
+	LD	A,(IX+RTL_ISR_OFF)
+	AND	TX_STATUS_BITS
+	JR	Z,.STATUS_CLEAR
+	DJNZ	.CLEAR_STATUS
+	LD	A,TX_ERR_STALE_ISR
+	LD	(TX_LAST_STAGE),A
+	CALL	CAPTURE_TX_STATE
+	SCF
+	RET
+.STATUS_CLEAR
+	; Capture the medium actually selected and duplex configuration at the
+	; physical TX boundary.  Page 3 is read-only here; restore page 0 before
+	; issuing the single TXP command.
+	CALL	CAPTURE_TX_PHY_PRE
+	; TXP is an edge-like command and MUST be written exactly once.
+	; Do not re-issue it when an immediate CR/ISR read has not yet
+	; exposed TXP/PTX: on real hardware those reads can lag, and the
+	; old three-try "acceptance" probe produced three ARP frames and
+	; could disturb an in-progress unicast transmission.  WAIT_PTX
+	; proves acceptance by observing a new PTX/TXE; no event -> E4.
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START | CR_TXP
+	LD	A,TX_STAGE_ARMED
+	LD	(TX_LAST_STAGE),A
 	JP	WAIT_PTX
-.LEN	DW 0
 	ENDIF
+
+
+; ------------------------------------------------------
+; VERIFY_TX_PREFIX: compare the first min(BC,42) bytes of
+; packet RAM at RTL_TPSR_INIT*256 with the caller's source buffer.
+; A short read-back detects corrupted Ethernet/IP/ARP headers
+; without doubling the ISA-open time for a maximum-size frame.
+;   In: HL = source, BC = full frame length.
+;   Out: CF=0 identical + RDC; CF=1 mismatch/RDC timeout.
+; ------------------------------------------------------
+VERIFY_TX_PREFIX
+	LD	A,B
+	OR	A
+	JR	NZ,.CAP_LENGTH
+	LD	A,C
+	CP	TX_VERIFY_PREFIX + 1
+	JR	C,.HAVE_LENGTH
+.CAP_LENGTH
+	LD	BC,TX_VERIFY_PREFIX
+.HAVE_LENGTH
+	LD	DE,TX_VERIFY_BUF
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	(IX+RTL_RBCR0_OFF),C
+	LD	(IX+RTL_RBCR1_OFF),B
+	LD	(IX+RTL_RSAR0_OFF),0
+	LD	(IX+RTL_RSAR1_OFF),RTL_TPSR_INIT
+	LD	(IX+RTL_CR_OFF),CR_DMA_READ
+	CALL	DMA_SETTLE
+.COMPARE
+	LD	A,(IX+RTL_DATA_OFF)
+	LD	(DE),A
+	INC	DE
+	CP	(HL)
+	JR	NZ,.MISMATCH
+	INC	HL
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.COMPARE
+	LD	BC,RTL_RDC_LOOPS
+.WAIT_RDC
+	LD	A,(IX+RTL_ISR_OFF)
+	AND	ISR_RDC
+	JR	NZ,.OK
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.WAIT_RDC
+	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT
+	SCF
+	RET
+.MISMATCH
+	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	SCF
+	RET
+.OK
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT
+	OR	A
+	RET
+
+
+; ------------------------------------------------------
+; CAPTURE_TX_STATE: snapshot page-0 TX status without printing.
+; Requires ISA open; capture-then-print discipline applies.
+; ------------------------------------------------------
+CAPTURE_TX_STATE
+	LD	IX,(RTL_BASE_PTR)
+	; SEND_FRAME/WAIT_PTX always operate on page 0.  Read CR before
+	; anything else and do not rewrite it here: on a busy timeout a
+	; write without TXP would destroy the state we are diagnosing.
+	LD	A,(IX+RTL_CR_OFF)
+	LD	(TX_LAST_CR),A
+	LD	A,(IX+RTL_ISR_OFF)
+	LD	(TX_LAST_ISR),A
+	LD	A,(IX+RTL_TSR_OFF)
+	LD	(TX_LAST_TSR),A
+	LD	A,(IX+RTL_NCR_OFF)
+	LD	(TX_LAST_NCR),A
+	; Page-0 offsets 01/02 are read-side CLDA0/CLDA1.  Capture the raw
+	; local-DMA address for diagnostics only.  It is shared with local
+	; receive activity and is not a TX byte counter; traffic arriving
+	; before this snapshot can move it away from TPSR + TBCR.
+	LD	A,(IX+RTL_PSTART_OFF)
+	LD	(TX_LAST_CLDA + 0),A
+	LD	A,(IX+RTL_PSTOP_OFF)
+	LD	(TX_LAST_CLDA + 1),A
+	RET
+
+
+; ------------------------------------------------------
+; CAPTURE_TX_PHY_PRE / POST: read RTL8019AS CONFIG0 and
+; CONFIG3 around TXP.  These snapshots distinguish a stable
+; UTP/half-duplex configuration from TP/CX auto-detect changing
+; medium while the frame is being transmitted.  Requires ISA open;
+; no DSS calls, no EEPROM writes.  Transmission is not active when
+; either routine is called, so changing CR page bits is safe.
+; ------------------------------------------------------
+CAPTURE_TX_PHY_PRE
+	LD	IX,(RTL_BASE_PTR)
+	; Page 2 exposes the write-only-on-page-0 TPSR value.  Capture it at
+	; the exact TX boundary so PTX cannot hide transmission from a stale or
+	; corrupted packet-RAM page.
+	LD	(IX+RTL_CR_OFF),CR_PAGE2_START
+	LD	A,(IX+RTL_TPSR_OFF)
+	LD	(TX_LAST_TPSR),A
+	LD	(IX+RTL_CR_OFF),CR_PAGE3_START
+	LD	A,(IX+RTL_CONFIG0_OFF)
+	LD	(TX_CFG0_PRE),A
+	LD	A,(IX+RTL_CONFIG3_OFF)
+	LD	(TX_CFG3_PRE),A
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	RET
+
+CAPTURE_TX_PHY_POST
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE3_START
+	LD	A,(IX+RTL_CONFIG0_OFF)
+	LD	(TX_CFG0_POST),A
+	LD	A,(IX+RTL_CONFIG3_OFF)
+	LD	(TX_CFG3_POST),A
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	RET
 
 
 ; ------------------------------------------------------
@@ -873,7 +1204,33 @@ SEND_FRAME
 	IFDEF USE_RTL_RING_HAS_PACKET
 RING_HAS_PACKET
 	LD	IX,(RTL_BASE_PTR)
+	; Service an RX-ring overflow before reporting ring state.  When
+	; CURR catches BNRY the DP8390/RTL8019AS sets ISR.OVW and STOPS
+	; storing further frames until the documented overflow-recovery
+	; runs -- otherwise RX is wedged for good (classic "got one packet
+	; then nothing" symptom).  Every wait loop polls through here, so
+	; recovering at this single point keeps all utilities unwedged
+	; under load (busy LAN, slow drain) without touching the apps.
+	; ISR == 0xFF is a floating-bus glitch read (all latched bits set
+	; incl. RST is implausible during normal RX), not a real overflow
+	; -- skip recovery so a glitch does not trigger a needless
+	; stop/restart.
+	LD	A,(IX+RTL_ISR_OFF)
+	CP	0xFF
+	JR	Z,.GLITCH
+	AND	ISR_OVW
+	CALL	NZ,RECOVER_OVERFLOW
+	; Read BNRY and validate it is a real ring page.  On marginal
+	; silicon a register read can float to 0xFF (undriven ISA bus);
+	; an out-of-range BNRY/CURR is such a glitch.  Treat it as "ring
+	; empty" so the caller ticks (window closed -> bus/IRQ recover)
+	; instead of DMA-reading garbage from page 0 (BNRY=FF -> address
+	; 0x0000 = PROM/registers), which corrupts ring state and stalls.
 	LD	A,(IX+RTL_BNRY_OFF)
+	CP	RTL_PSTART_INIT
+	JR	C,.GLITCH
+	CP	RTL_PSTOP_INIT
+	JR	NC,.GLITCH
 	INC	A
 	CP	RTL_PSTOP_INIT
 	JR	C,.NW
@@ -882,10 +1239,54 @@ RING_HAS_PACKET
 	LD	B,A
 	LD	(IX+RTL_CR_OFF),CR_PAGE1_START
 	LD	A,(IX+RTL_CURR_OFF)
-	LD	C,A
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	; Validate CURR likewise.
+	CP	RTL_PSTART_INIT
+	JR	C,.GLITCH
+	CP	RTL_PSTOP_INIT
+	JR	NC,.GLITCH
+	LD	C,A
 	LD	A,B
 	CP	C
+	RET
+.GLITCH
+	; Impossible register read (floating 0xFF): report ring empty.
+	XOR	A
+	RET
+
+; ------------------------------------------------------
+; RECOVER_OVERFLOW: DP8390/RTL8019AS RX-ring overflow recovery.
+; Follows the National DP8390 datasheet sequence: stop the chip,
+; let any in-flight DMA finish, mask the ring with internal
+; loopback, flush every queued frame by re-syncing BNRY/CURR,
+; clear ISR.OVW and resume normal RX.  Flushing (rather than
+; reading the queued frames out) costs us the packets that were
+; in the ring at overflow time -- acceptable: the higher-level
+; retransmit/retry recovers them, and the alternative (a wedged
+; receiver) loses every subsequent frame.  This driver polls TX
+; to completion before entering any RX wait, so no transmit is
+; ever in progress here and the datasheet "resend" step is moot.
+; In:  IX = chip base.  Trashes A.  (DELAY_2MS preserves IX/DE/HL.)
+; ------------------------------------------------------
+RECOVER_OVERFLOW
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP	; STP + abort DMA
+	; Wait with the system page restored and IRQs enabled.  Reopen the
+	; same slot/base and reload IX before touching the NIC again.
+	CALL	@ISA.ISA_CLOSE
+	CALL	UTIL.DELAY_2MS			; wait out any in-flight RX/TX DMA (~1.6ms)
+	CALL	@ISA.ISA_OPEN
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_RBCR0_OFF),0
+	LD	(IX+RTL_RBCR1_OFF),0
+	LD	(IX+RTL_TCR_OFF),TCR_LB_INTERNAL	; loopback: no new frames enter the ring
+	; Flush the ring while stopped: drop everything, re-sync pointers.
+	LD	(IX+RTL_BNRY_OFF),RTL_BNRY_INIT
+	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
+	LD	(IX+RTL_CURR_OFF),RTL_CURR_INIT
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP
+	LD	(IX+RTL_ISR_OFF),0xFF		; clear OVW + all latched status
+	LD	(IX+RTL_TCR_OFF),TCR_NORMAL
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START	; resume normal RX
 	RET
 	ENDIF
 
@@ -914,11 +1315,23 @@ READ_PACKET
 	LD	D,A
 	LD	E,0
 	LD	(.PKT_ADDR),DE
+	LD	A,RTL_HDR_RETRIES
+	LD	(.HDR_TRIES),A
 	; Read 4-byte header.
+.READ_HDR
 	LD	HL,(.HDR_PTR)
 	LD	BC,4
 	CALL	DMA_READ
 	RET	C
+	; Validate RX status and next-page before trusting length.
+	LD	HL,(.HDR_PTR)
+	LD	A,(HL)			; status
+	AND	ISR_PRX
+	JP	Z,.BAD_HEADER_RETRY
+	INC	HL
+	LD	A,(HL)			; next page
+	CALL	VALID_RX_PAGE_A
+	JP	C,.BAD_HEADER_RETRY
 	; body_len_candidate = (hdr.len) - 4.
 	LD	HL,(.HDR_PTR)
 	INC	HL
@@ -933,18 +1346,27 @@ READ_PACKET
 	LD	BC,4
 	OR	A
 	SBC	HL,BC
-	; Cap at MAX_LEN.
-	LD	BC,(.MAX_LEN)
+	JP	C,.BAD_HEADER_RETRY
+	; Require a plausible Ethernet frame body.  The body length
+	; here excludes the DP8390's stored CRC.
 	LD	A,H
-	CP	B
-	JR	C,.LEN_OK
-	JR	NZ,.LEN_CAP
+	OR	A
+	JR	NZ,.MIN_OK
 	LD	A,L
-	CP	C
-	JR	C,.LEN_OK
-.LEN_CAP
-	LD	H,B
-	LD	L,C
+	CP	14
+	JP	C,.BAD_HEADER_RETRY
+.MIN_OK
+	; Reject frames that do not fit the caller's buffer.  Do not
+	; cap silently: a corrupt RX header would make us read from the
+	; wrong ring area and poison subsequent protocol parsing.
+	LD	BC,(.MAX_LEN)
+	LD	A,B
+	CP	H
+	JP	C,.BAD_HEADER_RETRY
+	JR	NZ,.LEN_OK
+	LD	A,C
+	CP	L
+	JP	C,.BAD_HEADER_RETRY
 .LEN_OK
 	LD	(.BODY_LEN),HL
 	; Compute body source address.
@@ -1004,14 +1426,40 @@ READ_PACKET
 	LD	HL,(.HDR_PTR)
 	INC	HL
 	LD	A,(HL)
-	DEC	A
-	CP	RTL_PSTART_INIT
-	JR	NC,.OK_BNRY
-	LD	A,RTL_PSTOP_INIT - 1
-.OK_BNRY
-	LD	(IX+RTL_BNRY_OFF),A
+	CALL	SET_BNRY_FROM_NEXT_A
+	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE | ISR_OVW
+	LD	A,1
+	LD	(RTL_RX_TO_TX_PENDING),A
 	LD	BC,(.BODY_LEN)
 	OR	A
+	RET
+.BAD_HEADER_RETRY
+	LD	HL,.HDR_TRIES
+	DEC	(HL)
+	JP	NZ,.READ_HDR
+.BAD_HEADER
+	; Bad status/length usually means a transient remote-DMA read
+	; glitch.  Re-reading above handles the transient case.  If the
+	; stored next page is sane, drop just this ring slot; otherwise
+	; advance BNRY by one page.  Avoid resyncing to CURR here: on
+	; real hardware a single bad header read can otherwise discard a
+	; whole burst of queued ARP/DHCP replies.
+	LD	HL,(.HDR_PTR)
+	INC	HL
+	LD	A,(HL)
+	CALL	VALID_RX_PAGE_A
+	JP	C,.DROP_ONE_PAGE
+	CALL	SET_BNRY_FROM_NEXT_A
+	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE | ISR_OVW
+	SCF
+	RET
+.DROP_ONE_PAGE
+	LD	IX,(RTL_BASE_PTR)
+	LD	HL,(.PKT_ADDR)
+	LD	A,H
+	LD	(IX+RTL_BNRY_OFF),A
+	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE | ISR_OVW
+	SCF
 	RET
 .HDR_PTR	DW 0
 .BODY_PTR	DW 0
@@ -1020,6 +1468,30 @@ READ_PACKET
 .BODY_LEN	DW 0
 .BODY_ADDR	DW 0
 .FIRST_LEN	DW 0
+.HDR_TRIES	DB 0
+
+; VALID_RX_PAGE_A: CF=0 if A is in [PSTART, PSTOP), CF=1 otherwise.
+VALID_RX_PAGE_A
+	CP	RTL_PSTART_INIT
+	JR	C,.BAD
+	CP	RTL_PSTOP_INIT
+	JR	NC,.BAD
+	OR	A
+	RET
+.BAD
+	SCF
+	RET
+
+; SET_BNRY_FROM_NEXT_A: A = packet next page (or CURR for resync).
+; Writes BNRY = A-1, wrapping PSTART -> PSTOP-1.  Requires IX = base.
+SET_BNRY_FROM_NEXT_A
+	DEC	A
+	CP	RTL_PSTART_INIT
+	JR	NC,.OK
+	LD	A,RTL_PSTOP_INIT - 1
+.OK
+	LD	(IX+RTL_BNRY_OFF),A
+	RET
 	ENDIF
 
 

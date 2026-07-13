@@ -7,6 +7,8 @@
 	IFNDEF	_DSS_INC
 	DEFINE	_DSS_INC
 
+	INCLUDE "version.inc"
+
 ; BIOS RST entry (Bios.* functions, e.g. EMM_FN0..7).  We need
 ; this to query the physical page numbers backing a paged-RAM
 ; block (BIOS_EMM_FN4) without going through DSS -- which is
@@ -49,6 +51,11 @@ DSS_RESIZE_MEM		EQU 0x3F
 DSS_EXIT            EQU 0x41
 DSS_ENVIRON         EQU 0x46							; environment variables (PAGE 2 @ 0xE400)
 DSS_APPINFO         EQU 0x47							; B=subfn, HL=buf: 0=cmdline 1=app dir 2=full EXE path
+
+; APPINFO sub-functions (selected by B).
+APPINFO_PARAMS      EQU 0x00
+APPINFO_EXE_HOMEDIR EQU 0x01
+APPINFO_EXE_FULLPATH EQU 0x02
 
 ; ENVIRON sub-functions (selected by B):
 ENV_INIT			EQU 0xFF							; reset env table

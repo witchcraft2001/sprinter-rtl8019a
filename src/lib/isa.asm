@@ -30,6 +30,9 @@ ISA_OPEN
 					; chip (incl. reset/data ports).  Match the
 					; espprobe pattern: keep IRQs off while open.
 	PUSH	AF,BC
+	LD	A,(IS_OPEN)
+	OR	A
+	JR	NZ,OPEN_ALREADY	; keep IRQs disabled while ISA remains mapped
 	LD	BC,PAGE3
 	IN	A,(C)
 	LD	(SAVE_MMU3),A
@@ -45,6 +48,9 @@ ISA_SLOT EQU $+1
 	LD	BC,PORT_ISA
 	XOR	A
 	OUT	(C),A
+	LD	A,1
+	LD	(IS_OPEN),A
+OPEN_ALREADY
 	POP	BC,AF
 	RET
 
@@ -54,17 +60,26 @@ ISA_SLOT EQU $+1
 ; ------------------------------------------------------
 ISA_CLOSE
 	PUSH	AF,BC
+	LD	A,(IS_OPEN)
+	OR	A
+	JR	Z,CLOSE_ALREADY
 	LD	A,0x01
 	LD	BC,PORT_SYSTEM
 	OUT	(C),A
 	LD	BC,PAGE3
 	LD	A,(SAVE_MMU3)
 	OUT	(C),A
+	XOR	A
+	LD	(IS_OPEN),A
 	POP	BC,AF
 	EI				; system page restored -- safe to take IRQs again
 	RET
+CLOSE_ALREADY
+	POP	BC,AF
+	RET				; preserve caller's current interrupt state
 
 SAVE_MMU3	DB 0
+IS_OPEN	DB 0
 
 	ENDMODULE
 	ENDIF

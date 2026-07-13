@@ -152,7 +152,7 @@ BUILD_CFG_PATH
 	; APPINFO subfn 1 -> application directory into PATH_BUF.
 	; ABI (DSS kernel API/AppInfo.asm): HL = result buffer.
 	LD	HL,PATH_BUF
-	LD	B,1
+	LD	B,APPINFO_EXE_HOMEDIR
 	LD	C,DSS_APPINFO
 	RST	DSS
 	JR	C,.fallback		; not supported -> current dir
@@ -173,6 +173,8 @@ BUILD_CFG_PATH
 	LD	A,(HL)
 	INC	HL
 	CP	'\'
+	JR	Z,.append
+	CP	'/'
 	JR	Z,.append
 	LD	(HL),'\'
 	INC	HL

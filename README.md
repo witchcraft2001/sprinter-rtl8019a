@@ -14,7 +14,7 @@ notes for MAME network setup are in `docs/MAME_NETWORK.md`.
 Stages 0..10 implemented and tested in MAME with a pcap
 backend on macOS:
 
-- `HELLO`, `NICINFO`, `NICRAM`, `NICLB`, `NICTX`, `NICRX`
+- `HELLO`, `NICINFO`, `NICMODE`, `NICRAM`, `NICLB`, `NICTX`, `NICRX`
   -- driver bring-up.
 - `ARP`, `PING` (with `-t/-n/-l/-i/-w` Windows-style
   flags), `UDPTEST`, `TFTP`, `NTP`, `NSLOOKUP` -- IPv4
@@ -35,6 +35,12 @@ REN NETSMPL.CFG NET.CFG
 
 Then edit `NET.CFG` for your local network (`RTL_IOBASE`, `IP`, `NETMASK`,
 `GATEWAY`, ...).
+
+On a physical RTL8019AS card, run `NICINFO` and read-only `NICMODE` before
+the first `IFUP`.  If the card reports `DUPLEX=FULL` while the switch/router
+port is left at auto-negotiation, run `NICMODE HALF -y` once.  Legacy
+10BASE-T does not negotiate duplex; the peer otherwise selects half-duplex
+while the card remains full-duplex, causing intermittent frame loss.
 
 ## Build
 

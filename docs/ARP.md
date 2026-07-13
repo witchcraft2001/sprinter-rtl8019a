@@ -14,7 +14,7 @@ ARP /?
 ## Example
 
 ```
-RTL8019AS ARP v0.2
+RTL8019AS ARP v0.2.16
 
 ARPING 192.168.7.1 from 192.168.7.5 (02:80:19:11:22:33)
 Reply from 192.168.7.1: 66:65:74:68:00:01
@@ -22,7 +22,7 @@ RESULT OK
 ```
 
 The current ARP cache is 1..4 entries inside the running utility
-and is not persisted; an "arp -a" listing is not available in v0.2.
+and is not persisted; an "arp -a" listing is not currently available.
 
 ## Exit codes
 

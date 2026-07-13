@@ -290,7 +290,11 @@ CHECKSUM
 	INC	IX
 	ADD	HL,DE
 	JR	NC,.NC
-	INC	HL			; carry-fold (rare second wrap is impossible after one INC)
+	INC	HL			; end-around carry
+	LD	A,H
+	OR	L
+	JR	NZ,.NC
+	INC	HL
 .NC
 	DEC	BC
 	DEC	BC

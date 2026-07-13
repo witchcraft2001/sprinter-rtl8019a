@@ -19,7 +19,7 @@ IFUP /?         help
 ## Example (DHCP)
 
 ```
-RTL8019AS IFUP v0.2
+RTL8019AS IFUP v0.2.16
 
 DHCP: sending DISCOVER...
 DHCP: got OFFER 192.168.7.100 (server 192.168.7.1)

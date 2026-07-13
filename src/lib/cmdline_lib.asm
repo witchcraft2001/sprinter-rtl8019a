@@ -4,8 +4,9 @@
 ; - Long flags (--xxx) are NOT supported.
 ; - Help: /?, -?, -h, /h.
 ;
-; Tokens at 0x8080 are NUL-terminated in-place (whitespace
-; replaced with 0). ARGV[i] points to token i in that buffer;
+; Tokens in the DSS buffer captured from IX at program entry are
+; NUL-terminated in-place (whitespace replaced with 0). ARGV[i]
+; points to token i in that buffer;
 ; CONSUMED[i] tracks per-token state.
 ;
 ; Typical use:
@@ -31,7 +32,8 @@
 ;   LD   B,0
 ;   CALL @CMDL.GET_POSITIONAL     ; CF=0 -> HL = "192.168.7.1"
 ;
-; Storage: 49 bytes BSS-style (ARGC, ARGV[16], CONSUMED[16]).
+; Storage: 51 bytes BSS-style (ARGC, ARGV[16], CONSUMED[16],
+; entry-time source pointer).
 ;
 ; License: BSD 3-Clause
 ; ======================================================
@@ -41,16 +43,16 @@
 
 	INCLUDE "memmap.inc"
 
-; DSS places the command line at IX-0x80, where IX is the entry
-; point.  For ORG 0x8080 / entry 0x8100 -> 0x8080 (small variant).
-; For ORG 0x4100 / entry 0x4200 -> 0x4180 (large variant).
-; Apps using the large variant must DEFINE CMDLINE_AT_LARGE
-; BEFORE including cmdline_lib (selects 0x4180 instead of 0x8080).
-	IFDEF CMDLINE_AT_LARGE
-CMDLINE_AT	EQU 0x4180
-	ELSE
-CMDLINE_AT	EQU 0x8080
-	ENDIF
+; DSS passes a pointer to the length-prefixed command-line buffer
+; in IX at application entry: [IX+0]=length, [IX+1..]=text.
+; IX is volatile after the first CALL/RST DSS, so every app using
+; this library must execute
+;
+;   LD (CMDL_SOURCE_PTR),IX
+;
+; as the very first instruction at START.  The pointer must never
+; be derived from ORG/entry addresses: the PSP placement is owned
+; by DSS and may differ between executable layouts/load contexts.
 
 	IFDEF USE_CMDL
 	IFNDEF USE_UTIL_PARSE_DEC_BYTE
@@ -75,7 +77,7 @@ CONSUMED	EQU CMDL_CONSUMED
 
 
 ; ------------------------------------------------------
-; PARSE: tokenize command line at 0x8080 in-place.
+; PARSE: tokenize the entry-time DSS command line in-place.
 ;   Trashes A,BC,DE,HL.
 ; ------------------------------------------------------
 PARSE
@@ -87,7 +89,7 @@ PARSE
 	LD	(HL),0
 	INC	HL
 	DJNZ	.ZL
-	LD	HL,CMDLINE_AT
+	LD	HL,(CMDL_SOURCE_PTR)
 	LD	A,(HL)
 	OR	A
 	RET	Z			; empty cmdline

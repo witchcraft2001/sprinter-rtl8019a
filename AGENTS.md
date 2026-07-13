@@ -261,11 +261,17 @@ DSS EXE header conventions used in this project (locked, taken from the
   and any future utility that pulls in large library code.
 
 **Choosing between the two variants is driven by command-line needs first,
-size only as a tie-breaker.** The small variant occupies `0x8080..0x80FF`,
-which is the same region DSS uses for the program command line. The header
-therefore competes with command-line storage and only short / no-argument
-utilities can use it safely. The large variant places the header at
-`0x4100..0x41FF`, leaving `0x8080` fully available for command-line parsing.
+size only as a tie-breaker.** The small variant occupies `0x8080..0x80FF`
+and is reserved for short/no-argument utilities. The large variant places
+the header at `0x4100..0x41FF`, providing the linear room required by
+multi-token clients. Neither address defines the PSP location; DSS chooses
+that location at load time.
+
+For both variants, DSS passes the actual PSP/length-prefixed command-line
+pointer in `IX` at entry (`[IX+0]` is the length). Any app accepting arguments
+must save `IX` as the very first instruction at `START`, before every `CALL`
+or `RST DSS`, and parse through that saved pointer. Never derive the PSP from
+`ORG`, the entry address, `Entry-0x80`, `0x8080`, or `0x4180`.
 
 Mandatory rule:
 
@@ -276,8 +282,8 @@ Mandatory rule:
   arguments or only one short flag/value.
 - Use the large variant (`ORG 0x4100`, entry `0x4200`, SP `0xBFFF`) for
   any utility that parses URLs, host names, file paths, multi-token
-  arguments or otherwise relies on the full DSS command-line buffer at
-  `0x8080`. Required for: `WGET`, `TFTP`, `FTP`, `NTP` (with server arg),
+  arguments or otherwise relies on the full DSS command-line buffer passed
+  through `IX`. Required for: `WGET`, `TFTP`, `FTP`, `NTP` (with server arg),
   `PING` (with host arg), `UDPTEST` (host/port/payload), and any future
   tool of the same shape.
 
@@ -438,8 +444,10 @@ These constraints are non-negotiable until the spec is updated:
 - Remote DMA command bytes (low 6 bits of CR; OR with the page bits as
   needed): `0x0A` = remote read + STA, `0x12` = remote write + STA,
   `0x1A` = send packet + STA, `0x22` = abort/complete remote DMA + STA.
-- NE2000-style packet RAM layout: `TPSR=0x40`, `PSTART=0x46`, `PSTOP=0x80`,
-  `BNRY=0x46`, `CURR=0x47`, page size 256 bytes. PROM (MAC + signature)
+- RTL8019AS byte-mode packet RAM layout: `TPSR=0x40`, `PSTART=0x46`,
+  `PSTOP=0x60`, `BNRY=0x46`, `CURR=0x47`, page size 256 bytes. The
+  datasheet limits PSTOP to 0x60 when `DCR.WTS=0`; 0x80 is only valid in
+  16-bit mode. PROM (MAC + signature)
   is read by remote DMA from `RSAR=0x0000` with `RBCR=32` and `CR=0x0A`.
 - Reset is full NE2000-style, never a single write:
   ```
@@ -538,12 +546,13 @@ The early driver is considered ready when:
   PROM MAC;
 - `NICRAM.EXE` confirms remote DMA round-trips at 16, 64, 256, and 1536
   bytes;
-- `NICLB.EXE` confirms both `PTX OK` and `LOOP RX OK` with payload match.
-  The current MAME branch implements internal MAC loopback in DP8390 TX
-  path (`dp8390.cpp:82`), so RX-side verification is mandatory. Skipping
-  the RX check is allowed only on an older MAME build that lacks the
-  loopback patch, and must print `LOOP RX SKIP OLD MAME` and finish with
-  `RESULT PARTIAL`, not `RESULT OK`.
+- `NICLB.EXE` confirms `PTX OK` plus the receive side appropriate to the
+  target. The current MAME branch stores the internal-loopback frame in
+  RX SRAM, so MAME must pass the header/payload comparison. A physical
+  RTL8019AS does not store loopback packets in SRAM and does not set
+  `ISR.PRX` (RTL8019AS datasheet section 6.6.2); on real hardware NICLB
+  instead captures and reports the diagnostic FIFO plus ISR/RSR. External
+  RX SRAM is then verified by `NICRX.EXE`.
 - `PING.EXE` receives ICMP echo replies from a local host or router;
 - every error path prints stage code and NIC registers;
 - there are no infinite waits without diagnostic output.

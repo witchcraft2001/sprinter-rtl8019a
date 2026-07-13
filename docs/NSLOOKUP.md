@@ -26,7 +26,7 @@ a working gateway plus host-side NAT or routing.  Without
 ## Example
 
 ```
-RTL8019AS NSLOOKUP v0.1
+RTL8019AS NSLOOKUP v0.2.16
 
 Querying google.com at 192.168.7.1 from 192.168.7.101
 Name:    google.com
@@ -34,7 +34,7 @@ Address: 74.125.205.113
 RESULT OK
 ```
 
-Only A records and a single-question query are handled in v0.1;
+Only A records and a single-question query are currently handled;
 AAAA, CNAME chasing, MX, and multi-question are not supported.
 Recursion is delegated to the server (RD=1 in the query).
 

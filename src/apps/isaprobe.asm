@@ -2,16 +2,18 @@
 ; ISAPROBE.EXE - ISA bus diagnostic for Sprinter.
 ;
 ; Modes:
-;   ISAPROBE                   activity map of both ISA slots
-;   ISAPROBE -s N              activity map of single slot (N=0/1)
+;   ISAPROBE                   safe 0x000..0x3FF map of both slots
+;   ISAPROBE -s N              safe 0x000..0x3FF map of slot N
+;   ISAPROBE -n BASE [-s N]    safe NE/DP8390 page-0/page-1 snapshot
 ;   ISAPROBE -d ADDR [LEN]     hex dump of LEN bytes at I/O ADDR
-;                              (ADDR/LEN are hex; LEN default 0x20)
+;                              (ADDR/LEN are hex; LEN default 0x10)
 ;   ISAPROBE -o FILE [-s N]    raw 16 KB binary window to FILE
 ;   ISAPROBE /?                this help
 ;
 ; The Sprinter ISA window is 14 bits wide (16 KB), mapping
 ; I/O 0x0000..0x3FFF to memory 0xC000..0xFFFF after ISA_OPEN.
-; ISAPROBE walks that whole window.
+; The default activity map deliberately stops at 0x3FF.  Explicit
+; -d and -o modes can still access the wider window when required.
 ;
 ; WARNING: reading some ISA registers has side effects --
 ; e.g. RTL8019AS reset port at BASE+0x1F triggers chip reset
@@ -33,14 +35,20 @@ EXE_VERSION		EQU 1
 	DEFINE USE_UTIL_EXIT
 	DEFINE USE_CMDL
 	DEFINE USE_FILE
-	DEFINE CMDLINE_AT_LARGE
 
 WINDOW_BYTES		EQU 0x4000		; 16 KB I/O window
 BLOCK_SIZE		EQU 32			; activity-map granularity
-BLOCKS_PER_LINE		EQU 64			; 64 * 32 = 2048 bytes/line
-LINES_TOTAL		EQU 8			; 8 * 2048 = 16 KB
+BLOCK_PROBE_BYTES	EQU 16			; avoid NE2000 data/reset ports
+; Default map is intentionally limited to conventional 10-bit ISA I/O.
+; Many old cards decode only A0..A9, so probing 0x400+ reaches aliases of
+; live registers.  UM9003AF at 0x300 can hold IOCHRDY on its 0x700 alias.
+BLOCKS_PER_LINE		EQU 32			; 32 * 32 = 1024 bytes
+LINES_TOTAL		EQU 1			; safe map: I/O 0x0000..0x03FF
 
 CHUNK_SIZE		EQU 512			; file write chunk
+
+NE_CR_PAGE0_STOP	EQU 0x21		; page 0, stop, abort remote DMA
+NE_CR_PAGE1_STOP	EQU 0x61		; page 1, stop, abort remote DMA
 
 EX_USAGE		EQU 1
 EX_NIC_ERR		EQU 3			; not used here, but kept consistent
@@ -67,6 +75,9 @@ EXE_HEADER
 	ORG 0x4200
 
 START
+	LD	(CMDL_SOURCE_PTR),IX	; must precede every CALL/RST DSS
+	LD	A,0xFF
+	LD	(OUT_FH),A
 	PRINTLN MSG_BANNER
 
 	CALL	@CMDL.PARSE
@@ -76,7 +87,10 @@ START
 	; Mode dispatch -- use GET_FLAG_VALUE so the flag's value
 	; token is captured in HL on the same call (HAS_FLAG would
 	; consume the flag and a subsequent GET_FLAG_VALUE would
-	; then miss it).  -d takes priority, then -o, else map.
+	; then miss it).  -n takes priority, then -d, -o, else map.
+	LD	A,'n'
+	CALL	@CMDL.GET_FLAG_VALUE
+	JP	NC,MODE_NECORE		; HL -> BASE string
 	LD	A,'d'
 	CALL	@CMDL.GET_FLAG_VALUE
 	JP	NC,MODE_DUMP		; HL -> ADDR string
@@ -117,9 +131,8 @@ MAP_ONE_SLOT
 	PRINT MSG_SLOT_POST
 	POP	AF
 	LD	(@ISA.ISA_SLOT),A
-	CALL	@ISA.ISA_OPEN
 
-	; Outer line loop: 8 lines, each line covers 0x800 bytes.
+	; Safe default map: conventional ISA I/O 0000..03FF.
 	LD	HL,ISA_BASE_A		; window start
 	LD	B,LINES_TOTAL
 .LINE_LP
@@ -137,12 +150,16 @@ MAP_ONE_SLOT
 	CALL	PUTCHAR
 	POP	HL
 
-	; Inner: 64 blocks per line.
+	; Inner: 32 blocks per line.
 	LD	C,BLOCKS_PER_LINE
 .BLOCK_LP
 	PUSH	BC
 	PUSH	HL
+	; Keep each ISA mapping bracket short.  In particular, DSS_PUTCHAR
+	; must run only after ISA_CLOSE restored the system page-3 mapping.
+	CALL	@ISA.ISA_OPEN
 	CALL	CLASSIFY_BLOCK	; in: HL, out: A = '.', '0', or 'X'
+	CALL	@ISA.ISA_CLOSE
 	CALL	PUTCHAR
 	POP	HL
 	; Advance HL by BLOCK_SIZE.
@@ -159,12 +176,14 @@ MAP_ONE_SLOT
 	POP	BC
 	DJNZ	.LINE_LP
 
-	CALL	@ISA.ISA_CLOSE
 	RET
 
 
 ; ------------------------------------------------------
-; CLASSIFY_BLOCK: read 32 bytes at HL.
+; CLASSIFY_BLOCK: sample the first 16 bytes of a 32-byte block at HL.
+; The second half of a NE2000 block contains the DMA data port and reset
+; port.  Merely reading BASE+0x1F can change device state, so the default
+; activity map must not touch it.
 ;   '.' if all bytes == 0xFF
 ;   '0' if all bytes == 0x00
 ;   'X' otherwise (live: at least two distinct values seen,
@@ -173,7 +192,7 @@ MAP_ONE_SLOT
 ; ------------------------------------------------------
 CLASSIFY_BLOCK
 	PUSH	HL
-	LD	B,BLOCK_SIZE
+	LD	B,BLOCK_PROBE_BYTES
 	LD	A,(HL)
 	LD	D,A			; D = first byte (reference)
 	; flag: 0 = all-equal-to-D, 1 = saw difference
@@ -221,8 +240,9 @@ MODE_DUMP
 	LD	(DUMP_ADDR),BC
 
 	; Optional LEN: try to read positional 0 (may be the LEN).
-	; Default 0x20.
-	LD	BC,0x20
+	; Default 0x10: page-0 register core only.  A 0x20 dump would also
+	; read the NE2000 DMA data and reset ports.
+	LD	BC,0x10
 	LD	(DUMP_LEN),BC
 	LD	B,0
 	CALL	@CMDL.GET_POSITIONAL
@@ -251,69 +271,180 @@ MODE_DUMP
 	CALL	PUTCHAR
 	PRINT LINE_END
 
-	CALL	@ISA.ISA_OPEN
-
-	; Walk dump bytes 16 at a time.
+	; Walk dump bytes 16 at a time.  Capture each row with ISA mapped,
+	; close the window, then format it through DSS.
 	LD	BC,(DUMP_ADDR)
-	; HL = ISA_BASE_A + ADDR
 	LD	HL,ISA_BASE_A
 	ADD	HL,BC
+	LD	(SRC_PTR),HL
 	LD	BC,(DUMP_LEN)
+	LD	(DUMP_REMAIN),BC
 .LP
+	LD	BC,(DUMP_REMAIN)
 	LD	A,B
 	OR	C
 	JR	Z,.DONE
-	; One row.
-	CALL	DUMP_ROW	; uses HL ptr, BC remaining; returns advanced.
+
+	; ROW_LEN = min(remaining, 16).
+	LD	A,B
+	OR	A
+	JR	NZ,.FULL_ROW
+	LD	A,C
+	CP	16
+	JR	C,.HAVE_ROW_LEN
+.FULL_ROW
+	LD	A,16
+.HAVE_ROW_LEN
+	LD	(ROW_LEN),A
+
+	; Capture row into ordinary Z80 RAM while ISA is open.
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(SRC_PTR)
+	LD	DE,CHUNK_BUF
+	LD	A,(ROW_LEN)
+	LD	C,A
+	LD	B,0
+	CALL	COPY_FROM_ISA
+	LD	(SRC_PTR),HL
+	CALL	@ISA.ISA_CLOSE
+
+	CALL	DUMP_ROW
+
+	; Advance printable I/O address and remaining byte count.
+	LD	A,(ROW_LEN)
+	LD	E,A
+	LD	D,0
+	LD	HL,(DUMP_ADDR)
+	ADD	HL,DE
+	LD	(DUMP_ADDR),HL
+	LD	HL,(DUMP_REMAIN)
+	OR	A
+	SBC	HL,DE
+	LD	(DUMP_REMAIN),HL
 	JR	.LP
 .DONE
-	CALL	@ISA.ISA_CLOSE
 	JP	@UTIL.EXIT_OK
 
 
-; DUMP_ROW: print one row "AAAA: HH HH ... | ASCII".
-; In:  HL = window ptr, BC = remaining bytes (at least 1)
-; Out: HL += 16 (or BC), BC -= consumed
+; ------------------------------------------------------
+; MODE_NECORE: -n BASE [-s N]
+; Select standard DP8390 page 0 and page 1 and capture the first 16
+; registers from each.  No reset, DMA data-port or BASE+0x1F access.
+; This is a destructive STOP/page-select operation, but leaves the core
+; stopped on page 0 and is safe for pre-driver hardware identification.
+; ------------------------------------------------------
+MODE_NECORE
+	CALL	PARSE_HEX_WORD
+	JP	C,USAGE_ERROR
+	LD	(DUMP_ADDR),BC
+
+	CALL	GET_SLOT_OR_DEFAULT
+	LD	(@ISA.ISA_SLOT),A
+
+	PRINT	MSG_NE_PRE
+	LD	BC,(DUMP_ADDR)
+	CALL	PRINT_HEX_WORD_BC
+	PRINT	MSG_DUMP_SLOT
+	LD	A,(@ISA.ISA_SLOT)
+	ADD	A,'0'
+	CALL	PUTCHAR
+	PRINT	LINE_END
+
+	LD	BC,(DUMP_ADDR)
+	LD	HL,ISA_BASE_A
+	ADD	HL,BC
+	LD	(SRC_PTR),HL
+
+	; Capture everything first; DSS is called only after ISA_CLOSE.
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(SRC_PTR)
+	LD	A,(HL)
+	LD	(NE_RAW_CR),A
+
+	LD	(HL),NE_CR_PAGE0_STOP
+	NOP
+	NOP
+	LD	HL,(SRC_PTR)
+	LD	DE,NE_PAGE0
+	LD	BC,16
+	CALL	COPY_FROM_ISA
+
+	LD	HL,(SRC_PTR)
+	LD	(HL),NE_CR_PAGE1_STOP
+	NOP
+	NOP
+	LD	HL,(SRC_PTR)
+	LD	DE,NE_PAGE1
+	LD	BC,16
+	CALL	COPY_FROM_ISA
+
+	; Leave the generic DP8390 stopped, page 0, remote DMA aborted.
+	LD	HL,(SRC_PTR)
+	LD	(HL),NE_CR_PAGE0_STOP
+	CALL	@ISA.ISA_CLOSE
+
+	PRINT	MSG_NE_RAW
+	LD	A,(NE_RAW_CR)
+	CALL	PRINT_HEX_BYTE
+	PRINT	LINE_END
+	PRINT	MSG_NE_P0
+	LD	HL,NE_PAGE0
+	CALL	PRINT_16_BYTES
+	PRINT	MSG_NE_P1
+	LD	HL,NE_PAGE1
+	CALL	PRINT_16_BYTES
+
+	; Validate only page-select and STOP bits.  Remote-DMA command bits
+	; are implementation-dependent on readback.
+	LD	A,(NE_PAGE0)
+	AND	0xC3
+	CP	0x01
+	JR	NZ,.FAIL
+	LD	A,(NE_PAGE1)
+	AND	0xC3
+	CP	0x41
+	JR	NZ,.FAIL
+	PRINTLN MSG_NE_OK
+	JP	@UTIL.EXIT_OK
+.FAIL
+	PRINT	MSG_NE_FAIL
+	LD	A,(NE_PAGE0)
+	CALL	PRINT_HEX_BYTE
+	LD	A,'/'
+	CALL	PUTCHAR
+	LD	A,(NE_PAGE1)
+	CALL	PRINT_HEX_BYTE
+	PRINT	LINE_END
+	LD	B,EX_NIC_ERR
+	JP	@UTIL.EXIT_FAIL
+
+
+; DUMP_ROW: print one captured row "AAAA: HH HH ... | ASCII".
+; Input is DUMP_ADDR, ROW_LEN and CHUNK_BUF.  ISA must be closed.
 DUMP_ROW
-	; Print I/O addr = HL - ISA_BASE_A.
-	PUSH	BC
-	PUSH	HL
-	LD	A,H
-	SUB	HIGH ISA_BASE_A
-	CALL	PRINT_HEX_BYTE
-	LD	A,L
-	CALL	PRINT_HEX_BYTE
+	LD	BC,(DUMP_ADDR)
+	CALL	PRINT_HEX_WORD_BC
 	LD	A,':'
 	CALL	PUTCHAR
 	LD	A,' '
 	CALL	PUTCHAR
-	POP	HL
-	POP	BC
 
-	; First pass: hex part, up to 16 bytes, padded.
-	; Save HL,BC for ASCII pass.
-	PUSH	BC
-	PUSH	HL
-	LD	D,16			; D = max bytes to print
-	LD	E,0			; E = bytes actually printed
+	; Hex part, padded to 16 columns.
+	LD	HL,CHUNK_BUF
+	LD	A,(ROW_LEN)
+	LD	C,A			; bytes left to print
+	LD	B,16			; columns left
 .HEX_LP
-	LD	A,B
-	OR	C
+	LD	A,C
+	OR	A
 	JR	Z,.HEX_PAD
 	LD	A,(HL)
-	PUSH	HL
-	PUSH	DE
-	PUSH	BC
 	CALL	PRINT_HEX_BYTE
 	LD	A,' '
 	CALL	PUTCHAR
-	POP	BC
-	POP	DE
-	POP	HL
 	INC	HL
-	DEC	BC
-	INC	E
-	DEC	D
+	DEC	C
+	DEC	B
 	JR	NZ,.HEX_LP
 	JR	.HEX_END
 .HEX_PAD
@@ -322,7 +453,7 @@ DUMP_ROW
 	CALL	PUTCHAR
 	CALL	PUTCHAR
 	CALL	PUTCHAR
-	DEC	D
+	DEC	B
 	JR	NZ,.HEX_PAD
 .HEX_END
 	; '|' separator.
@@ -331,13 +462,10 @@ DUMP_ROW
 	LD	A,' '
 	CALL	PUTCHAR
 
-	; Restore HL,BC to row start; print E ASCII bytes.
-	POP	HL
-	POP	BC
-	PUSH	BC
-	PUSH	HL
-	LD	D,E
-	LD	A,D
+	; ASCII part from the captured row.
+	LD	HL,CHUNK_BUF
+	LD	A,(ROW_LEN)
+	LD	B,A
 	OR	A
 	JR	Z,.ASC_END
 .ASC_LP
@@ -350,44 +478,12 @@ DUMP_ROW
 .DOT
 	LD	A,'.'
 .SHOW
-	PUSH	HL
-	PUSH	DE
-	PUSH	BC
 	CALL	PUTCHAR
-	POP	BC
-	POP	DE
-	POP	HL
 	INC	HL
-	DEC	D
+	DEC	B
 	JR	NZ,.ASC_LP
 .ASC_END
 	PRINT LINE_END
-	; Re-pop HL/BC to advance them by the consumed count.
-	POP	HL
-	POP	BC
-	; HL += E, BC -= E (E in low byte of saved DE; we've trashed DE
-	; but we know E was up to 16 and equal to min(BC, 16) at the
-	; start of the row).  Recompute consumed = min(BC, 16).
-	LD	A,B
-	OR	A
-	JR	NZ,.GE16
-	LD	A,C
-	CP	16
-	JR	C,.LT16
-.GE16
-	LD	A,16
-.LT16
-	; A = consumed bytes
-	LD	E,A
-	LD	D,0
-	ADD	HL,DE
-	; BC -= consumed
-	LD	A,C
-	SUB	E
-	LD	C,A
-	LD	A,B
-	SBC	A,0
-	LD	B,A
 	RET
 
 
@@ -431,7 +527,7 @@ MODE_FILE
 	LD	HL,(SRC_PTR)
 	LD	DE,CHUNK_BUF
 	LD	BC,CHUNK_SIZE
-	LDIR
+	CALL	COPY_FROM_ISA
 	LD	(SRC_PTR),HL
 	CALL	@ISA.ISA_CLOSE
 	; Write to file.
@@ -468,6 +564,43 @@ FILE_FAIL
 .NF
 	LD	B,EX_FILE
 	JP	@UTIL.EXIT_FAIL
+
+
+; ------------------------------------------------------
+; COPY_FROM_ISA: copy BC bytes from mapped ISA memory at HL to RAM at DE.
+; ISA must already be open.  Do not use Z80 block-transfer instructions
+; here: real Sprinter + UM9003AF completed scalar reads in activity-map but
+; stalled when the same registers were read with LDIR.
+; Out: HL/DE advanced, BC=0.  Trashes AF.
+; ------------------------------------------------------
+COPY_FROM_ISA
+	LD	A,B
+	OR	C
+	RET	Z
+.LP
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.LP
+	RET
+
+
+; HL -> 16 captured bytes in ordinary RAM.  ISA must be closed.
+PRINT_16_BYTES
+	LD	B,16
+.LP
+	LD	A,(HL)
+	CALL	PRINT_HEX_BYTE
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	HL
+	DJNZ	.LP
+	PRINT	LINE_END
+	RET
 
 
 ; ------------------------------------------------------
@@ -637,29 +770,36 @@ SHOW_HELP
 ; ------------------------------------------------------
 ; Messages.
 ; ------------------------------------------------------
-MSG_BANNER	DB "ISAPROBE v0.1",0
+MSG_BANNER	DB "ISAPROBE v",PACKAGE_VERSION,0
 MSG_SLOT_PRE	DB "Slot ",0
-MSG_SLOT_POST	DB " activity map (each char = 32 bytes; .=FF 0=00 X=live)",13,10,0
+MSG_SLOT_POST	DB " activity map 0000..03FF (32-byte blocks, sample16; .=FF 0=00 X=live)",13,10,0
 MSG_DUMP_PRE	DB "Hex dump @ I/O 0x",0
 MSG_DUMP_LEN	DB " len 0x",0
 MSG_DUMP_SLOT	DB " slot ",0
+MSG_NE_PRE	DB "NE core @ I/O 0x",0
+MSG_NE_RAW	DB "[N0] RAW CR=",0
+MSG_NE_P0	DB "[N1] PAGE0 ",0
+MSG_NE_P1	DB "[N2] PAGE1 ",0
+MSG_NE_OK	DB "[N3] CR page select OK",0
+MSG_NE_FAIL	DB "[E] CR page select mismatch P0/P1=",0
 MSG_FILE_PRE	DB "Writing 16 KB ISA window to ",0
 MSG_FILE_DONE	DB "Done.",0
 MSG_USAGE_ERR	DB "[E] usage error -- see help below.",0
 MSG_E_FILE	DB "[E] file create / write / close failed.",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  ISAPROBE                 activity map of both ISA slots",13,10
-	DB "  ISAPROBE -s N            single slot (N = 0 or 1)",13,10
+	DB "  ISAPROBE                 safe 0000..03FF map of both slots",13,10
+	DB "  ISAPROBE -s N            safe 0000..03FF map of slot N",13,10
+	DB "  ISAPROBE -n BASE [-s N]  safe NE page-0/page-1 snapshot",13,10
 	DB "  ISAPROBE -d ADDR [LEN]   hex dump LEN bytes at I/O ADDR (hex)",13,10
 	DB "  ISAPROBE -o FILE [-s N]  16 KB raw window to FILE",13,10
 	DB "  ISAPROBE /?              this help",13,10,13,10
-	DB "ADDR / LEN are hex (0x prefix optional). Default LEN 0x20.",13,10
+	DB "ADDR / LEN are hex (0x prefix optional). Default LEN 0x10.",13,10
 	DB "Default slot for -d / -o is 1.",13,10
-	DB "WARNING: ISAPROBE READS the full 14-bit I/O window.  Active",13,10
-	DB "  ISA devices (RTL8019AS in particular) may be reset or",13,10
-	DB "  perturbed by side-effect reads.  Use only for diagnosing",13,10
-	DB "  absent / unresponsive cards.",13,10,0
+	DB "WARNING: wide -d / -o reads may access the 14-bit window.",13,10
+	DB "  Partial address decoding can alias live registers and hang",13,10
+	DB "  a bus cycle; side-effect reads may reset a device.  Prefer",13,10
+	DB "  the safe map, then dump only a discovered 32-byte block.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
@@ -678,4 +818,9 @@ OUTPUT_PTR	EQU APP_BSS_BASE + 4		; 2
 OUT_FH		EQU APP_BSS_BASE + 6		; 1
 SRC_PTR		EQU APP_BSS_BASE + 7		; 2
 CHUNKS_LEFT	EQU APP_BSS_BASE + 9		; 2
+DUMP_REMAIN	EQU APP_BSS_BASE + 11		; 2
+ROW_LEN		EQU APP_BSS_BASE + 13		; 1
 CHUNK_BUF	EQU APP_BSS_BASE + 16		; CHUNK_SIZE
+NE_RAW_CR	EQU CHUNK_BUF			; 1
+NE_PAGE0	EQU CHUNK_BUF + 1		; 16
+NE_PAGE1	EQU CHUNK_BUF + 17		; 16
