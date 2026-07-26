@@ -22,6 +22,13 @@ backend on macOS:
 - `NETCFG`, `IFUP` (static + DHCP), `WGET` (HTTP/1.0),
   `FTP` (passive mode, work in progress).
 
+Stage 11 adds `UNETRTL.DLL`, a loadable library that exposes the
+stack to other DSS programs through the same numbered API the
+Sprinter Wi-Fi kit implements, so one consumer binary can drive
+either card.  It ships on the floppy image with its conformance
+test `UNETTEST.EXE`, and stays out of the release archive until it
+is validated on real hardware.  See `docs/UNETRTL.md`.
+
 ## Installing on Sprinter DSS
 
 The `distr/sprinter-rtl8019a.zip` archive and the FAT12 floppy image both
@@ -298,8 +305,10 @@ macOS.
 ## Layout
 
 ```
-src/include/      shared includes (DSS, Sprinter, RTL8019AS constants, macros)
-src/lib/          reusable driver and stack modules (planned)
+src/include/      shared includes (DSS, Sprinter, RTL8019AS constants, macros,
+                  UNET ABI mirror)
+src/lib/          reusable driver and stack modules
+src/dll/          libman 1.3 / L1 loadable libraries (UNETRTL.DLL)
 src/apps/         utility entry points
 config/           NET.CFG.sample
 docs/             user docs (shipped) and developer docs (not shipped)

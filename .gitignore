@@ -10,3 +10,4 @@ distr/
 # Local-only config; ship only NET.CFG.sample.
 NET.CFG
 config/NET.CFG
+.claude/

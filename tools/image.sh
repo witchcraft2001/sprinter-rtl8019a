@@ -66,6 +66,14 @@ for app in "${BUILD_APPS[@]}"; do
   copy_to_image_root "$repo_root/build/$upper.EXE" "$upper.EXE"
 done
 
+# The floppy image carries everything, including the diagnostics and the
+# experimental UNET DLL that the ZIP omits: this image is the test stand.
+# .DLL is binary, so copy_to_image_root moves it byte for byte.
+for dll in ${BUILD_DLLS[@]+"${BUILD_DLLS[@]}"}; do
+  upper="$(printf '%s' "$dll" | tr '[:lower:]' '[:upper:]')"
+  copy_to_image_root "$repo_root/build/$upper.DLL" "$upper.DLL"
+done
+
 for rel_path in "${DIST_DOC_FILES[@]}"; do
   src="$repo_root/$rel_path"
   base="$(basename "$rel_path")"

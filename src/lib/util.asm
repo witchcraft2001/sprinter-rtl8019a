@@ -729,6 +729,98 @@ _EXIT_S_OK	DB "RESULT OK",13,10,0
 _EXIT_S_FAIL	DB "RESULT FAIL",13,10,0
 	ENDIF
 
+	IFDEF USE_UTIL_FORMAT
+; ------------------------------------------------------
+; Buffer-writing formatters.  The PRINT_* helpers above all
+; go to DSS_PCHARS, which a library linked into a DLL must
+; never do; these write into a caller buffer instead.
+; ------------------------------------------------------
+
+; ------------------------------------------------------
+; FORMAT_DEC_A: byte in A as 1..3 ASCII decimal digits at
+; (DE), no leading zeros.  "0" emits a single '0'.
+;   In:  A = value, DE = destination.
+;   Out: DE = past the last digit.
+; Trashes A, B, C.  Preserves HL.
+; ------------------------------------------------------
+FORMAT_DEC_A
+	PUSH	AF
+	XOR	A
+	LD	(.EMITTED),A
+	POP	AF
+	LD	C,100
+	CALL	.DIGIT
+	LD	C,10
+	CALL	.DIGIT
+	ADD	A,'0'				; units digit always emitted
+	LD	(DE),A
+	INC	DE
+	RET
+; Emit A/C as one digit (suppressing a leading zero); A = A mod C.
+.DIGIT
+	LD	B,'0'
+.LOOP
+	SUB	C
+	JR	C,.UNDO
+	INC	B
+	JR	.LOOP
+.UNDO
+	ADD	A,C				; A = remainder
+	PUSH	AF
+	LD	A,B
+	CP	'0'
+	JR	NZ,.EMIT			; non-zero digit: always emit
+	LD	A,(.EMITTED)
+	OR	A
+	JR	Z,.SKIP				; leading zero: suppress
+.EMIT
+	LD	A,B
+	LD	(DE),A
+	INC	DE
+	LD	A,1
+	LD	(.EMITTED),A
+.SKIP
+	POP	AF
+	RET
+.EMITTED	EQU UTIL_HBUF + 3		; spare byte of the hex scratch
+
+; ------------------------------------------------------
+; FORMAT_IPV4: 4-byte IPv4 at (HL) as "a.b.c.d",0 at (DE).
+;   In:  HL = 4-byte address, DE = destination (>= 16 bytes).
+;   Out: DE -> the terminating NUL.
+; Trashes A, BC, HL.
+; ------------------------------------------------------
+FORMAT_IPV4
+	LD	B,4
+.NEXT
+	LD	A,(HL)
+	INC	HL
+	PUSH	BC
+	PUSH	HL
+	CALL	FORMAT_DEC_A
+	POP	HL
+	POP	BC
+	DEC	B
+	JR	Z,.END
+	LD	A,'.'
+	LD	(DE),A
+	INC	DE
+	JR	.NEXT
+.END
+	XOR	A
+	LD	(DE),A				; terminate; DE -> NUL
+	RET
+
+; ------------------------------------------------------
+; FORMAT_HEX_A: byte in A as exactly 2 ASCII hex digits at
+; (DE), DE += 2.  Unterminated -- callers chain these.
+;   In:  A = value, DE = destination.  Trashes A, C.
+; ------------------------------------------------------
+FORMAT_HEX_A
+	LD	C,A
+	JP	HEXB
+	ENDIF
+
 	IFDEF USE_UTIL_EXIT_NO_NIC
 ; ------------------------------------------------------
 ; EXIT_NO_NIC: print a clear "card not detected" line

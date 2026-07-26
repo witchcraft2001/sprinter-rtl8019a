@@ -54,12 +54,27 @@
 ; be derived from ORG/entry addresses: the PSP placement is owned
 ; by DSS and may differ between executable layouts/load contexts.
 
+; USE_CMDL pulls the whole argv machinery.  USE_CMDL_PARSE is the
+; pure-parser slice (PARSE_IPV4 / PARSE_U16) that resolve_lib needs and
+; that a DLL can take without the argv state, the help/usage text or
+; DIE_USAGE's print-and-exit.  USE_CMDL implies it, so EXEs are unchanged.
 	IFDEF USE_CMDL
+	IFNDEF USE_CMDL_PARSE
+	DEFINE USE_CMDL_PARSE
+	ENDIF
+	ENDIF
+
+	IFDEF USE_CMDL_PARSE
 	IFNDEF USE_UTIL_PARSE_DEC_BYTE
 	DEFINE USE_UTIL_PARSE_DEC_BYTE
 	ENDIF
+	ENDIF
+
+	IFDEF USE_CMDL
+	IFNDEF LIB_NO_CONSOLE			; DIE_USAGE is the only EXIT user
 	IFNDEF USE_UTIL_EXIT
 	DEFINE USE_UTIL_EXIT
+	ENDIF
 	ENDIF
 	ENDIF
 
@@ -420,6 +435,10 @@ IS_HELP
 	RET
 
 
+	ENDIF					; end of the USE_CMDL argv machinery
+
+	IFDEF USE_CMDL_PARSE
+
 ; ------------------------------------------------------
 ; PARSE_IPV4: HL = ASCIIZ; DE = 4-byte dest.
 ;   Out: dest filled, CF=0 ok; CF=1 parse error.
@@ -501,6 +520,10 @@ PARSE_U16
 	RET
 
 
+	ENDIF					; end of USE_CMDL_PARSE
+
+	IFDEF USE_CMDL
+	IFNDEF LIB_NO_CONSOLE
 ; ------------------------------------------------------
 ; DIE_USAGE: print HL as ASCIIZ usage and exit B=1.
 ; ------------------------------------------------------
@@ -509,8 +532,7 @@ DIE_USAGE
 	RST	DSS
 	LD	B,1
 	JP	@UTIL.EXIT_FAIL
-
-
+	ENDIF
 	ENDIF
 
 	ENDMODULE

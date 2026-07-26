@@ -654,7 +654,10 @@ WAIT_SYN_ACK
 .HAVE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
-	LD	BC,1518
+	LD	BC,1518			; @MAIN.RX_BUF_SIZE is documented but the
+					; apps define RX_BUF_SIZE outside MODULE MAIN,
+					; so it is not referenceable here.  All callers
+					; (apps and the UNET DLL) size RX_BUF at 1518.
 	CALL	@RTL.READ_PACKET
 	JP	C,.TICK
 	; Validate IPv4 + TCP from remote.
@@ -849,7 +852,10 @@ RECV
 .HAVE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
-	LD	BC,1518
+	LD	BC,1518			; @MAIN.RX_BUF_SIZE is documented but the
+					; apps define RX_BUF_SIZE outside MODULE MAIN,
+					; so it is not referenceable here.  All callers
+					; (apps and the UNET DLL) size RX_BUF at 1518.
 	CALL	@RTL.READ_PACKET
 	JP	C,.TICK
 	CALL	IS_TCP_FROM_PEER

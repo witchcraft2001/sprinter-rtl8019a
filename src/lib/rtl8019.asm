@@ -228,6 +228,7 @@ TRY_ENV_OVERRIDE
 	; auto-scan path.  ISA is CLOSED here either way.
 	LD	HL,0
 	LD	(RTL_BASE_PTR),HL
+	IFNDEF	LIB_NO_CONSOLE
 	LD	HL,MSG_HW_FALLBACK_PRE
 	LD	C,DSS_PCHARS
 	RST	DSS
@@ -237,12 +238,15 @@ TRY_ENV_OVERRIDE
 	LD	HL,MSG_HW_FALLBACK_POST
 	LD	C,DSS_PCHARS
 	RST	DSS
+	ENDIF
 .SILENT
 	SCF
 	RET
 
+	IFNDEF	LIB_NO_CONSOLE
 MSG_HW_FALLBACK_PRE	DB "[W] NET_RTL_HW=",0
 MSG_HW_FALLBACK_POST	DB " not usable, auto-scanning.",13,10,0
+	ENDIF
 
 
 ; ------------------------------------------------------

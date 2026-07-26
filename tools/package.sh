@@ -85,13 +85,46 @@ copy_simple() {
   copy_with_crlf "$src" "$package_root/$upper_base"
 }
 
+# Diagnostics and experimental DLLs are built and put on the floppy image
+# but kept out of the release ZIP.  The ZIP is the supported kit; a
+# half-validated component there invites bug reports against the whole
+# package.  See ZIP_EXCLUDE_* in tools/artifacts.sh.
+is_excluded() {
+  local needle="$1"
+  shift
+  # A bare "$@" under `set -u` with an empty array is an error on the
+  # bash 3.2 that ships with macOS, so guard on the count first.
+  [ "$#" -eq 0 ] && return 1
+  local item
+  for item in "$@"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 for app in "${BUILD_APPS[@]}"; do
+  if is_excluded "$app" ${ZIP_EXCLUDE_APPS[@]+"${ZIP_EXCLUDE_APPS[@]}"}; then
+    continue
+  fi
   upper="$(printf '%s' "$app" | tr '[:lower:]' '[:upper:]')"
   exe="$repo_root/build/$upper.EXE"
   if [ -f "$exe" ]; then
     cp "$exe" "$package_root/$upper.EXE"
   else
     echo "Warning: build/$upper.EXE not found, skipping" >&2
+  fi
+done
+
+for dll in ${BUILD_DLLS[@]+"${BUILD_DLLS[@]}"}; do
+  if is_excluded "$dll" ${ZIP_EXCLUDE_DLLS[@]+"${ZIP_EXCLUDE_DLLS[@]}"}; then
+    continue
+  fi
+  upper="$(printf '%s' "$dll" | tr '[:lower:]' '[:upper:]')"
+  dll_path="$repo_root/build/$upper.DLL"
+  if [ -f "$dll_path" ]; then
+    cp "$dll_path" "$package_root/$upper.DLL"
+  else
+    echo "Warning: build/$upper.DLL not found, skipping" >&2
   fi
 done
 

@@ -56,8 +56,10 @@
 	IFNDEF USE_UTIL_PARSE_HEX_BYTE
 	DEFINE USE_UTIL_PARSE_HEX_BYTE
 	ENDIF
+	IFNDEF LIB_NO_CONSOLE			; REQUIRE_* are the only EXIT users
 	IFNDEF USE_UTIL_EXIT
 	DEFINE USE_UTIL_EXIT
+	ENDIF
 	ENDIF
 	ENDIF
 
@@ -260,7 +262,13 @@ GET_U16
 ; REQUIRE_IP / REQUIRE_MAC: GET_IP/GET_MAC; on miss print
 ; "[E] env var <NAME> not set; run NETCFG -i first" and
 ; exit B=4 (config error). Never returns on miss.
+;
+; Gated out under LIB_NO_CONSOLE: a library that a DLL links
+; must never print to the consumer's screen nor terminate the
+; host process.  DLL callers use GET_IP / GET_MAC and map the
+; carry onto their own status code.
 ; ------------------------------------------------------
+	IFNDEF	LIB_NO_CONSOLE
 REQUIRE_IP
 	PUSH	HL			; save name ptr for error msg
 	CALL	GET_IP
@@ -291,6 +299,7 @@ _MISSING
 
 _MSG_PRE	DB "[E] env var ",0
 _MSG_POST	DB " not set; run NETCFG -i first",13,10,0
+	ENDIF
 
 
 	ENDIF

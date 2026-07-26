@@ -122,6 +122,7 @@ START
 	LD	HL,STATIC_IP
 	CALL	PRINT_IPV4
 	PRINTLN MSG_STATIC_POST
+	CALL	PUBLISH_NET_MARKER
 	JP	@UTIL.EXIT_OK
 
 .DHCP_FLOW
@@ -222,6 +223,7 @@ START
 	LD	HL,N_NET_LEASE_SEC
 	LD	IX,@DHCP.LEASE_SECS
 	CALL	SETENV_DEC32_BE
+	CALL	PUBLISH_NET_MARKER
 
 	PRINT MSG_ACK_PRE
 	LD	HL,@DHCP.OFFERED_IP
@@ -471,6 +473,23 @@ FMT_DEC_HL
 	INC	DE
 	DJNZ	.OUTL
 	RET
+
+
+; ------------------------------------------------------
+; PUBLISH_NET_MARKER: SETENV "NET=RTL".  A launcher reads NET to
+; decide which UNET DLL to load (the Wi-Fi kit publishes NET=WIFI).
+; UNETRTL.DLL also accepts the legacy state -- no NET at all, but
+; NET_IP and NET_MAC present -- so this is an addition, not a
+; requirement.  NETCFG -d removes it again.
+; ------------------------------------------------------
+PUBLISH_NET_MARKER
+	LD	HL,S_NET_RTL
+	LD	B,ENV_SET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	RET
+
+S_NET_RTL	DB "NET=RTL",0
 
 
 DO_SETENV

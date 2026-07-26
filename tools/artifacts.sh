@@ -32,6 +32,24 @@ BUILD_APPS=(
   nslookup
   wget
   ftp
+  unettest
+)
+
+# libman 1.3 / L1 DLLs, built with sprinter-mkdll from src/dll/<name>.asm
+# into build/<UPPERCASE>.DLL.
+BUILD_DLLS=(
+  unetrtl
+)
+
+# Diagnostics that ship on the floppy image but stay out of the release
+# ZIP.  UNETTEST is a conformance harness, and the UNET DLL API is still
+# experimental on this backend -- promote both once they are proven on
+# real hardware.
+ZIP_EXCLUDE_APPS=(
+  unettest
+)
+ZIP_EXCLUDE_DLLS=(
+  unetrtl
 )
 
 # Text/documentation files copied to the distribution root.
@@ -54,6 +72,7 @@ DIST_DOC_FILES=(
   docs/TFTP.md
   docs/ISAPROBE.md
   docs/NICMODE.md
+  docs/UNETRTL.md
   LICENSE
 )
 

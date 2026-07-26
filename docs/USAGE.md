@@ -31,6 +31,12 @@ the same layout: usage syntax, options, examples, exit codes.
 | `TFTP.TXT`    | TFTP download with RFC 2348 blksize                  |
 | `ISAPROBE.TXT`| ISA bus diagnostic when NICINFO can't find the card  |
 | `NICMODE.TXT` | Read/repair persistent RTL8019AS duplex mode         |
+| `UNETRTL.TXT` | UNET network DLL: TCP/UDP/DNS/ping for your own code |
+
+`UNETRTL.DLL` is for developers: it exposes the kit's network stack
+to your own DSS programs through the same numbered API the Sprinter
+Wi-Fi kit implements, so one binary can drive either card.  It ships
+on the floppy image with `UNETTEST.EXE`, not in the archive.
 
 `PINGALT.EXE` is a diagnostic twin of PING with TX moved to packet-RAM page
 `46`; use the same `PING.TXT` reference.  The other `NIC*` utilities

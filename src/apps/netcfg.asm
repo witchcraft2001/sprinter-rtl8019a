@@ -356,6 +356,13 @@ DO_INIT
 	LD	HL,N_NET_RTL_HW
 	LD	IX,@NETCFG.OUR_RTL_HW
 	CALL	SETENV_STR
+	; NET=RTL is the backend marker a launcher reads to decide which
+	; UNET DLL to load (the Wi-Fi kit publishes NET=WIFI).  UNETRTL.DLL
+	; also accepts the legacy state -- no NET at all, but NET_IP and
+	; NET_MAC present -- so an older configuration keeps working.
+	LD	HL,N_NET
+	LD	DE,V_RTL
+	CALL	SETENV_LITERAL
 
 	; IP_SRC and the IP/MASK/GW/DNS group depend on whether
 	; NET.CFG asked for DHCP.
@@ -837,10 +844,12 @@ N_NET_DNS2	DB "NET_DNS2",0
 N_NET_NTP	DB "NET_NTP",0
 N_NET_TZ	DB "NET_TZ",0
 N_NET_RTL_HW	DB "NET_RTL_HW",0
+N_NET		DB "NET",0
 		DB 0			; table terminator
 
 V_STATIC	DB "STATIC",0
 V_DHCP		DB "DHCP",0
+V_RTL		DB "RTL",0
 
 LINE_END	DB 13,10,0
 

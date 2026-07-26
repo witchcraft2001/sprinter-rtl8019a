@@ -38,8 +38,8 @@ ISA-8 RTL8019AS card.
 ## Project Structure & Module Organization
 
 This repository uses `src/include/` for shared include files, `src/lib/` for
-reusable DSS assembly modules (driver and stack), and `src/apps/` for utility
-entry points. Build outputs go to `build/`; distributable zip and floppy
+reusable DSS assembly modules (driver and stack), `src/dll/` for libman 1.3 /
+L1 loadable libraries, and `src/apps/` for utility entry points. Build outputs go to `build/`; distributable zip and floppy
 images go to `distr/`. Package membership is controlled by
 `tools/artifacts.sh`. User-facing documentation lives in `docs/`, batch and
 host-side examples in `examples/`, configuration templates in `config/`.
@@ -234,12 +234,45 @@ copy of the program. Concretely:
   the program reads BEFORE writing) stays in the `.EXE` as DB/DW. This
   rule is about *zero-filled* uninitialized buffers only.
 
+**Exception: `src/dll/*.asm`.** A libman DLL is relocated into window 1
+(`0x4000`) or window 2 (`0x8000`), so the absolute map below is unusable
+-- `0xA000..0xAFFF` is *inside* window 2, and libman packs several DLLs
+into one 16 KB page, so memory past the declared image length may belong
+to another library. DSS paged memory is no escape either, because paged
+blocks map through `WIN0`-`WIN3` and `WIN3` is the ISA window whenever
+the driver is active. A DLL therefore declares all of its BSS as
+`DS n,0` **inside** the image and points `memmap.inc` at it (see
+"Parameterized BSS" below). This exception applies to `src/dll/` only;
+every `.EXE` still follows the rule above.
+
 Project-wide runtime memory map for shared library buffers lives in
 `src/include/memmap.inc`. Each library exposes a single `EQU` for its
 buffer base and another for the size; per-app private buffers start at
 `APP_BSS_BASE` (also in `memmap.inc`). When you add a new library
 buffer, place it in `memmap.inc` -- do not pick an ad-hoc address in the
 library file.
+
+**Parameterized BSS.** Every address in `memmap.inc` is written as
+`<region base> + offset`, and the bases (`LIBBSS_BASE`, `CMDL_BSS_BASE`,
+`RESOLVE_BSS_BASE`, `TCP_BSS_BASE`, `UDP_BSS_BASE`, `ICMP_BSS_BASE`) get
+their historical absolute values unless `LIBBSS_CUSTOM` is defined. A DLL
+defines `LIBBSS_CUSTOM` plus its own bases before including `memmap.inc`.
+Two rules follow:
+
+- **Sizes must be literals, never a difference of two addresses.** In a
+  relocatable image both operands are relocated, so `EQU 0xAA26 - 0xAA00`
+  silently becomes wrong. Write `EQU 38`.
+- **The regression gate for any `memmap.inc` change is byte identity.**
+  Rebuild and `cmp` every `build/*.EXE` against a pre-change copy; the
+  default branch must reproduce the old map exactly.
+
+**`LIB_NO_CONSOLE`.** A library linked into a DLL must never print to the
+consumer's screen nor terminate the host process. The few library paths
+that call `DSS_PCHARS` or `DSS_EXIT` (`RTL.INIT_BASE`'s fallback warning,
+`NETENV.REQUIRE_IP`/`REQUIRE_MAC`, `CMDL.DIE_USAGE`, `UTIL.EXIT*`) are
+wrapped in `IFNDEF LIB_NO_CONSOLE`, which `src/dll/*.asm` defines. This is
+compile-time rather than a runtime flag so the message strings are deleted
+too, and so a forgotten flag write cannot paint over a consumer's screen.
 
 Required initialized data (default values, banner strings, lookup
 tables) stays in the `.EXE` as `DB/DW`. The rule applies to
@@ -291,6 +324,23 @@ If a utility starts as a no-arg diagnostic (small variant) and later grows
 command-line arguments, migrate it to the large variant in the same change
 that adds the arguments — do not try to keep the small header by squeezing
 arguments into a shorter buffer.
+
+**Exception: DLL consumers.** A program that loads a libman DLL must own
+exactly ONE 16 KB window, because the DLL needs the other one. The large
+variant straddles both (code at `0x4100` in window 1, `SP=0xBFFF` in
+window 2), so a DLL consumer uses the SMALL variant even when it takes
+arguments: `ORG 0x8080`, entry `0x8100`, stack and buffers placed after
+the image with `ASSERT STACK_TOP <= 0xC000`, and the DLL loaded into
+window 1. `src/apps/unettest.asm` is the reference. This is a property of
+being a DLL consumer, not a general licence to squeeze arguments into the
+small header.
+
+**The UNET ABI is a mirror, not a local file.** `src/include/unet.inc` is
+byte-identical to the frozen contract in the sibling `sprinter_wifi`
+project; both backends must compile against the same function numbers and
+error codes. `tools/build.sh` enforces this with `cmp` whenever the
+sibling is checked out. To change the ABI, change it there first, then
+re-copy — never edit the local copy.
 
 The required header padding is allowed and is not a runtime buffer; large
 runtime buffers still must live outside the `.EXE` image (BSS-style labels
