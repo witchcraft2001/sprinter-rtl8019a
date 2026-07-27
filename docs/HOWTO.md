@@ -231,8 +231,8 @@ FTP server.lan target.zip -u alice -p secret -y
 ## Versioning
 
 Every utility prints the same package version in its banner.  The
-current package version is `v0.2.16`: `0.2` identifies the common
-package/API feature line and the final `16` is the build/revision.
+current package version is `v0.2.20`: `0.2` identifies the common
+package/API feature line and the final `20` is the build/revision.
 Fix-only releases bump the third component.  A package-level API or
 feature-line change bumps the first or second component for every
 utility together.  The value is defined once in

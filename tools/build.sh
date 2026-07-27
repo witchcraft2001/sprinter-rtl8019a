@@ -80,7 +80,14 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
     echo "Warning: sprinter-mkdll not found (install libman or set UNET_LIBMAN_SRC); skipping DLL build" >&2
   else
     # This repo keeps its version in src/include/version.inc, not a VERSION
-    # file. The L1 header carries only major.minor.
+    # file.  The L1 numeric header carries only major.minor, while its
+    # 15-byte name field carries the complete human-readable package tag.
+    package_version="$(sed -n 's/.*PACKAGE_VERSION[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
+                      "$repo_root/src/include/version.inc" | head -1)"
+    [ -n "$package_version" ] || {
+      echo "Error: PACKAGE_VERSION must use major.minor.revision form" >&2
+      exit 1
+    }
     dll_version="$(sed -n 's/.*PACKAGE_VERSION[[:space:]]*"\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1.\2/p' \
                      "$repo_root/src/include/version.inc" | head -1)"
     [ -n "$dll_version" ] || dll_version="0.1"
@@ -97,9 +104,13 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
 
       # The L1 name field holds at most 15 bytes and is what l_info reports.
       case "$dll" in
-        unetrtl) dll_name="UNET RTL" ;;
+        unetrtl) dll_name="UNETRTL v$package_version" ;;
         *)       dll_name="$upper" ;;
       esac
+      if [ "${#dll_name}" -gt 15 ]; then
+        echo "Error: L1 text tag '$dll_name' exceeds the 15-byte header field" >&2
+        exit 1
+      fi
 
       "${mkdll_cmd[@]}" build "$src" \
         --format l1 --target 1.3 --assembler sjasmplus \
@@ -107,6 +118,15 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
         --name "$dll_name" --version "$dll_version" --no-compress -o "$out"
       "${mkdll_cmd[@]}" verify "$out" --target 1.3
       echo "Built $out"
+
+      # Keep a ready-to-use runtime DLL at the repository root.  Consumers
+      # can take this file directly; it is regenerated only after the L1
+      # container has passed verification above.
+      published="$repo_root/$upper.DLL"
+      if ! cmp -s "$out" "$published" 2>/dev/null; then
+        cp "$out" "$published"
+        echo "Published $published"
+      fi
     done
   fi
 fi

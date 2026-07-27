@@ -11,8 +11,13 @@
 ; Build (see tools/build.sh):
 ;   sprinter-mkdll build src/dll/unetrtl.asm --format l1 --target 1.3 \
 ;     --assembler sjasmplus -I src/include -I src/lib \
-;     --name "UNET RTL" --version 0.2 --no-compress \
+;     --name "UNETRTL v0.2.20" --version 0.2 --no-compress \
 ;     -o build/UNETRTL.DLL
+;
+; The L1 header has a compact, encoded major.minor version plus a
+; 15-byte human-readable name field.  tools/build.sh writes the full
+; PACKAGE_VERSION into that field as `UNETRTL v<version>` so consumers
+; can identify the exact DLL revision without decoding the header.
 ;
 ; --- Layout notes (read before editing) ---------------------------
 ;

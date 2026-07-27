@@ -35,8 +35,9 @@ the same layout: usage syntax, options, examples, exit codes.
 
 `UNETRTL.DLL` is for developers: it exposes the kit's network stack
 to your own DSS programs through the same numbered API the Sprinter
-Wi-Fi kit implements, so one binary can drive either card.  It ships
-on the floppy image with `UNETTEST.EXE`, not in the archive.
+Wi-Fi kit implements, so one binary can drive either card.  The
+ready-built DLL is also committed at the repository root and ships in
+the archive and floppy image; `UNETTEST.EXE` is floppy-only.
 
 `PINGALT.EXE` is a diagnostic twin of PING with TX moved to packet-RAM page
 `46`; use the same `PING.TXT` reference.  The other `NIC*` utilities

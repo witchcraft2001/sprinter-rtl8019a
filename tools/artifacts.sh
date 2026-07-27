@@ -42,15 +42,12 @@ BUILD_DLLS=(
 )
 
 # Diagnostics that ship on the floppy image but stay out of the release
-# ZIP.  UNETTEST is a conformance harness, and the UNET DLL API is still
-# experimental on this backend -- promote both once they are proven on
-# real hardware.
+# ZIP.  UNETTEST is a conformance harness.  UNETRTL.DLL is a published
+# runtime artifact and therefore ships in both the ZIP and the image.
 ZIP_EXCLUDE_APPS=(
   unettest
 )
-ZIP_EXCLUDE_DLLS=(
-  unetrtl
-)
+ZIP_EXCLUDE_DLLS=()
 
 # Text/documentation files copied to the distribution root.
 # docs/MAME_NETWORK.md is intentionally NOT shipped: it is developer-only.

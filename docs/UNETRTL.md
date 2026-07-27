@@ -190,6 +190,10 @@ covering both transports takes two runs.  A backend without
 Exit codes: `0` ok, `1` usage, `2` hardware not found, `3`
 communication or protocol error, `4` network not configured.
 
-`UNETTEST.EXE` and `UNETRTL.DLL` ship on the floppy image only; they
-are kept out of the release archive while the DLL API is still
-being validated on real hardware.
+`UNETRTL.DLL` is published at the repository root and ships in both
+the release archive and the floppy image, so a consumer can take the
+ready-built file without installing the assembler or libman.  Its L1
+header records the ABI line in the numeric version field and the full
+package revision in the 15-byte text tag, for example
+`UNETRTL v0.2.20`.  `UNETTEST.EXE` remains a floppy-only conformance
+harness.

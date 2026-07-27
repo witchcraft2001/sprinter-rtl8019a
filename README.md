@@ -25,9 +25,10 @@ backend on macOS:
 Stage 11 adds `UNETRTL.DLL`, a loadable library that exposes the
 stack to other DSS programs through the same numbered API the
 Sprinter Wi-Fi kit implements, so one consumer binary can drive
-either card.  It ships on the floppy image with its conformance
-test `UNETTEST.EXE`, and stays out of the release archive until it
-is validated on real hardware.  See `docs/UNETRTL.md`.
+either card.  The ready-built DLL is committed at the repository root
+and ships in both release formats; its L1 header includes the full
+human-readable package tag.  Its conformance test `UNETTEST.EXE`
+ships on the floppy image.  See `docs/UNETRTL.md`.
 
 ## Installing on Sprinter DSS
 
