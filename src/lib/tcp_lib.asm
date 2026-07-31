@@ -611,28 +611,63 @@ WRITE_TCP_CSUM
 ;   In:  HL = current sum, DE = ptr, BC = byte count (even).
 ;   Out: HL = updated sum, DE = past last byte.
 ;        Trashes A, BC.
+;
+; Chained-ADC implementation, ~55 T/word vs ~103 T/word for
+; the naive PUSH/POP word loop (the TCP checksum runs over
+; every outgoing segment, so this is on the hot send path).
+; Carry out of the low-byte add joins the next word's
+; high-byte add; carry out of the high-byte add is the
+; end-around carry and joins the same word's low-byte add;
+; the trailing carry is folded after the loop.
 ; ------------------------------------------------------
 CSUM_ACCUM_BE
-.LP
 	LD	A,B
 	OR	C
 	RET	Z
-	PUSH	BC
-	LD	A,(DE)
-	INC	DE
-	LD	B,A
-	LD	A,(DE)
-	INC	DE
-	LD	C,A
-	; BC = BE 16-bit word (B=hi, C=lo).
-	ADD	HL,BC
-	POP	BC
-	JR	NC,.NOC
+	EX	DE,HL			; HL = ptr, DE = accumulated sum
+	SRL	B
+	RR	C			; BC = word count (>= 1)
+	; Split into DJNZ chunks: inner = C words (0 -> 256), plus
+	; B extra 256-word chunks (one fewer when C = 0).  Stored as
+	; count+1 so the loop tail can test with a CF-preserving DEC.
+	LD	A,C
+	OR	A
+	LD	A,B
+	JR	NZ,.HAVE_OUT
+	DEC	A
+.HAVE_OUT
+	INC	A
+	LD	(.OUTREM + 1),A		; self-mod: outer chunks + 1
+	LD	B,C			; inner word counter (0 -> 256)
+	OR	A			; clear CF for the first ADC
+.WLP
+	LD	A,D
+	ADC	A,(HL)			; high byte (+ carry from prev word)
+	LD	D,A
 	INC	HL
-.NOC
-	DEC	BC
-	DEC	BC
-	JR	.LP
+	LD	A,E
+	ADC	A,(HL)			; low byte (+ end-around carry)
+	LD	E,A
+	INC	HL
+	DJNZ	.WLP
+.OUTREM
+	LD	A,0			; self-modified: chunks remaining + 1
+	DEC	A			; preserves CF
+	JR	Z,.FOLD
+	LD	(.OUTREM + 1),A
+	JR	.WLP			; B = 0 -> next chunk is 256 words
+.FOLD
+	; Fold the trailing carry end-around into D:E.
+	LD	A,D
+	ADC	A,0
+	LD	D,A
+	JR	NC,.FOLDED
+	INC	E
+	JR	NZ,.FOLDED
+	INC	D
+.FOLDED
+	EX	DE,HL			; HL = sum, DE = past last byte
+	RET
 
 
 ; ------------------------------------------------------
@@ -854,15 +889,22 @@ RECV
 .LP
 	CALL	@RTL.RING_HAS_PACKET
 	JR	NZ,.HAVE
-.TICK					; reached every pass: tick + key poll
-	CALL	@MAIN.TICK_AND_CHECK_KEY
-	JP	C,.CANCEL
+.TICK					; reached every pass
+	; Consume the budget BEFORE the 1 ms tick: the final pass then
+	; returns without a wasted delay.  This matters for the ACK
+	; drain pattern (RECV_TIMEOUT=1 with a queued packet): the ACK
+	; is consumed and RECV returns immediately instead of always
+	; paying a full tick on the way out.
 	LD	HL,(TCP_TIMEOUT_LEFT)
 	DEC	HL
 	LD	(TCP_TIMEOUT_LEFT),HL
 	LD	A,H
 	OR	L
-	JP	NZ,.LP
+	JR	Z,.TIMED_OUT
+	CALL	@MAIN.TICK_AND_CHECK_KEY
+	JP	C,.CANCEL
+	JP	.LP
+.TIMED_OUT
 	LD	A,F_TIMEOUT
 	LD	(TCP_LAST_FAIL),A
 	SCF

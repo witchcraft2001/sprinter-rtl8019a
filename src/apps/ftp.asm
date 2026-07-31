@@ -730,20 +730,22 @@ START
 	INC	HL
 	LD	(BODY_TOTAL_HI),HL
 .PUT_NOC
-	; Non-blocking ACK drain (keeps SND_UNA moving).  When the ring
-	; is idle, cycle the ISA window instead: it would otherwise stay
-	; open (IRQs masked) for a whole 8 KB block, starving the 50 Hz
-	; system tick.  A close/open pair lets a pending IRQ through.
+	; Breathe every slice: close the ISA window (lets a pending
+	; 50 Hz IRQ through -- it would otherwise stay masked for a
+	; whole 8 KB block) and poll Esc/Ctrl+C, without any delay.
+	; RECV no longer key-polls in drain mode (timeout consumed
+	; before the tick), so this is the upload's only cancel path.
+	CALL	BREATHE_AND_CHECK_KEY
+	JP	C,USER_ABORT
+	; Non-blocking ACK drain (keeps SND_UNA moving).  With the
+	; reordered RECV tick this costs only the ACK parse itself.
 	CALL	@RTL.RING_HAS_PACKET
-	JR	Z,.PUT_BREATHE
+	JR	Z,.PUT_NO_ACK
 	LD	HL,1
 	LD	(@TCP.RECV_TIMEOUT),HL
 	CALL	@TCP.RECV
 	; CF=1 here means timeout (ok) or peer closed (caught later).
-	JP	.PUT_SLICE_LOOP
-.PUT_BREATHE
-	CALL	@ISA.ISA_CLOSE
-	CALL	@ISA.ISA_OPEN
+.PUT_NO_ACK
 	JP	.PUT_SLICE_LOOP
 
 
@@ -1438,10 +1440,17 @@ WAIT_FOR_ARP_REPLY
 
 ; ------------------------------------------------------
 ; TICK_AND_CHECK_KEY: ~1 ms wait + Esc/Ctrl+C poll.
+; BREATHE_AND_CHECK_KEY: same poll without the delay -- used by
+; the PUT slice loop, which must service IRQs and the keyboard
+; every segment without paying 1 ms each time.
 ; ------------------------------------------------------
+BREATHE_AND_CHECK_KEY
+	CALL	@ISA.ISA_CLOSE		; EI window: pending 50Hz IRQ is taken here
+	JR	TICK_AND_CHECK_KEY.SCAN
 TICK_AND_CHECK_KEY
 	CALL	@ISA.ISA_CLOSE		; close window + EI BEFORE the delay so the
 	CALL	@UTIL.DELAY_1MS		; 50Hz system IRQ is serviced during the wait
+.SCAN
 	LD	C,DSS_SCANKEY
 	RST	DSS
 	JR	Z,.NO_KEY
@@ -1496,6 +1505,7 @@ ARP_TIMEOUT
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 .CAN
+USER_ABORT
 	CALL	@ISA.ISA_CLOSE
 	PRINTLN MSG_ABORTED
 	LD	B,EX_CANCEL
