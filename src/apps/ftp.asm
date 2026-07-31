@@ -661,38 +661,65 @@ START
 
 
 ; --------------------------------------------------------------------
-; PUT (STOR) data loop.  Read up to FTP_PUT_CHUNK bytes from OUT_FH,
-; ship through the data session via TCP.SEND.  Each TCP.SEND posts
-; one PSH+ACK segment and returns immediately; after every chunk we
+; PUT (STOR) data loop.  Fill FTP_DATA_BUF with one big DSS read
+; (8 KB serves ~15 MSS-sized segments -- reading the file per
+; segment made DSS call overhead dominate upload throughput), then
+; ship it as MSS-sized slices via TCP.SEND.  Each TCP.SEND posts
+; one PSH+ACK segment and returns immediately; after every slice we
 ; give the chip a chance to drain a peer ACK so SND_UNA doesn't fall
 ; arbitrarily far behind SND_NXT.  EOF (DSS_READ -> 0 bytes) jumps
 ; back to .DATA_TRANSFER_DONE for the unified close-out / 226 read.
 ; --------------------------------------------------------------------
 .PUT_DATA_LOOP
-	; Read up to one MSS into FTP_DATA_BUF.
+	; Fill FTP_DATA_BUF (ISA closed for the DSS call).
 	CALL	@ISA.ISA_CLOSE
 	LD	HL,FTP_DATA_BUF
-	LD	DE,FTP_PUT_CHUNK
+	LD	DE,FTP_DATA_BUF_SIZE
 	LD	A,(OUT_FH)
 	LD	C,DSS_READ_FILE
 	RST	DSS
 	JP	C,FILE_FAIL
 	LD	A,D
 	OR	E
-	JR	NZ,.PUT_HAVE_DATA
+	JR	NZ,.PUT_BLOCK_READY
 	CALL	@ISA.ISA_OPEN
-	JP	Z,.DATA_TRANSFER_DONE	; nothing left to send
-.PUT_HAVE_DATA
-	CALL	@ISA.ISA_OPEN
-
-	; Send the chunk.  TCP.SEND wants HL=ptr, BC=length.
+	JP	.DATA_TRANSFER_DONE	; EOF -- nothing left to send
+.PUT_BLOCK_READY
+	LD	(PUT_BLK_LEFT),DE
 	LD	HL,FTP_DATA_BUF
-	LD	B,D
-	LD	C,E
+	LD	(PUT_BLK_PTR),HL
+	; Progress dot per 8 KB block (matches the GET cadence).
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	CALL	@ISA.ISA_OPEN
+.PUT_SLICE_LOOP
+	; Slice length = min(FTP_PUT_CHUNK, PUT_BLK_LEFT).
+	LD	HL,(PUT_BLK_LEFT)
+	LD	A,H
+	OR	L
+	JP	Z,.PUT_DATA_LOOP	; block drained -> refill
+	LD	BC,FTP_PUT_CHUNK
+	OR	A
+	SBC	HL,BC
+	JR	NC,.PUT_LEN_OK
+	ADD	HL,BC			; short tail: send what is left
+	LD	B,H
+	LD	C,L
+	LD	HL,0
+.PUT_LEN_OK
+	LD	(PUT_BLK_LEFT),HL
+
+	; Send the slice.  TCP.SEND wants HL=ptr, BC=length.
+	LD	HL,(PUT_BLK_PTR)
 	PUSH	BC
+	PUSH	HL
 	CALL	@TCP.SEND
+	POP	HL
 	POP	BC
 	JP	C,DATA_RX_FAIL
+	ADD	HL,BC
+	LD	(PUT_BLK_PTR),HL
 
 	; BODY_TOTAL += bytes sent.
 	LD	HL,(BODY_TOTAL_LO)
@@ -703,25 +730,21 @@ START
 	INC	HL
 	LD	(BODY_TOTAL_HI),HL
 .PUT_NOC
-
-	; Progress dot per chunk -- briefly close ISA so PUTCHAR
-	; reaches the console.
-	CALL	@ISA.ISA_CLOSE
-	LD	A,'.'
-	LD	C,DSS_PUTCHAR
-	RST	DSS
-	CALL	@ISA.ISA_OPEN
-
-	; Non-blocking ACK drain.  If no packet is queued, skip;
-	; otherwise pull one ACK off the ring (1 ms cap).
+	; Non-blocking ACK drain (keeps SND_UNA moving).  When the ring
+	; is idle, cycle the ISA window instead: it would otherwise stay
+	; open (IRQs masked) for a whole 8 KB block, starving the 50 Hz
+	; system tick.  A close/open pair lets a pending IRQ through.
 	CALL	@RTL.RING_HAS_PACKET
-	JR	Z,.PUT_NO_ACK
+	JR	Z,.PUT_BREATHE
 	LD	HL,1
 	LD	(@TCP.RECV_TIMEOUT),HL
 	CALL	@TCP.RECV
 	; CF=1 here means timeout (ok) or peer closed (caught later).
-.PUT_NO_ACK
-	JP	.PUT_DATA_LOOP
+	JP	.PUT_SLICE_LOOP
+.PUT_BREATHE
+	CALL	@ISA.ISA_CLOSE
+	CALL	@ISA.ISA_OPEN
+	JP	.PUT_SLICE_LOOP
 
 
 ; ------------------------------------------------------
@@ -1807,6 +1830,8 @@ NLST_MODE	EQU LIST_MODE + 1		; 1 (1 if -n was given)
 PUT_MODE	EQU NLST_MODE + 1		; 1 (1 if "PUT" verb was given)
 HAS_OVR_O	EQU PUT_MODE + 1		; 1 (1 if -o was given)
 OVR_O_PTR	EQU HAS_OVR_O + 1		; 2 (-> argv when HAS_OVR_O=1)
+PUT_BLK_PTR	EQU OVR_O_PTR + 2		; 2 (PUT: next unsent byte in block)
+PUT_BLK_LEFT	EQU PUT_BLK_PTR + 2		; 2 (PUT: unsent bytes left in block)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count

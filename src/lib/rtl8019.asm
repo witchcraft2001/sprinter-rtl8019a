@@ -647,6 +647,9 @@ DMA_READ
 	LD	(IX+RTL_RSAR0_OFF),E
 	LD	(IX+RTL_RSAR1_OFF),D
 	LD	(IX+RTL_CR_OFF),CR_DMA_READ
+	IF RTL_DMA_SETTLE > 0
+	; Paced fallback loop, selected at assembly time for bring-up
+	; experiments on marginal hardware (RTL_DMA_SETTLE > 0).
 	CALL	DMA_SETTLE		; let the chip prefetch the first FIFO byte
 .LOOP
 	CALL	DMA_SETTLE		; let the FIFO present the next byte
@@ -657,6 +660,70 @@ DMA_READ
 	LD	A,B
 	OR	C
 	JR	NZ,.LOOP
+	ELSE
+	; Fast path: ~22 T/byte vs ~85 T/byte for the paced loop.  The
+	; data port sits at one fixed address, so read it through DE
+	; (7 T) instead of (IX+d) (19 T), move 8 bytes per DJNZ pass,
+	; then finish with a 0..7-byte tail.  The 8-group count is kept
+	; in one register: valid for transfers up to 2047 bytes -- every
+	; caller stays <= 1536 (max Ethernet frame / NICRAM test size).
+	LD	A,C
+	AND	7
+	LD	(.TAILN + 1),A		; self-mod: tail length 0..7
+	SRL	B
+	RR	C
+	SRL	B
+	RR	C
+	SRL	B
+	RR	C			; C = 8-byte group count
+	PUSH	HL
+	LD	HL,(RTL_BASE_PTR)
+	LD	DE,RTL_DATA_OFF
+	ADD	HL,DE
+	EX	DE,HL			; DE = data port address
+	POP	HL
+	LD	A,C
+	OR	A
+	JR	Z,.TAILN
+	LD	B,C
+.LP8
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	DJNZ	.LP8
+.TAILN
+	LD	B,0			; self-modified: tail length
+	LD	A,B
+	OR	A
+	JR	Z,.TDONE
+.TLP
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	DJNZ	.TLP
+.TDONE
+	ENDIF
 	LD	BC,RTL_RDC_LOOPS
 .WRDC
 	LD	A,(IX+RTL_ISR_OFF)
@@ -698,6 +765,8 @@ DMA_WRITE
 	LD	(IX+RTL_RSAR0_OFF),E
 	LD	(IX+RTL_RSAR1_OFF),D
 	LD	(IX+RTL_CR_OFF),CR_DMA_WRITE
+	IF RTL_DMA_SETTLE > 0
+	; Paced fallback loop (see DMA_READ).
 	CALL	DMA_SETTLE		; let the chip arm the remote-write FIFO
 .LOOP
 	LD	A,(HL)
@@ -708,6 +777,67 @@ DMA_WRITE
 	LD	A,B
 	OR	C
 	JR	NZ,.LOOP
+	ELSE
+	; Fast path -- mirror of DMA_READ: fixed-address data port via
+	; DE, 8 bytes per DJNZ pass + 0..7-byte tail.  Same <= 2047-byte
+	; group-count limit; all callers stay <= 1536.
+	LD	A,C
+	AND	7
+	LD	(.TAILN + 1),A		; self-mod: tail length 0..7
+	SRL	B
+	RR	C
+	SRL	B
+	RR	C
+	SRL	B
+	RR	C			; C = 8-byte group count
+	PUSH	HL
+	LD	HL,(RTL_BASE_PTR)
+	LD	DE,RTL_DATA_OFF
+	ADD	HL,DE
+	EX	DE,HL			; DE = data port address
+	POP	HL
+	LD	A,C
+	OR	A
+	JR	Z,.TAILN
+	LD	B,C
+.LP8
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	DJNZ	.LP8
+.TAILN
+	LD	B,0			; self-modified: tail length
+	LD	A,B
+	OR	A
+	JR	Z,.TDONE
+.TLP
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	DJNZ	.TLP
+.TDONE
+	ENDIF
 	LD	BC,RTL_RDC_LOOPS
 .WRDC
 	LD	A,(IX+RTL_ISR_OFF)
@@ -755,7 +885,15 @@ TX_CLEAR_TRIES	EQU 32
 TX_DMA_TRIES	EQU 3
 TX_VERIFY_PREFIX EQU 42			; ETH + IPv4/ARP header prefix
 TX_STATUS_BITS	EQU ISR_PTX | ISR_TXE
-RX_TO_TX_GUARD_MS EQU 20		; one 50 Hz system-tick interval
+; RX->TX settle guard, ms.  A v0.2.6 A/B test on the ORIGINAL (since
+; replaced) card showed TX right after RX could corrupt the frame;
+; 20 ms (one 50 Hz tick) papered over it at a devastating cost: every
+; TCP ACK during a download and every data segment during an upload
+; paid it, capping transfers at ~30 KB/s.  The replacement card shows
+; no such anomaly, and SEND_FRAME's prefix read-back + retries catch
+; a corrupted load anyway.  Raise above 0 only if TX_ERR_VERIFY
+; failures reappear on hardware; 0 compiles the guard out entirely.
+RX_TO_TX_GUARD_MS EQU 0
 
 ; TX_LAST_STAGE values.  Success walks 01 -> 04; E* values
 ; identify the exact failed transition for capture-then-print
@@ -989,11 +1127,10 @@ SEND_FRAME
 	LD	(TX_CFG3_POST),A
 	LD	(TX_LAST_NCR),A
 	LD	(TX_LAST_TPSR),A
-	; A successful RX immediately followed by TX is unreliable on the
-	; real Sprinter/RTL8019AS combination.  The v0.2.6 A/B test proved
-	; that one extra post-ARP screen line makes the same unicast ICMP
-	; frame work.  Replace that accidental delay with an explicit guard
-	; while the ISA window is CLOSED and system interrupts are enabled.
+	; A successful RX immediately followed by TX was unreliable on the
+	; ORIGINAL card (see RX_TO_TX_GUARD_MS above); the guard compiles
+	; out at 0 and can be re-enabled there if TX verify errors return.
+	IF RX_TO_TX_GUARD_MS > 0
 	LD	A,(RTL_RX_TO_TX_PENDING)
 	OR	A
 	JR	Z,.NO_RX_GUARD
@@ -1004,6 +1141,7 @@ SEND_FRAME
 	CALL	UTIL.DELAY_MS
 	CALL	@ISA.ISA_OPEN
 .NO_RX_GUARD
+	ENDIF
 	LD	IX,(RTL_BASE_PTR)
 	; Never overwrite TPSR packet RAM while an earlier transmit is
 	; still active.  More importantly, this establishes a clean

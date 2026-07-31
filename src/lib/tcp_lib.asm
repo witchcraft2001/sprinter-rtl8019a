@@ -12,7 +12,7 @@
 ;
 ; Design choices:
 ;   - one session.
-;   - MSS 536 announced; advertised window 3072 (fits the
+;   - MSS 536 announced; advertised window 3584 (fits the
 ;     8-bit-mode RX ring, see TCP_RECV_WIN_HI).
 ;   - sequence numbers stored big-endian on disk to match
 ;     the wire format; arithmetic is done by reading bytes
@@ -66,12 +66,12 @@ OPEN_TIMEOUT_MS		EQU 5000
 ; Must fit the chip's RX ring: with the 8-bit-mode ring (PSTART
 ; 0x46, PSTOP 0x60) usable capacity is ~25 pages = 6.4 KB, and one
 ; full MSS=536 segment costs 3 pages (590 B frame + 4 B RX header).
-; 3 KB caps the peer at ~6 in-flight segments = 18 pages, leaving
-; headroom for broadcasts and drain latency.  Advertising more (the
-; old 8 KB was sized for the pre-PSTOP-fix 14.5 KB ring) makes every
-; server burst overflow the ring; overflow recovery then flushes ALL
-; queued frames, amplifying one loss into a stall.
-TCP_RECV_WIN_HI		EQU 0x0C		; 3072 = 0x0C00
+; 3.5 KB caps the peer at ~7 in-flight segments = 21 pages, leaving
+; 4 pages of headroom for broadcasts and drain latency.  Advertising
+; more (the old 8 KB was sized for the pre-PSTOP-fix 14.5 KB ring)
+; makes every server burst overflow the ring; overflow recovery then
+; flushes ALL queued frames, amplifying one loss into a stall.
+TCP_RECV_WIN_HI		EQU 0x0E		; 3584 = 0x0E00
 TCP_RECV_WIN_LO		EQU 0x00
 
 ; Delayed-ACK threshold (RFC 1122 allows up to 2 segments unacked).
