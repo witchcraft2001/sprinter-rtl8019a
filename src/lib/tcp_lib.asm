@@ -1,16 +1,19 @@
 ; ======================================================
 ; tcp_lib.asm -- minimal one-session TCP/IPv4 client.
 ;
-; Scope (stage 1, this file):
+; Scope:
 ;   * TCP.OPEN  -- send SYN, wait SYN+ACK, send ACK, set
 ;                  state to ESTABLISHED.
-;   * TCP.SEND  -- TODO (stage 2)
-;   * TCP.RECV  -- TODO (stage 2)
-;   * TCP.CLOSE -- TODO (stage 3)
+;   * TCP.SEND  -- one PSH+ACK segment (1..MSS bytes).
+;   * TCP.RECV  -- poll for payload/FIN/RST, delayed ACKs.
+;   * TCP.CLOSE -- send FIN+ACK, no post-FIN drain.
+;   * TCP.SAVE_CTX / RESTORE_CTX -- swap the single session
+;     state so apps can multiplex sessions (FTP ctrl+data).
 ;
 ; Design choices:
 ;   - one session.
-;   - MSS 536 announced; advertised window 1024.
+;   - MSS 536 announced; advertised window 3072 (fits the
+;     8-bit-mode RX ring, see TCP_RECV_WIN_HI).
 ;   - sequence numbers stored big-endian on disk to match
 ;     the wire format; arithmetic is done by reading bytes
 ;     manually (no native 32-bit ops on Z80).
@@ -60,10 +63,15 @@
 OPEN_TIMEOUT_MS		EQU 5000
 
 ; Receive window advertised in every outgoing SYN/ACK/DATA segment.
-; 8 KB lets the peer pipeline ~14 MSS=536 segments before needing
-; an ACK; the chip's ~14.5 KB RX ring tolerates that burst with
-; headroom.  Going much higher risks RX-ring overflow on slow drains.
-TCP_RECV_WIN_HI		EQU 0x20		; 8192 = 0x2000
+; Must fit the chip's RX ring: with the 8-bit-mode ring (PSTART
+; 0x46, PSTOP 0x60) usable capacity is ~25 pages = 6.4 KB, and one
+; full MSS=536 segment costs 3 pages (590 B frame + 4 B RX header).
+; 3 KB caps the peer at ~6 in-flight segments = 18 pages, leaving
+; headroom for broadcasts and drain latency.  Advertising more (the
+; old 8 KB was sized for the pre-PSTOP-fix 14.5 KB ring) makes every
+; server burst overflow the ring; overflow recovery then flushes ALL
+; queued frames, amplifying one loss into a stall.
+TCP_RECV_WIN_HI		EQU 0x0C		; 3072 = 0x0C00
 TCP_RECV_WIN_LO		EQU 0x00
 
 ; Delayed-ACK threshold (RFC 1122 allows up to 2 segments unacked).
@@ -662,7 +670,17 @@ WAIT_SYN_ACK
 	JP	C,.TICK
 	; Validate IPv4 + TCP from remote.
 	CALL	IS_TCP_FROM_PEER
-	JP	NC,.TICK
+	JR	C,.PEER_SEG
+	IFDEF USE_ARP_ANSWER
+	; Not our segment: if it is an ARP request for our IP, answer
+	; it.  Peers re-validate their ARP entry mid-session; staying
+	; silent here kills the connection on a real LAN.  (The reply
+	; clobbers TX_BUF -- safe: every outgoing TCP segment is
+	; rebuilt in TX_BUF from scratch before sending.)
+	CALL	@ARP.ANSWER_REQUEST
+	ENDIF
+	JP	.TICK
+.PEER_SEG
 	; Check flags = SYN | ACK.
 	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)
 	AND	(TF_RST | TF_SYN | TF_ACK)
@@ -859,7 +877,12 @@ RECV
 	CALL	@RTL.READ_PACKET
 	JP	C,.TICK
 	CALL	IS_TCP_FROM_PEER
-	JP	NC,.TICK
+	JR	C,.PEER_SEG
+	IFDEF USE_ARP_ANSWER
+	CALL	@ARP.ANSWER_REQUEST	; see WAIT_SYN_ACK for rationale
+	ENDIF
+	JP	.TICK
+.PEER_SEG
 	; Flags.
 	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)
 	LD	(.FLAGS),A
@@ -871,15 +894,14 @@ RECV
 	SCF
 	RET
 .NO_RST
-	; Validate seq == RCV_NXT.  If not, silently drop and
-	; loop (out-of-order or duplicate; ACK will retransmit).
+	; Validate seq == RCV_NXT.
 	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4	; seq BE
 	LD	DE,TCP_RCV_NXT
 	LD	B,4
 .CMPSEQ
 	LD	A,(DE)
 	CP	(HL)
-	JP	NZ,.TICK
+	JP	NZ,.OUT_OF_ORDER
 	INC	DE
 	INC	HL
 	DJNZ	.CMPSEQ
@@ -984,6 +1006,22 @@ RECV
 .PEER_FIN
 	SCF
 	RET
+.OUT_OF_ORDER
+	; Out-of-order or duplicate segment.  Never drop it silently:
+	; immediately re-ACK RCV_NXT so the peer re-syncs.  Silent drop
+	; deadlocks the session -- if our cumulative ACK is lost (or was
+	; still deferred by delayed-ACK when the RX ring overflowed and
+	; got flushed), the peer retransmits OLD data with exponential
+	; backoff and we would ignore every copy until RECV times out.
+	; The dup-ACK also fires the peer's fast retransmit on a lost
+	; data segment instead of waiting out its RTO.
+	XOR	A
+	LD	(RECV_UNACKED),A	; cumulative ACK pays the delayed-ACK debt
+	CALL	BUILD_ACK
+	LD	HL,@MAIN.TX_BUF
+	LD	BC,(TCP_TX_LEN)
+	CALL	@RTL.SEND_FRAME		; best-effort; the next copy re-triggers
+	JP	.TICK
 .CANCEL
 	LD	A,F_CANCEL
 	LD	(TCP_LAST_FAIL),A
@@ -1141,7 +1179,7 @@ BUILD_FIN
 	LD	A,TF_FIN | TF_ACK
 	LD	(DE),A
 	INC	DE
-	LD	A,0x04
+	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
 	XOR	A

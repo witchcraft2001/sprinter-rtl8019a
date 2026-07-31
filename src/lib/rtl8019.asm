@@ -951,6 +951,33 @@ WAIT_PTX
 	IFDEF USE_RTL_SEND_FRAME
 SEND_FRAME
 	LD	(TX_SOURCE_PTR),HL
+	; Enforce the Ethernet minimum payload (60 bytes without FCS).
+	; The DP8390 transmits exactly TBCR bytes -- it never pads --
+	; so a shorter frame (TCP SYN = 58, pure ACK = 54) leaves the
+	; card as a runt that real switches drop silently.  MAME/pcap
+	; masked this: frames injected through the host NIC get padded
+	; by its hardware on transmit.  The source buffer must have
+	; room for 60 bytes; every caller builds frames in a TX buffer
+	; of at least that size.
+	LD	A,B
+	OR	A
+	JR	NZ,.LEN_OK
+	LD	A,C
+	CP	60
+	JR	NC,.LEN_OK
+	PUSH	HL
+	ADD	HL,BC			; B=0 here: HL -> first pad byte
+	LD	A,60
+	SUB	C
+	LD	B,A			; pad count (1..60)
+	XOR	A
+.PAD_LP
+	LD	(HL),A
+	INC	HL
+	DJNZ	.PAD_LP
+	POP	HL
+	LD	BC,60
+.LEN_OK
 	LD	(TX_LENGTH),BC
 	; Mark per-attempt PHY diagnostics invalid until their exact phase is
 	; reached.  This prevents a pre-TX failure from printing values left by
