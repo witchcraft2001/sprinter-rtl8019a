@@ -29,6 +29,9 @@ DSS_OPEN_FILE       EQU 0x11
 DSS_CLOSE_FILE      EQU 0x12
 DSS_READ_FILE       EQU 0x13
 DSS_WRITE           EQU 0x14
+DSS_MOVE_FP         EQU 0x15			; A=handle B=whence(0/1/2) HL:IX=offset -> HL:IX=pos
+SEEK_SET            EQU 0
+SEEK_END            EQU 2
 DSS_MOVE_FP_CP      EQU 0x0115
 DSS_FIND_FIRST      EQU 0x0119
 DSS_FIND_NEXT       EQU 0x011A

@@ -36,6 +36,8 @@ EXE_VERSION		EQU 1
 	DEFINE USE_FILE
 	DEFINE USE_UTIL_PRINT_DEC_32
 	DEFINE USE_UTIL_TPUT
+	DEFINE USE_UTIL_TPUT_PROGRESS
+	DEFINE USE_UTIL_PARSE_DEC32
 
 ARP_TIMEOUT_MS	EQU 3000
 SCAN_C		EQU 0xAC
@@ -77,6 +79,9 @@ START
 
 	XOR	A
 	LD	(CANCELLED),A
+	LD	HL,0			; transfer size unknown until SIZE /
+	LD	(EXPECTED_LEN),HL	; local seek fills it in
+	LD	(EXPECTED_LEN + 2),HL
 
 	CALL	@CMDL.PARSE
 	CALL	@CMDL.IS_HELP
@@ -397,6 +402,41 @@ START
 	CALL	EXPECT_2XX
 	JP	C,REPLY_BAD
 
+	; SIZE <file> (GET only, after TYPE I so binary size is
+	; reported).  "213 <n>" fills EXPECTED_LEN -- the Y in the
+	; "X / Y" progress line.  Servers without SIZE answer 5xx;
+	; that is non-fatal, the total just stays unknown ("?").
+	LD	A,(LIST_MODE)
+	OR	A
+	JR	NZ,.NO_SIZE
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.NO_SIZE
+	LD	HL,CMD_SIZE
+	LD	BC,CMD_SIZE_LEN
+	LD	DE,(FILENAME_PTR)
+	LD	A,(FILENAME_LEN)
+	CALL	SEND_CMD_ARG
+	JP	C,TCP_FAIL
+	CALL	READ_REPLY
+	JP	C,REPLY_FAIL
+	CALL	PRINT_REPLY
+	LD	A,(REPLY_CODE)
+	CP	'2'
+	JR	NZ,.NO_SIZE
+	LD	A,(REPLY_CODE + 1)
+	CP	'1'
+	JR	NZ,.NO_SIZE
+	LD	A,(REPLY_CODE + 2)
+	CP	'3'
+	JR	NZ,.NO_SIZE
+	LD	HL,REPLY_LINE		; text after "213 "
+	CALL	@UTIL.PARSE_DEC32
+	JR	C,.NO_SIZE
+	LD	(EXPECTED_LEN),HL
+	LD	(EXPECTED_LEN + 2),DE
+.NO_SIZE
+
 	; PASV
 	LD	HL,CMD_PASV
 	LD	BC,CMD_PASV_LEN
@@ -447,6 +487,25 @@ START
 	CALL	@FILE.OPEN_INPUT
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
+	; Local file size -> EXPECTED_LEN (the Y in "X / Y"
+	; progress): seek to end (position = size), rewind to
+	; start.  ISA is still closed here (DSS needs PAGE3).
+	LD	B,SEEK_END
+	LD	HL,0
+	LD	IX,0
+	LD	C,DSS_MOVE_FP
+	RST	DSS
+	JR	C,.PUT_SIZE_DONE	; can't seek -> total stays "?"
+	LD	(EXPECTED_LEN),IX
+	LD	(EXPECTED_LEN + 2),HL
+	LD	A,(OUT_FH)
+	LD	B,SEEK_SET
+	LD	HL,0
+	LD	IX,0
+	LD	C,DSS_MOVE_FP
+	RST	DSS
+	JP	C,FILE_FAIL		; must rewind or STOR sends nothing
+.PUT_SIZE_DONE
 	CALL	@ISA.ISA_OPEN
 .SKIP_FILE_OPEN
 
@@ -547,6 +606,8 @@ START
 	LD	(FTP_DATA_LEN),HL
 	LD	(BODY_TOTAL_LO),HL
 	LD	(BODY_TOTAL_HI),HL
+	XOR	A
+	LD	(PROG_CNT),A
 	LD	A,(PUT_MODE)
 	OR	A
 	JP	NZ,.PUT_DATA_LOOP
@@ -588,18 +649,26 @@ START
 	LD	A,(OUT_FH)
 	CP	NO_HANDLE
 	JR	Z,.NOC
+	; DSS file close (and the final progress repaint) need
+	; PAGE3 restored -- FLUSH_DATA and the PUT loop leave the
+	; ISA window open, and closing a DSS file with the window
+	; open violates the ISA discipline.
+	CALL	@ISA.ISA_CLOSE
+	CALL	PRINT_PROGRESS		; final "X / Y" (X ends = Y)
+	LD	A,(OUT_FH)
 	LD	C,DSS_CLOSE_FILE
 	RST	DSS
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
+	CALL	@ISA.ISA_OPEN		; TCP.CLOSE below needs the chip
 .NOC
 
 	; Close data TCP cleanly.
 	CALL	@TCP.CLOSE
 
-	; Terminate the progress-dot line emitted by FLUSH_DATA so
-	; the server's "226 Transfer complete" banner lands on a
-	; fresh line.
+	; Terminate the "X / Y" progress line (it ends with CR
+	; only) so the server's "226 Transfer complete" banner
+	; lands on a fresh line.
 	PRINT LINE_END
 
 	; Restore control session.
@@ -688,10 +757,14 @@ START
 	LD	(PUT_BLK_LEFT),DE
 	LD	HL,FTP_DATA_BUF
 	LD	(PUT_BLK_PTR),HL
-	; Progress dot per 8 KB block (matches the GET cadence).
-	LD	A,'.'
-	LD	C,DSS_PUTCHAR
-	RST	DSS
+	; In-place "X / Y" progress every 4th 8 KB block (console
+	; repaint cost; ISA still closed here).  The final repaint
+	; is forced at close so X ends equal to Y.
+	LD	A,(PROG_CNT)
+	AND	3
+	CALL	Z,PRINT_PROGRESS
+	LD	HL,PROG_CNT
+	INC	(HL)
 	CALL	@ISA.ISA_OPEN
 .PUT_SLICE_LOOP
 	; Slice length = min(FTP_PUT_CHUNK, PUT_BLK_LEFT).
@@ -1296,7 +1369,16 @@ APPEND_DATA
 	OR	A
 	SBC	HL,DE
 	JR	C,.NO_FLUSH
-	; Flush first.
+	; Flush first.  Ack everything received BEFORE the long
+	; write pause: with no unacked data outstanding the server
+	; has nothing to retransmit while we are away, and whatever
+	; it sends meanwhile fits the advertised window (21 of 26
+	; ring pages).  Without this the delayed-ACK debt (up to 3
+	; segments) crossed the server's RTO during the pause --
+	; cwnd collapse + retransmit storms cut GET throughput and
+	; could snowball into a recv timeout.  Best-effort: a TX
+	; error here surfaces on the next real send.
+	CALL	@TCP.SEND_DUP_ACK	; ISA window is open here
 	CALL	FLUSH_DATA
 	RET	C
 .NO_FLUSH
@@ -1328,6 +1410,24 @@ APPEND_DATA
 
 
 ; ------------------------------------------------------
+; PRINT_PROGRESS: in-place "X / Y" progress line with
+; X = BODY_TOTAL, Y = EXPECTED_LEN.  BODY_TOTAL_LO/HI are
+; not adjacent in BSS, so stage a contiguous 4-byte LE copy
+; in FTP_SCRATCH (helper scratch, dead during transfers).
+; ISA window must be CLOSED (DSS console output).
+; Trashes everything.
+; ------------------------------------------------------
+PRINT_PROGRESS
+	LD	HL,(BODY_TOTAL_LO)
+	LD	(FTP_SCRATCH),HL
+	LD	HL,(BODY_TOTAL_HI)
+	LD	(FTP_SCRATCH + 2),HL
+	LD	HL,FTP_SCRATCH
+	LD	DE,EXPECTED_LEN
+	JP	@UTIL.TPUT_PROGRESS
+
+
+; ------------------------------------------------------
 ; FLUSH_DATA: write FTP_DATA_BUF to OUT_FH and reset.
 ;   Out: CF=0 ok, CF=1 DSS_WRITE error.
 ; ------------------------------------------------------
@@ -1338,9 +1438,14 @@ FLUSH_DATA
 	RET	Z
 	; DSS console and file I/O must run with PAGE3 restored.
 	CALL	@ISA.ISA_CLOSE
-	LD	A,'.'
-	LD	C,DSS_PUTCHAR
-	RST	DSS
+	; In-place "X / Y" line every 4th flush (32 KB): the DSS
+	; console repaint is slow enough to tax the transfer when
+	; done per flush.  The final repaint is forced at close.
+	LD	A,(PROG_CNT)
+	AND	3
+	CALL	Z,PRINT_PROGRESS
+	LD	HL,PROG_CNT
+	INC	(HL)
 	LD	HL,(FTP_DATA_LEN)
 	LD	D,H
 	LD	E,L
@@ -1787,6 +1892,8 @@ CMD_NLST	DB "NLST "
 CMD_NLST_LEN	EQU $ - CMD_NLST
 CMD_STOR	DB "STOR "
 CMD_STOR_LEN	EQU $ - CMD_STOR
+CMD_SIZE	DB "SIZE "
+CMD_SIZE_LEN	EQU $ - CMD_SIZE
 EMPTY_STR	DB 0
 CMD_RETR	DB "RETR "
 CMD_RETR_LEN	EQU $ - CMD_RETR
@@ -1842,6 +1949,8 @@ HAS_OVR_O	EQU PUT_MODE + 1		; 1 (1 if -o was given)
 OVR_O_PTR	EQU HAS_OVR_O + 1		; 2 (-> argv when HAS_OVR_O=1)
 PUT_BLK_PTR	EQU OVR_O_PTR + 2		; 2 (PUT: next unsent byte in block)
 PUT_BLK_LEFT	EQU PUT_BLK_PTR + 2		; 2 (PUT: unsent bytes left in block)
+EXPECTED_LEN	EQU PUT_BLK_LEFT + 2		; 4 (LE; total for "X / Y", 0 = unknown)
+PROG_CNT	EQU EXPECTED_LEN + 4		; 1 (progress repaint decimator)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count

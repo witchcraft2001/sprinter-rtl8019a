@@ -416,6 +416,14 @@ PRINT_DEC_32
 	ENDIF
 
 
+	; USE_UTIL_TPUT_PROGRESS implies USE_UTIL_TPUT (shares
+	; DIV32_BY_DE and PRINT_DEC_32 for the KB formatting).
+	IFDEF USE_UTIL_TPUT_PROGRESS
+	IFNDEF USE_UTIL_TPUT
+	DEFINE USE_UTIL_TPUT
+	ENDIF
+	ENDIF
+
 	; USE_UTIL_TPUT implies USE_UTIL_PRINT_DEC_32 (used to format the
 	; bytes / seconds / KB/s numbers).
 	IFDEF USE_UTIL_TPUT
@@ -699,6 +707,172 @@ _TPUT_S_COMMA		DB ", ",0
 _TPUT_S_KBS		DB " KB/s",0
 _TPUT_S_BPS		DB " B/s",0
 _TPUT_S_NL		DB 13,10,0
+
+	IFDEF USE_UTIL_TPUT_PROGRESS
+; ------------------------------------------------------
+; TPUT_PROGRESS: in-place transfer progress line
+; "<doneKB>KB / <totalKB>KB" (format shared with the
+; sprinter_wifi network kit).  Emits 0x0D first so repeated
+; calls overwrite the same console line (on the DSS console
+; 0x0D resets the X column, 0x0A is the line feed).  No
+; trailing newline -- the caller prints a real LINE_END once
+; the transfer is done.
+;   In: HL = ptr to done  byte count (4-byte LE)
+;       DE = ptr to total byte count (4-byte LE; all-zero
+;            means size unknown and prints "?").
+; DSS console output: the ISA window must be CLOSED.
+; Trashes everything (incl. UTIL_DEC32_SCRATCH).
+; ------------------------------------------------------
+TPUT_PROGRESS
+	PUSH	DE			; total ptr
+	PUSH	HL			; done ptr
+	LD	A,0x0D
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	HL
+	CALL	.KB_AT_HL		; done KB
+	LD	HL,_TPUT_S_PROG_MID
+	LD	C,DSS_PCHARS
+	RST	DSS
+	POP	HL			; total ptr
+	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	INC	HL
+	OR	(HL)
+	INC	HL
+	OR	(HL)
+	DEC	HL
+	DEC	HL
+	DEC	HL
+	JR	NZ,.HAVE_TOTAL
+	LD	A,'?'			; total unknown
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	JR	.TAIL
+.HAVE_TOTAL
+	CALL	.KB_AT_HL		; total KB
+.TAIL
+	LD	HL,_TPUT_S_PROG_KB
+	LD	C,DSS_PCHARS
+	RST	DSS
+	RET
+
+; Print the 4-byte LE value at (HL) divided by 1024 (i.e. in KB).
+; KB = value >> 10 = drop the low byte, then >> 2 -- avoids a
+; 32-iteration long division on every progress repaint.
+.KB_AT_HL
+	INC	HL
+	LD	E,(HL)			; byte 1
+	INC	HL
+	LD	D,(HL)			; byte 2
+	INC	HL
+	LD	A,(HL)			; byte 3
+	EX	DE,HL			; HL = bytes 2:1 (= value >> 8)
+	LD	E,A			; E:HL = 24-bit value >> 8
+	SRL	E
+	RR	H
+	RR	L
+	SRL	E
+	RR	H
+	RR	L
+	LD	D,0			; DE:HL = KB
+	JP	PRINT_DEC_32
+
+_TPUT_S_PROG_MID	DB "KB / ",0
+_TPUT_S_PROG_KB		DB "KB",0
+	ENDIF
+	ENDIF
+
+
+	IFDEF USE_UTIL_PARSE_DEC32
+; ------------------------------------------------------
+; PARSE_DEC32: parse an unsigned ASCII decimal at (HL).
+; Leading spaces/tabs are skipped; digits are consumed up
+; to the first non-digit.  No overflow check (values are
+; file sizes, far below 2^32).
+;   In:  HL = ptr to string
+;   Out: CF=0: DE:HL = value (DE = high word).
+;        CF=1: no digit found at the pointer.
+; Trashes A,BC.  Uses UTIL_DEC32_SCRATCH + UTIL_HBUF.
+; ------------------------------------------------------
+PARSE_DEC32
+.SKIP
+	LD	A,(HL)
+	CP	' '
+	JR	Z,.ADV
+	CP	9
+	JR	NZ,.CHK1
+.ADV
+	INC	HL
+	JR	.SKIP
+.CHK1
+	SUB	'0'
+	CP	10
+	JR	C,.GO
+	SCF
+	RET
+.GO
+	PUSH	HL
+	LD	HL,0
+	LD	(UTIL_DEC32_SCRATCH),HL
+	LD	(UTIL_DEC32_SCRATCH + 2),HL
+	POP	HL
+.DLP
+	LD	A,(HL)
+	SUB	'0'
+	CP	10
+	JR	NC,.FIN
+	INC	HL
+	PUSH	HL
+	; acc = acc*10 + digit:  x2, stash, x4 more (=x8), add stash.
+	CALL	.X2
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	LD	(UTIL_HBUF),HL
+	LD	HL,(UTIL_DEC32_SCRATCH + 2)
+	LD	(UTIL_HBUF + 2),HL
+	CALL	.X2
+	CALL	.X2
+	LD	BC,(UTIL_HBUF)
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	ADD	HL,BC
+	LD	(UTIL_DEC32_SCRATCH),HL
+	LD	BC,(UTIL_HBUF + 2)
+	LD	HL,(UTIL_DEC32_SCRATCH + 2)
+	ADC	HL,BC
+	LD	(UTIL_DEC32_SCRATCH + 2),HL
+	; + digit (A survived .X2 and the adds' register use).
+	LD	C,A
+	LD	B,0
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	ADD	HL,BC
+	LD	(UTIL_DEC32_SCRATCH),HL
+	JR	NC,.NOC
+	LD	HL,(UTIL_DEC32_SCRATCH + 2)
+	INC	HL
+	LD	(UTIL_DEC32_SCRATCH + 2),HL
+.NOC
+	POP	HL
+	JR	.DLP
+.FIN
+	LD	HL,(UTIL_DEC32_SCRATCH)
+	LD	DE,(UTIL_DEC32_SCRATCH + 2)
+	OR	A			; CF=0
+	RET
+
+; acc (4-byte LE at UTIL_DEC32_SCRATCH) <<= 1.  Preserves A,BC,DE.
+.X2
+	PUSH	HL
+	LD	HL,UTIL_DEC32_SCRATCH
+	SLA	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	INC	HL
+	RL	(HL)
+	POP	HL
+	RET
 	ENDIF
 
 

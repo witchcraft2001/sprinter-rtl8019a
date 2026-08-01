@@ -38,6 +38,8 @@ EXE_VERSION		EQU 1
 	DEFINE USE_FILE
 	DEFINE USE_UTIL_PRINT_DEC_32
 	DEFINE USE_UTIL_TPUT
+	DEFINE USE_UTIL_TPUT_PROGRESS
+	DEFINE USE_UTIL_PARSE_DEC32
 
 ARP_TIMEOUT_MS	EQU 3000
 SCAN_C		EQU 0xAC
@@ -237,6 +239,10 @@ START
 	LD	(BODY_TOTAL_LO),HL
 	LD	(BODY_TOTAL_HI),HL
 	LD	(WGET_BUF_LEN),HL
+	LD	(CONTENT_LEN),HL
+	LD	(CONTENT_LEN + 2),HL
+	XOR	A
+	LD	(PROG_CNT),A
 
 	; Receive loop.
 .RXLP
@@ -292,6 +298,11 @@ START
 	JP	C,FILE_FAIL
 
 	CALL	@ISA.ISA_CLOSE
+	; Final "X / Y" repaint so the line ends at the full size
+	; (mid-transfer repaints are decimated to every 4th flush).
+	LD	HL,BODY_TOTAL_LO
+	LD	DE,CONTENT_LEN
+	CALL	@UTIL.TPUT_PROGRESS
 	; Close output file.
 	LD	A,(OUT_FH)
 	CP	NO_HANDLE
@@ -303,8 +314,8 @@ START
 .NOCLOSE
 	; (TCP already CLOSEd by .HOP_RX_DONE.)
 
-	; Terminate the progress-dot line emitted by FLUSH_BUF, then
-	; print summary.
+	; Terminate the "X / Y" progress line emitted by FLUSH_BUF
+	; (it ends with CR only), then print summary.
 	PRINT LINE_END
 	PRINT MSG_DONE_PRE
 	LD	HL,(BODY_TOTAL_LO)
@@ -502,6 +513,7 @@ CAPTURE_HDR_BYTE
 	JR	.RESET
 .HDR_DISPATCH
 	CALL	CHECK_LOCATION_HEADER
+	CALL	CHECK_CONTENT_LENGTH
 .RESET
 	XOR	A
 	LD	(HDR_LINE_LEN),A
@@ -571,6 +583,42 @@ CHECK_LOCATION_HEADER
 	RET
 
 LIT_LOCATION	DB "location:",0
+
+
+; ------------------------------------------------------
+; CHECK_CONTENT_LENGTH: HDR_LINE_BUF holds an ASCIIZ header
+; line.  If the name (case-insensitive) is "content-length",
+; parse the decimal value into CONTENT_LEN (4-byte LE) -- the
+; Y in the "X / Y" progress line.  Non-matching or malformed
+; lines leave CONTENT_LEN alone (0 = unknown -> "?").
+; Trashes A,BC,DE,HL.
+; ------------------------------------------------------
+CHECK_CONTENT_LENGTH
+	LD	HL,HDR_LINE_BUF
+	LD	DE,LIT_CONTENT_LEN
+.PFX
+	LD	A,(DE)
+	OR	A
+	JR	Z,.PFX_OK		; matched whole prefix
+	LD	C,A			; expected (already lowercase)
+	LD	A,(HL)
+	OR	A
+	RET	Z
+	CALL	TOLOWER
+	CP	C
+	RET	NZ			; mismatch -> not Content-Length
+	INC	HL
+	INC	DE
+	JR	.PFX
+.PFX_OK
+	; HL past "content-length:"; PARSE_DEC32 skips the blanks.
+	CALL	@UTIL.PARSE_DEC32
+	RET	C			; no digits -> keep unknown
+	LD	(CONTENT_LEN),HL
+	LD	(CONTENT_LEN + 2),DE
+	RET
+
+LIT_CONTENT_LEN	DB "content-length:",0
 
 
 ; ------------------------------------------------------
@@ -690,7 +738,16 @@ APPEND_TO_BUF
 	OR	A
 	SBC	HL,DE			; CF=1 if (buf_len + count) < size
 	JR	C,.FITS
-	; Doesn't fit: flush first.
+	; Doesn't fit: flush first.  Ack everything received
+	; BEFORE the long write pause: with no unacked data
+	; outstanding the server has nothing to retransmit while
+	; we are away, and whatever it sends meanwhile fits the
+	; advertised window (21 of 26 ring pages).  Without this
+	; the delayed-ACK debt crossed the server's RTO during
+	; the pause -- cwnd collapse + retransmit storms cut
+	; throughput to ~25 KB/s.  Best-effort: a TX error here
+	; surfaces on the next real send.
+	CALL	@TCP.SEND_DUP_ACK	; ISA window is open here
 	CALL	FLUSH_BUF
 	JR	C,.FAIL
 .FITS
@@ -740,9 +797,18 @@ FLUSH_BUF
 	RET	Z
 	; DSS console and file I/O must run with PAGE3 restored.
 	CALL	@ISA.ISA_CLOSE
-	LD	A,'.'
-	LD	C,DSS_PUTCHAR
-	RST	DSS
+	; In-place "X / Y" line every 4th flush (32 KB): the DSS
+	; console repaint is slow enough to tax the transfer when
+	; done per flush.  A final repaint is forced at the end.
+	LD	A,(PROG_CNT)
+	AND	3
+	JR	NZ,.NO_PROG
+	LD	HL,BODY_TOTAL_LO	; LO+HI adjacent = 4-byte LE counter
+	LD	DE,CONTENT_LEN
+	CALL	@UTIL.TPUT_PROGRESS
+.NO_PROG
+	LD	HL,PROG_CNT
+	INC	(HL)
 	LD	HL,(WGET_BUF_LEN)
 	LD	D,H
 	LD	E,L			; DE = byte count
@@ -1508,6 +1574,8 @@ STATUS_CODE	EQU APP_BSS_BASE + 42		; 2 (parsed numeric code)
 HDR_LINE_LEN	EQU APP_BSS_BASE + 44		; 1 (current line capture fill)
 HTTP_REDIRECT	EQU APP_BSS_BASE + 45		; 1 (1 if status 3xx + Location)
 HOP_COUNT	EQU APP_BSS_BASE + 46		; 1 (redirect hops so far)
+CONTENT_LEN	EQU APP_BSS_BASE + 47		; 4 (LE; Content-Length, 0 = unknown)
+PROG_CNT	EQU APP_BSS_BASE + 51		; 1 (progress repaint decimator)
 HDR_LINE_BUF_SIZE EQU 256
 REDIRECT_URL_BUF_SIZE EQU 256
 MAX_REDIRECT_HOPS EQU 5
