@@ -5,7 +5,7 @@ Plain HTTP/1.0 downloader with redirect following.  No HTTPS.
 ## Usage
 
 ```
-WGET url [-o output] [-y]
+WGET url [-o output] [-y|-f] [-r]
 WGET /?
 ```
 
@@ -16,7 +16,13 @@ WGET /?
 | `-o file`  | Local output (default: basename derived from URL     |
 |            | path; supports directory prefix per "Output paths"   |
 |            | in HOWTO.TXT).                                       |
-| `-y`       | Overwrite local file without prompt.                 |
+| `-y`, `-f` | Overwrite local file without prompt.                 |
+|            | Without `-y`/`-f`/`-r`, an existing output file      |
+|            | prompts `Overwrite/Resume/Cancel [O/R/C]`.           |
+| `-r`       | Resume: reopen the local file, append, and request   |
+|            | `Range: bytes=<size>-` from the server.  Expects a   |
+|            | 206 reply; a 200 (server without Range support)      |
+|            | aborts with a hint instead of corrupting the file.   |
 
 ## Behaviour
 
@@ -28,8 +34,10 @@ WGET /?
 - The output file is opened up front; if the final hop is not
   2xx the partial file is `DELETE`d before exiting so batch
   scripts don't see stale 0-byte / error-page files.
-- Disk I/O is buffered: 8 KB write coalescing buffer, one `.`
-  printed per flush.
+- Disk I/O is buffered: 8 KB write coalescing buffer; a
+  `<doneKB>KB / <totalKB>KB` progress line is repainted in
+  place during the download (total from `Content-Length`,
+  `?` when the server does not announce it).
 - End-of-run summary prints byte count and KB/s (or B/s for
   low-rate transfers) using DSS clock deltas.
 

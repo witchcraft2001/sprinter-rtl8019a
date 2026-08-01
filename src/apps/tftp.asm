@@ -48,6 +48,7 @@ EXE_VERSION		EQU 1
 	DEFINE USE_FILE
 	DEFINE USE_UTIL_PRINT_DEC_32
 	DEFINE USE_UTIL_TPUT
+	DEFINE USE_UTIL_PARSE_DEC32
 
 ARP_TIMEOUT_MS	EQU 3000
 TFTP_TIMEOUT_MS	EQU 5000		; per-DATA reply budget
@@ -66,8 +67,7 @@ UDP_HDR_LEN	EQU 8
 
 OUR_PORT_HI	EQU 0xC1
 OUR_PORT_LO	EQU 0x00
-TFTP_SRV_PORT_HI EQU 0
-TFTP_SRV_PORT_LO EQU 69
+TFTP_SRV_PORT	EQU 69			; default; host[:port] overrides (SRV_PORT)
 
 ; -- TFTP opcodes
 OP_RRQ		EQU 1
@@ -137,23 +137,55 @@ START
 	LD	(HAS_OVERRIDE),A
 .OVERRIDE_OK
 
-	; -y / --yes: force overwrite without prompt (GET only).
+	; -y / -f: force overwrite without prompt (GET only; two
+	; spellings for parity with the sprinter_wifi package).
 	XOR	A
 	LD	(FORCE_FLAG),A
 	LD	A,'y'
 	CALL	@CMDL.HAS_FLAG
+	JR	NC,.SET_FORCE
+	LD	A,'f'
+	CALL	@CMDL.HAS_FLAG
 	JR	C,.NO_FORCE
+.SET_FORCE
 	LD	A,1
 	LD	(FORCE_FLAG),A
 .NO_FORCE
 
 	; --- Now positionals (flag values are already consumed).
 
-	; positional 0: host (IPv4 literal or hostname)
+	; positional 0: host[:port] (IPv4 literal or hostname).
+	; The ':' (if any) is replaced by a NUL in the writable
+	; command-line RAM; port defaults to 69.
 	LD	B,0
 	CALL	@CMDL.GET_POSITIONAL
 	JP	C,USAGE_ERROR
 	LD	(TARGET_HOST_PTR),HL
+	PUSH	HL
+	LD	HL,TFTP_SRV_PORT
+	LD	(SRV_PORT),HL
+	POP	HL
+.PORT_SCAN
+	LD	A,(HL)
+	OR	A
+	JR	Z,.PORT_DONE
+	CP	':'
+	JR	Z,.PORT_SPLIT
+	INC	HL
+	JR	.PORT_SCAN
+.PORT_SPLIT
+	LD	(HL),0			; terminate host at the colon
+	INC	HL
+	CALL	@UTIL.PARSE_DEC32	; -> DE:HL
+	JP	C,USAGE_ERROR
+	LD	A,D
+	OR	E
+	JP	NZ,USAGE_ERROR		; port > 65535
+	LD	A,H
+	OR	L
+	JP	Z,USAGE_ERROR		; port 0
+	LD	(SRV_PORT),HL
+.PORT_DONE
 
 	; positional 1: subcommand GET or PUT.
 	LD	B,1
@@ -342,9 +374,10 @@ START
 	LD	(TFTP_PAYLOAD_PTR),HL
 	LD	HL,(RRQ_LEN)
 	LD	(TFTP_PAYLOAD_LEN),HL
-	LD	A,TFTP_SRV_PORT_HI
+	LD	HL,(SRV_PORT)		; host[:port]; default 69
+	LD	A,H
 	LD	(TFTP_DST_PORT_HI),A
-	LD	A,TFTP_SRV_PORT_LO
+	LD	A,L
 	LD	(TFTP_DST_PORT_LO),A
 	CALL	BUILD_UDP_FRAME		; returns frame length in BC
 	LD	HL,TX_BUF
@@ -1689,6 +1722,7 @@ HAS_OVERRIDE	 EQU LOCAL_NAME_PTR + 2		; 1 byte
 OVERRIDE_PTR	 EQU HAS_OVERRIDE + 1		; 2 bytes
 ACK_BLOCK	 EQU OVERRIDE_PTR + 2		; 2 bytes (block# from received ACK)
 SAW_TFTP_ERR	 EQU ACK_BLOCK + 2		; 1 byte (1 if we got an OP_ERROR)
+SRV_PORT	 EQU SAW_TFTP_ERR + 1		; 2 bytes (LE; request port, default 69)
 
 
 ; ------- messages -------
@@ -1714,15 +1748,15 @@ MSG_E_NO_DNS1	DB "[E] NET_DNS1 not set; pass an IPv4 literal or run NETCFG/IFUP 
 MSG_E_NO_GW	DB "[E] DNS server is off-subnet but NET_GW is not set.",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  TFTP host GET remote-file [-o local-name] [-y]",13,10
-	DB "  TFTP host PUT local-file  [-o remote-name]",13,10
+	DB "  TFTP host[:port] GET remote-file [-o local-name] [-y|-f]",13,10
+	DB "  TFTP host[:port] PUT local-file  [-o remote-name]",13,10
 	DB "  TFTP /?",13,10,13,10
-	DB "  host         TFTP server IPv4 or hostname.",13,10
+	DB "  host[:port]  TFTP server IPv4 or hostname, port default 69.",13,10
 	DB "  GET / PUT    download from / upload to the server.",13,10
 	DB "  filename     remote (GET) or local (PUT) name.",13,10
 	DB "  -o name      override the OTHER side: local output for",13,10
 	DB "               GET, remote name on the server for PUT.",13,10
-	DB "  -y           overwrite local file without prompt (GET).",13,10,13,10
+	DB "  -y, -f       overwrite local file without prompt (GET).",13,10,13,10
 	DB "RFC 2348 blksize=1428 is requested; servers that ignore",13,10
 	DB "options fall back to RFC 1350 512-byte blocks.",13,10,0
 LINE_END	DB 13,10,0

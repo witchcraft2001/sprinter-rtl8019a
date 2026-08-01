@@ -103,6 +103,192 @@ OPEN_OUTPUT
 	RET
 
 
+	IFDEF USE_FILE_APPEND
+; ------------------------------------------------------
+; OPEN_APPEND: open a file for resume-style appending.
+; An existing file is opened read-write and the pointer is
+; moved to its end; a missing file is created fresh.
+;   In:  HL = ASCIIZ filename, optional path
+;   Out: CF=0 -> A = handle positioned at EOF,
+;               FILE_APPEND_SIZE (4-byte LE) = prior size
+;               (0 for a fresh file).
+;        CF=1 -> create or seek error.
+; ------------------------------------------------------
+OPEN_APPEND
+	CALL	SETUP_PATH
+	RET	C
+	LD	HL,0
+	LD	(FILE_APPEND_SIZE),HL
+	LD	(FILE_APPEND_SIZE + 2),HL
+	LD	HL,(NAME_PTR)
+	LD	A,FM_READ_WRITE
+	LD	C,DSS_OPEN_FILE
+	RST	DSS
+	JR	C,.FRESH		; no file yet -> create empty
+	LD	(FILE_FH_SCRATCH),A
+	; Seek to end: returned position = current size.
+	LD	B,SEEK_END
+	LD	HL,0
+	LD	IX,0
+	LD	C,DSS_MOVE_FP
+	RST	DSS
+	JR	C,.SEEK_FAIL
+	LD	(FILE_APPEND_SIZE),IX
+	LD	(FILE_APPEND_SIZE + 2),HL
+	CALL	RESTORE_CWD
+	LD	A,(FILE_FH_SCRATCH)
+	OR	A			; CF=0
+	RET
+.SEEK_FAIL
+	LD	A,(FILE_FH_SCRATCH)
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	CALL	RESTORE_CWD
+	SCF
+	RET
+.FRESH
+	LD	HL,(NAME_PTR)
+	LD	A,FA_ARCHIVE
+	LD	C,DSS_CREATE_OVERWRITE
+	RST	DSS
+	PUSH	AF
+	CALL	RESTORE_CWD
+	POP	AF
+	RET
+
+
+; ------------------------------------------------------
+; OPEN_OUTPUT_ORC: mode-driven open for resumable downloads
+; (prompt behaviour mirrors the sprinter_wifi package).
+;   In:  HL = ASCIIZ filename (path allowed),
+;        A  = 0 -> prompt Overwrite/Resume/Cancel when the
+;                  file exists (create silently otherwise);
+;             1 -> force overwrite (no prompt);
+;             2 -> force resume (append, no prompt).
+;   Out: CF=0 -> A = handle; FILE_APPEND_SIZE (4-byte LE) =
+;               resume offset (0 unless a resume path ran).
+;        CF=1 -> user cancelled / create / seek error.
+; ------------------------------------------------------
+OPEN_OUTPUT_ORC
+	PUSH	AF
+	PUSH	HL
+	LD	HL,0
+	LD	(FILE_APPEND_SIZE),HL
+	LD	(FILE_APPEND_SIZE + 2),HL
+	XOR	A
+	LD	(FILE_CANCELLED),A
+	POP	HL
+	POP	AF
+	AND	A
+	JR	Z,.ASK
+	CP	2
+	JP	Z,OPEN_APPEND
+	LD	A,1
+	JP	OPEN_OUTPUT
+.ASK
+	; Existence probe (own SETUP_PATH bracket; the re-entry
+	; paths below redo it, so restore CWD before jumping).
+	PUSH	HL
+	CALL	SETUP_PATH
+	JR	C,.FAILPOP
+	LD	HL,(NAME_PTR)
+	LD	A,FA_READONLY
+	LD	C,DSS_OPEN_FILE
+	RST	DSS
+	JR	C,.FRESH		; nothing there -> silent create
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	HL,MSG_PRE
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	HL,(FULL_PTR)
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	HL,MSG_ORC_POST
+	LD	C,DSS_PCHARS
+	RST	DSS
+	CALL	WAIT_ORC		; A = 'O' / 'R' / 'C'
+	PUSH	AF
+	CALL	RESTORE_CWD
+	POP	AF
+	POP	HL
+	CP	'R'
+	JP	Z,OPEN_APPEND
+	CP	'O'
+	JR	NZ,.CANCEL
+	LD	A,1
+	JP	OPEN_OUTPUT
+.CANCEL
+	LD	A,1
+	LD	(FILE_CANCELLED),A
+	LD	HL,MSG_NO
+	LD	C,DSS_PCHARS
+	RST	DSS
+	SCF
+	RET
+.FRESH
+	CALL	RESTORE_CWD
+	POP	HL
+	LD	A,1			; no prompt needed for a new file
+	JP	OPEN_OUTPUT
+.FAILPOP
+	POP	HL
+	SCF
+	RET
+
+
+; ------------------------------------------------------
+; WAIT_ORC: blocking key wait for the O/R/C prompt.
+;   Out: A = 'O' (overwrite; O or Y), 'R' (resume),
+;        'C' (cancel; C, N or Esc).  Unrecognised keys ask
+;        again.  Echoes the key + CRLF.  Leaves the ISA
+;        window CLOSED (DSS keyboard/console need PAGE3).
+; ------------------------------------------------------
+WAIT_ORC
+	CALL	@ISA.ISA_CLOSE
+.ASK
+	LD	B,DSS_WAITKEY		; subfunction: block until key
+	LD	C,DSS_K_CLEAR		; clear buffer first
+	RST	DSS
+	; Echo the typed character followed by CRLF.
+	PUSH	AF
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	LD	A,13
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	LD	A,10
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	POP	AF
+	CP	0x1B			; Esc = cancel (check BEFORE the
+	JR	Z,.CAN			; case fold: ';' folds to 0x1B)
+	AND	0xDF			; fold letters to uppercase
+	CP	'R'
+	JR	Z,.RES
+	CP	'O'
+	JR	Z,.OVR
+	CP	'Y'			; Y/N kept for Y/N-prompt familiarity
+	JR	Z,.OVR
+	CP	'C'
+	JR	Z,.CAN
+	CP	'N'
+	JR	Z,.CAN
+	JR	.ASK
+.RES
+	LD	A,'R'
+	RET
+.OVR
+	LD	A,'O'
+	RET
+.CAN
+	LD	A,'C'
+	RET
+
+MSG_ORC_POST	DB "' exists. Overwrite/Resume/Cancel [O/R/C]? ",0
+	ENDIF
+
+
 ; ------------------------------------------------------
 ; OPEN_INPUT: open a file for reading.
 ;   In:  HL = ASCIIZ filename, optional path

@@ -8,16 +8,17 @@ verbose directory listing (`-l`), and terse name-only listing
 ## Usage
 
 ```
-FTP host filename  [-u user] [-p pass] [-o output] [-y]   (download)
-FTP host PUT local [-u user] [-p pass] [-o remote-name]   (upload)
-FTP host [path] -l [-u user] [-p pass]                    (LIST)
-FTP host [path] -n [-u user] [-p pass]                    (NLST)
+FTP host[:port] filename  [-u user] [-p pass] [-o output] [-y|-f] [-r]  (download)
+FTP host[:port] PUT local [-u user] [-p pass] [-o remote-name]          (upload)
+FTP host[:port] [path] -l [-u user] [-p pass]                           (LIST)
+FTP host[:port] [path] -n [-u user] [-p pass]                           (NLST)
 FTP /?
 ```
 
 | Option       | Meaning                                            |
 |--------------|----------------------------------------------------|
-| `host`       | FTP server IPv4 or hostname (port 21)              |
+| `host[:port]`| FTP server IPv4 or hostname; control port defaults |
+|              | to 21 (`FTP srv:2121 file.bin`).                   |
 | `filename`   | Remote file to RETR (paths allowed: `/pub/foo.zip`)|
 | `PUT local`  | Switches to upload mode; `local` is the on-disk    |
 |              | source file (path-aware, e.g. `test\foo.zip`).     |
@@ -42,7 +43,14 @@ FTP /?
 |              | sends `STOR a.txt`, not `STOR C:\docs\a.txt`.      |
 |              | The GET form also supports a directory prefix per  |
 |              | "Output paths" in HOWTO.TXT.                       |
-| `-y`         | Overwrite local file without prompt (GET only).    |
+| `-y`, `-f`   | Overwrite local file without prompt (GET only).    |
+|              | Without `-y`/`-f`/`-r`, an existing local file     |
+|              | prompts `Overwrite/Resume/Cancel [O/R/C]` (Y and N |
+|              | still work as overwrite / cancel).                 |
+| `-r`         | Resume a GET: reopen the local file, append, and   |
+|              | send `REST <size>` so the server skips what is     |
+|              | already on disk.  Fails with a hint if the server  |
+|              | rejects REST.  Ignored for PUT and listings.       |
 
 ## Login flow
 

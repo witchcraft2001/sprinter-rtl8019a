@@ -20,7 +20,8 @@ backend on macOS:
   flags), `UDPTEST`, `TFTP`, `NTP`, `NSLOOKUP` -- IPv4
   + UDP utilities.
 - `NETCFG`, `IFUP` (static + DHCP), `WGET` (HTTP/1.0),
-  `FTP` (passive mode, work in progress).
+  `FTP` (passive mode, work in progress), `TELNET` (ANSI/VT100,
+  Zmodem and Ymodem).
 
 Stage 11 adds `UNETRTL.DLL`, a loadable library that exposes the
 stack to other DSS programs through the same numbered API the
@@ -96,6 +97,7 @@ helpers that live next to MAME:
 | `NTP`                  | `tools/dev/ntp_serve.py` -- minimal NTP responder |
 | `WGET`                 | `python3 -m http.server` -- static HTTP/1.0       |
 | `FTP`                  | `pyftpdlib` -- minimal FTP server (anonymous)     |
+| `TELNET`               | Telnet/BBS service or a raw TCP terminal server   |
 
 The same virtual interface (a host-only NIC at
 `192.168.7.1/24`) carries every test.  Sprinter sees this

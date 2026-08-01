@@ -28,6 +28,7 @@ the same layout: usage syntax, options, examples, exit codes.
 | `NTP.TXT`     | NTPv3 client; sets the DSS clock                     |
 | `WGET.TXT`    | HTTP download with redirect following                |
 | `FTP.TXT`     | FTP download + directory listing                     |
+| `TELNET.TXT`  | ANSI/VT100 Telnet client with Zmodem/Ymodem          |
 | `TFTP.TXT`    | TFTP download with RFC 2348 blksize                  |
 | `ISAPROBE.TXT`| ISA bus diagnostic when NICINFO can't find the card  |
 | `NICMODE.TXT` | Read/repair persistent RTL8019AS duplex mode         |

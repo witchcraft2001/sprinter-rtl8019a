@@ -11,7 +11,7 @@ DIST_DIR_NAME="SPRTL"
 # build/<UPPERCASE_NAME>.EXE. Add apps here only when their source is present.
 # Stage order from sprinter_rtl8019_soft.md:
 #   hello -> nicinfo -> nicram -> niclb -> nictx -> nicrx ->
-#   ping -> udptest -> tftp -> ntp -> wget -> ftp
+#   ping -> udptest -> tftp -> ntp -> wget -> ftp -> telnet
 BUILD_APPS=(
   hello
   nicinfo
@@ -32,6 +32,7 @@ BUILD_APPS=(
   nslookup
   wget
   ftp
+  telnet
   unettest
 )
 
@@ -66,6 +67,7 @@ DIST_DOC_FILES=(
   docs/NTP.md
   docs/WGET.md
   docs/FTP.md
+  docs/TELNET.md
   docs/TFTP.md
   docs/ISAPROBE.md
   docs/NICMODE.md

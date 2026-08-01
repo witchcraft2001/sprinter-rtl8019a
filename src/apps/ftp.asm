@@ -38,6 +38,8 @@ EXE_VERSION		EQU 1
 	DEFINE USE_UTIL_TPUT
 	DEFINE USE_UTIL_TPUT_PROGRESS
 	DEFINE USE_UTIL_PARSE_DEC32
+	DEFINE USE_UTIL_FORMAT_DEC32
+	DEFINE USE_FILE_APPEND
 
 ARP_TIMEOUT_MS	EQU 3000
 SCAN_C		EQU 0xAC
@@ -79,9 +81,16 @@ START
 
 	XOR	A
 	LD	(CANCELLED),A
+	LD	(PUT_MODE),A		; USER_ABORT may run before the parse
+	LD	A,NO_HANDLE		; ... and it inspects both of these
+	LD	(OUT_FH),A
+	LD	HL,0
+	LD	(FTP_DATA_LEN),HL
 	LD	HL,0			; transfer size unknown until SIZE /
 	LD	(EXPECTED_LEN),HL	; local seek fills it in
 	LD	(EXPECTED_LEN + 2),HL
+	LD	(RESUME_OFFSET),HL	; no -r / fresh file
+	LD	(RESUME_OFFSET + 2),HL
 
 	CALL	@CMDL.PARSE
 	CALL	@CMDL.IS_HELP
@@ -112,15 +121,32 @@ START
 	LD	(NLST_MODE),A
 .NO_NFLAG
 
-	; -y / --yes: force overwrite without prompt.
+	; -y / -f: force overwrite without prompt (two spellings
+	; for parity with the sprinter_wifi package).
 	XOR	A
 	LD	(FORCE_FLAG),A
 	LD	A,'y'
 	CALL	@CMDL.HAS_FLAG
+	JR	NC,.SET_FORCE
+	LD	A,'f'
+	CALL	@CMDL.HAS_FLAG
 	JR	C,.NO_FORCE
+.SET_FORCE
 	LD	A,1
 	LD	(FORCE_FLAG),A
 .NO_FORCE
+
+	; -r: resume a GET -- append to the local file and ask the
+	; server to skip what we already hold (REST).  Ignored for
+	; PUT / listings.
+	XOR	A
+	LD	(RESUME_FLAG),A
+	LD	A,'r'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_RESUME
+	LD	A,1
+	LD	(RESUME_FLAG),A
+.NO_RESUME
 
 	; -u user (optional, default = anonymous)
 	XOR	A
@@ -184,7 +210,9 @@ START
 	; --- Now positionals.  Flag values are already marked
 	; consumed, so GET_POSITIONAL skips over them.
 
-	; positional 0: host.
+	; positional 0: host[:port].  The token lives in writable
+	; command-line RAM, so the ':' (if any) is replaced by a
+	; NUL to terminate the host part in place.
 	LD	B,0
 	CALL	@CMDL.GET_POSITIONAL
 	JP	C,USAGE_ERROR
@@ -192,6 +220,31 @@ START
 	OR	A
 	JP	Z,USAGE_ERROR
 	LD	(HOST_PTR),HL
+	PUSH	HL
+	LD	HL,FTP_CTRL_PORT
+	LD	(CTRL_PORT),HL
+	POP	HL
+.PORT_SCAN
+	LD	A,(HL)
+	OR	A
+	JR	Z,.PORT_DONE
+	CP	':'
+	JR	Z,.PORT_SPLIT
+	INC	HL
+	JR	.PORT_SCAN
+.PORT_SPLIT
+	LD	(HL),0			; terminate host at the colon
+	INC	HL
+	CALL	@UTIL.PARSE_DEC32	; -> DE:HL
+	JP	C,USAGE_ERROR
+	LD	A,D
+	OR	E
+	JP	NZ,USAGE_ERROR		; port > 65535
+	LD	A,H
+	OR	L
+	JP	Z,USAGE_ERROR		; port 0
+	LD	(CTRL_PORT),HL
+.PORT_DONE
 
 	; positional 1: filename, "PUT" verb, or (in list mode) the
 	; directory path -- the latter is optional.
@@ -337,9 +390,10 @@ START
 	LD	DE,TCP_REMOTE_MAC
 	LD	BC,6
 	LDIR
-	XOR	A
+	LD	HL,(CTRL_PORT)		; host[:port]; default 21
+	LD	A,H
 	LD	(TCP_REMOTE_PORT_HI),A
-	LD	A,FTP_CTRL_PORT
+	LD	A,L
 	LD	(TCP_REMOTE_PORT_LO),A
 
 	CALL	@ISA.ISA_CLOSE
@@ -475,11 +529,29 @@ START
 	LD	A,(PUT_MODE)
 	OR	A
 	JR	NZ,.OPEN_PUT
-	LD	HL,(OUTPUT_PTR)
+	; GET: mode 2 = -r (silent resume), 1 = -y/-f (silent
+	; overwrite), 0 = prompt Overwrite/Resume/Cancel when the
+	; file exists.  Whatever path ran, FILE_APPEND_SIZE holds
+	; the resume offset (0 unless resuming) -- it feeds REST
+	; and the absolute X in the progress display.
+	LD	A,(RESUME_FLAG)
+	OR	A
+	LD	A,2
+	JR	NZ,.GET_MODE
 	LD	A,(FORCE_FLAG)
-	CALL	@FILE.OPEN_OUTPUT
+	OR	A
+	LD	A,1
+	JR	NZ,.GET_MODE
+	XOR	A
+.GET_MODE
+	LD	HL,(OUTPUT_PTR)
+	CALL	@FILE.OPEN_OUTPUT_ORC
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
+	LD	HL,(FILE_APPEND_SIZE)
+	LD	(RESUME_OFFSET),HL
+	LD	HL,(FILE_APPEND_SIZE + 2)
+	LD	(RESUME_OFFSET + 2),HL
 	CALL	@ISA.ISA_OPEN
 	JR	.SKIP_FILE_OPEN
 .OPEN_PUT
@@ -537,6 +609,56 @@ START
 	CALL	@TCP.SAVE_CTX
 	LD	HL,CTRL_BACKUP
 	CALL	@TCP.RESTORE_CTX
+
+	; -r GET with a non-empty local file: REST <offset> tells
+	; the server to resume from there.  A server without REST
+	; support answers non-3xx -- appending the full body after
+	; that would corrupt the file, so bail out with a hint.
+	LD	A,(LIST_MODE)
+	OR	A
+	JR	NZ,.NO_REST
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.NO_REST
+	LD	HL,(RESUME_OFFSET)
+	LD	DE,(RESUME_OFFSET + 2)
+	LD	A,H
+	OR	L
+	OR	D
+	OR	E
+	JR	Z,.NO_REST
+	; Build "REST <n>" in REPLY_LINE (dead between replies).
+	; NOT FTP_SCRATCH: only 8 of its bytes are free --
+	; FILENAME_PTR lives at +56, and a 6-digit offset
+	; overwrote it, corrupting the RETR argument (the
+	; v0.2.27 "-r" bug).
+	PUSH	HL
+	PUSH	DE
+	LD	HL,CMD_REST
+	LD	DE,REPLY_LINE
+	LD	BC,CMD_REST_LEN
+	LDIR
+	POP	DE
+	POP	HL
+	LD	IX,REPLY_LINE + CMD_REST_LEN
+	CALL	@UTIL.FORMAT_DEC_32	; IX -> past last digit
+	PUSH	IX
+	POP	HL
+	LD	BC,REPLY_LINE
+	OR	A
+	SBC	HL,BC			; HL = total length
+	LD	B,H
+	LD	C,L
+	LD	HL,REPLY_LINE
+	CALL	SEND_CMD
+	JP	C,TCP_FAIL
+	CALL	READ_REPLY
+	JP	C,REPLY_FAIL
+	CALL	PRINT_REPLY
+	LD	A,(REPLY_CODE)
+	CP	'3'			; 350 = restart accepted
+	JP	NZ,REST_REFUSED
+.NO_REST
 
 	; RETR / STOR / LIST / NLST depending on mode.
 	LD	A,(LIST_MODE)
@@ -1418,9 +1540,16 @@ APPEND_DATA
 ; Trashes everything.
 ; ------------------------------------------------------
 PRINT_PROGRESS
+	; X = RESUME_OFFSET + BODY_TOTAL: with -r the display shows
+	; the absolute file position, not just this session's bytes.
+	; Y (EXPECTED_LEN from SIZE) is absolute already.
 	LD	HL,(BODY_TOTAL_LO)
+	LD	DE,(RESUME_OFFSET)
+	ADD	HL,DE
 	LD	(FTP_SCRATCH),HL
 	LD	HL,(BODY_TOTAL_HI)
+	LD	DE,(RESUME_OFFSET + 2)
+	ADC	HL,DE
 	LD	(FTP_SCRATCH + 2),HL
 	LD	HL,FTP_SCRATCH
 	LD	DE,EXPECTED_LEN
@@ -1611,12 +1740,57 @@ ARP_TIMEOUT
 	JP	@UTIL.EXIT_FAIL
 .CAN
 USER_ABORT
+	; Order matters: the file work comes FIRST because FLUSH_DATA
+	; repaints the "X / Y" line, which would otherwise land
+	; between "Aborted" and "RESULT FAIL" and run into it.
+	;
+	; Keep what was already downloaded: flush the pending buffer
+	; and close the file, so the partial result is resumable with
+	; -r instead of losing the last block.  Nothing to flush when
+	; no file is open (listing / abort before the open) or when
+	; uploading (OUT_FH is then the read-side handle).
+	LD	A,(OUT_FH)
+	CP	NO_HANDLE
+	JR	Z,.NOFH
+	LD	A,(PUT_MODE)
+	OR	A
+	JR	NZ,.CLOSE_FH
+	CALL	@ISA.ISA_OPEN		; FLUSH_DATA expects the window open
+	CALL	FLUSH_DATA
 	CALL	@ISA.ISA_CLOSE
+	CALL	PRINT_PROGRESS		; final count = what is on disk now
+.CLOSE_FH
+	CALL	@ISA.ISA_CLOSE
+	LD	A,(OUT_FH)
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+.NOFH
+	CALL	@ISA.ISA_CLOSE
+	PRINT LINE_END			; close the "X / Y" progress line
 	PRINTLN MSG_ABORTED
 	LD	B,EX_CANCEL
 	JP	@UTIL.EXIT_FAIL
 
+
+; ------------------------------------------------------
+; CHECK_USER_CANCEL: leave through the abort path when the
+; TCP layer failed because the user pressed Esc/Ctrl+C.  A
+; cancel is a decision, not a fault: no error code and no
+; register dump, which otherwise buried the "Aborted" line
+; in diagnostics nobody asked for.  Returns only when the
+; failure was a real one.  May be called with the ISA
+; window open or closed.
+; ------------------------------------------------------
+CHECK_USER_CANCEL
+	LD	A,(TCP_LAST_FAIL)
+	CP	@TCP.F_CANCEL
+	JP	Z,USER_ABORT
+	RET
+
 TCP_OPEN_FAIL
+	CALL	CHECK_USER_CANCEL	; Esc/Ctrl+C exits quietly
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
@@ -1635,6 +1809,7 @@ RESOLVE_FAIL
 	JP	@UTIL.EXIT_FAIL
 
 REPLY_FAIL
+	CALL	CHECK_USER_CANCEL	; Esc/Ctrl+C exits quietly
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
@@ -1654,6 +1829,7 @@ REPLY_BAD
 	JP	@UTIL.EXIT_FAIL
 
 TCP_FAIL
+	CALL	CHECK_USER_CANCEL	; Esc/Ctrl+C exits quietly
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
@@ -1672,6 +1848,7 @@ PASV_FAIL
 	JP	@UTIL.EXIT_FAIL
 
 DATA_OPEN_FAIL
+	CALL	CHECK_USER_CANCEL	; Esc/Ctrl+C exits quietly
 	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
 	PRINTLN MSG_E_DATA_OPEN
@@ -1679,14 +1856,38 @@ DATA_OPEN_FAIL
 	JP	@UTIL.EXIT_FAIL
 
 DATA_RX_FAIL
+	CALL	CHECK_USER_CANCEL	; Esc/Ctrl+C exits quietly
+	; Snapshot the chip BEFORE closing the window -- the REGS
+	; line (BNRY/CURR/ISR incl. OVW) is the only way to tell a
+	; wedged RX ring from a peer that simply went silent.
+	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
-	PRINTLN MSG_E_DATA_RX
+	PRINT MSG_E_DATA_RX
+	; code = TCP layer verdict (02 = timeout, 03 = RST, ...),
+	; ovw = RX-ring overflows this run (data was discarded).
+	PRINT MSG_CODE
+	LD	A,(TCP_LAST_FAIL)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT MSG_OVW
+	LD	A,(RTL_RX_OVW_COUNT)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT LINE_END
+	CALL	PRINT_REG_DUMP
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
 FILE_FAIL
 	CALL	@ISA.ISA_CLOSE
+	; "Cancel" at the Overwrite/Resume/Cancel prompt is a user
+	; decision, not an I/O error: file_lib already printed the
+	; abort line, so just leave with the cancel status.
+	LD	A,(FILE_CANCELLED)
+	OR	A
+	JR	Z,.REAL_ERR
+	LD	B,EX_CANCEL
+	JP	@UTIL.EXIT
+.REAL_ERR
 	PRINT LINE_END
 	PRINTLN MSG_E_FILE
 	LD	A,(OUT_FH)
@@ -1719,6 +1920,15 @@ USAGE_ERROR
 	LD	C,DSS_PCHARS
 	RST	DSS
 	LD	B,1
+	JP	@UTIL.EXIT_FAIL
+
+
+REST_REFUSED
+	; Control session is current and the ISA window is open;
+	; close it for the console + exit path.
+	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_E_NO_REST
+	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
 
@@ -1894,6 +2104,8 @@ CMD_STOR	DB "STOR "
 CMD_STOR_LEN	EQU $ - CMD_STOR
 CMD_SIZE	DB "SIZE "
 CMD_SIZE_LEN	EQU $ - CMD_SIZE
+CMD_REST	DB "REST "
+CMD_REST_LEN	EQU $ - CMD_REST
 EMPTY_STR	DB 0
 CMD_RETR	DB "RETR "
 CMD_RETR_LEN	EQU $ - CMD_RETR
@@ -1923,7 +2135,7 @@ REPLY_CODE	EQU APP_BSS_BASE + 36		; 3
 PASV_PORT_HI	EQU APP_BSS_BASE + 39		; 1
 PASV_PORT_LO	EQU APP_BSS_BASE + 40		; 1
 PASV_IP		EQU APP_BSS_BASE + 41		; 4
-FTP_SCRATCH	EQU APP_BSS_BASE + 48		; 16 (helper scratch)
+FTP_SCRATCH	EQU APP_BSS_BASE + 48		; 8 usable (FILENAME_PTR sits at +56!)
 FILENAME_PTR	EQU APP_BSS_BASE + 56		; 2
 FILENAME_LEN	EQU APP_BSS_BASE + 58		; 1
 OUTPUT_PTR	EQU APP_BSS_BASE + 59		; 2
@@ -1951,6 +2163,9 @@ PUT_BLK_PTR	EQU OVR_O_PTR + 2		; 2 (PUT: next unsent byte in block)
 PUT_BLK_LEFT	EQU PUT_BLK_PTR + 2		; 2 (PUT: unsent bytes left in block)
 EXPECTED_LEN	EQU PUT_BLK_LEFT + 2		; 4 (LE; total for "X / Y", 0 = unknown)
 PROG_CNT	EQU EXPECTED_LEN + 4		; 1 (progress repaint decimator)
+RESUME_FLAG	EQU PROG_CNT + 1		; 1 (1 if -r was given)
+RESUME_OFFSET	EQU RESUME_FLAG + 1		; 4 (LE; local size at open, REST offset)
+CTRL_PORT	EQU RESUME_OFFSET + 4		; 2 (LE; control port, default 21)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
@@ -1974,6 +2189,7 @@ MSG_E_RESOLVE	DB "[E] could not resolve host.",0
 MSG_E_BAD_REPLY	DB "[E] FTP server returned non-2xx.",0
 MSG_E_TCP_SEND	DB "[E] TCP send failed.",0
 MSG_E_PASV	DB "[E] could not parse PASV reply.",0
+MSG_E_NO_REST	DB "[E] server rejected REST (no resume). Rerun without -r.",0
 MSG_PASV_HDR	DB "Data endpoint: ",0
 MSG_OPENING_DATA DB "Opening data connection...",0
 MSG_NLST_FB	 DB "[W] NLST not supported; retrying with LIST.",0
@@ -1981,17 +2197,18 @@ MSG_DONE_PRE	DB "Done. ",0
 MSG_BYTES	DB " bytes received.",0
 MSG_BYTES_SENT	DB " bytes sent.",0
 MSG_E_DATA_OPEN	DB "[E] data connection failed.",0
-MSG_E_DATA_RX	DB "[E] data recv failed.",0
+MSG_E_DATA_RX	DB "[E] data recv failed",0
+MSG_CODE	DB ", code 0x",0
+MSG_OVW		DB " ovw 0x",0
 MSG_E_FILE	DB "[E] file create/write failed.",0
 MSG_USAGE_ERR	DB "[E] usage: missing host or filename",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  FTP host filename     [-u user] [-p pass] [-o output] [-y]",13,10
-	DB "  FTP host PUT local    [-u user] [-p pass] [-o remote-name]",13,10
-	DB "  FTP host [path] -l    [-u user] [-p pass]",13,10
-	DB "  FTP host [path] -n    [-u user] [-p pass]",13,10
+	DB "  FTP host[:port] filename   [-u user] [-p pass] [-o output] [-y|-f] [-r]",13,10
+	DB "  FTP host[:port] PUT local  [-u user] [-p pass] [-o remote-name]",13,10
+	DB "  FTP host[:port] [path] -l|-n  [-u user] [-p pass]",13,10
 	DB "  FTP /?",13,10,13,10
-	DB "  host       FTP server (IPv4 or hostname).",13,10
+	DB "  host[:port]  FTP server (IPv4 or hostname), port default 21.",13,10
 	DB "  filename   remote file to download (default mode).",13,10
 	DB "  PUT local  upload local file to server.",13,10
 	DB "  path       remote directory to list (default: server CWD).",13,10
@@ -2002,7 +2219,8 @@ MSG_HELP
 	DB "             when -u is given without -p).",13,10
 	DB "  -o name    GET: alternate local output filename.",13,10
 	DB "             PUT: alternate remote name on the server.",13,10
-	DB "  -y         overwrite local file without prompt (GET).",13,10,0
+	DB "  -y, -f     overwrite local file without prompt (GET).",13,10
+	DB "  -r         resume GET: append locally, REST on server.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE

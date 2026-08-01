@@ -40,6 +40,8 @@ EXE_VERSION		EQU 1
 	DEFINE USE_UTIL_TPUT
 	DEFINE USE_UTIL_TPUT_PROGRESS
 	DEFINE USE_UTIL_PARSE_DEC32
+	DEFINE USE_UTIL_FORMAT_DEC32
+	DEFINE USE_FILE_APPEND
 
 ARP_TIMEOUT_MS	EQU 3000
 SCAN_C		EQU 0xAC
@@ -80,6 +82,10 @@ START
 
 	XOR	A
 	LD	(CANCELLED),A
+	LD	A,NO_HANDLE		; USER_ABORT may run before the open
+	LD	(OUT_FH),A		; ... and it inspects both of these
+	LD	HL,0
+	LD	(WGET_BUF_LEN),HL
 
 	CALL	@CMDL.PARSE
 	CALL	@CMDL.IS_HELP
@@ -103,15 +109,31 @@ START
 	CALL	DERIVE_OUTPUT
 .OUT_DONE
 
-	; -y / --yes: force overwrite without prompt.
+	; -y / -f: force overwrite without prompt (two spellings
+	; for parity with the sprinter_wifi package).
 	XOR	A
 	LD	(FORCE_FLAG),A
 	LD	A,'y'
 	CALL	@CMDL.HAS_FLAG
+	JR	NC,.SET_FORCE
+	LD	A,'f'
+	CALL	@CMDL.HAS_FLAG
 	JR	C,.NO_FORCE
+.SET_FORCE
 	LD	A,1
 	LD	(FORCE_FLAG),A
 .NO_FORCE
+
+	; -r: resume -- append to the local file and ask the server
+	; for the remainder with a Range header.
+	XOR	A
+	LD	(RESUME_FLAG),A
+	LD	A,'r'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_RESUME
+	LD	A,1
+	LD	(RESUME_FLAG),A
+.NO_RESUME
 
 	; Pull NET_IP, NET_MAC.
 	LD	HL,N_NET_IP
@@ -138,15 +160,33 @@ START
 
 	; Open output file once -- it stays empty across redirects
 	; (body bytes are suppressed for non-2xx responses), and the
-	; final 2xx hop fills it.
+	; final 2xx hop fills it.  With -r the file is reopened for
+	; append and its prior size becomes the Range offset.
 	CALL	@ISA.ISA_CLOSE
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
-	LD	HL,(OUTPUT_PTR)
+	; Mode 2 = -r (silent resume), 1 = -y/-f (silent
+	; overwrite), 0 = prompt Overwrite/Resume/Cancel when the
+	; file exists.  FILE_APPEND_SIZE comes back as the resume
+	; offset (0 unless resuming) and feeds the Range header.
+	LD	A,(RESUME_FLAG)
+	OR	A
+	LD	A,2
+	JR	NZ,.OPEN_MODE
 	LD	A,(FORCE_FLAG)
-	CALL	@FILE.OPEN_OUTPUT
+	OR	A
+	LD	A,1
+	JR	NZ,.OPEN_MODE
+	XOR	A
+.OPEN_MODE
+	LD	HL,(OUTPUT_PTR)
+	CALL	@FILE.OPEN_OUTPUT_ORC
 	JP	C,FILE_FAIL
 	LD	(OUT_FH),A
+	LD	HL,(FILE_APPEND_SIZE)
+	LD	(RESUME_OFFSET),HL
+	LD	HL,(FILE_APPEND_SIZE + 2)
+	LD	(RESUME_OFFSET + 2),HL
 
 	; Total wall-clock includes any redirect hops -- start the
 	; timer here, before the hop loop.
@@ -300,9 +340,7 @@ START
 	CALL	@ISA.ISA_CLOSE
 	; Final "X / Y" repaint so the line ends at the full size
 	; (mid-transfer repaints are decimated to every 4th flush).
-	LD	HL,BODY_TOTAL_LO
-	LD	DE,CONTENT_LEN
-	CALL	@UTIL.TPUT_PROGRESS
+	CALL	PRINT_PROGRESS
 	; Close output file.
 	LD	A,(OUT_FH)
 	CP	NO_HANDLE
@@ -329,11 +367,18 @@ START
 	JP	@UTIL.EXIT_OK
 .RXFAIL
 	; Error during recv (timeout, RST, etc.)
+	CALL	CHECK_USER_CANCEL	; Esc/Ctrl+C exits quietly
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
 	PRINT MSG_E_RECV
 	LD	A,(TCP_LAST_FAIL)
+	CALL	@UTIL.PRINT_HEX_A
+	; RX-ring overflows this run: non-zero means frames were
+	; discarded by the driver's recovery, so the stall is a
+	; lost-data/retransmit story, not a silent peer.
+	PRINT MSG_OVW
+	LD	A,(RTL_RX_OVW_COUNT)
 	CALL	@UTIL.PRINT_HEX_A
 	PRINT LINE_END
 	; Best-effort close of file/conn.
@@ -367,6 +412,30 @@ BUILD_GET
 	LDIR
 	LD	HL,HOST_BUF
 	CALL	COPY_ASCIIZ
+	; -r with a non-empty local file: ask for the remainder.
+	; LIT_RANGE opens with the CRLF that closes the Host line;
+	; LIT_REST's leading CRLF then closes the Range line.
+	LD	HL,(RESUME_OFFSET)
+	LD	A,H
+	OR	L
+	LD	HL,(RESUME_OFFSET + 2)
+	OR	H
+	OR	L
+	JR	Z,.NO_RANGE
+	LD	HL,LIT_RANGE
+	LD	BC,LIT_RANGE_LEN
+	LDIR
+	PUSH	DE
+	POP	IX			; IX = dest for the digits
+	LD	HL,(RESUME_OFFSET)
+	LD	DE,(RESUME_OFFSET + 2)
+	CALL	@UTIL.FORMAT_DEC_32
+	PUSH	IX
+	POP	DE			; DE = past the digits
+	LD	A,'-'			; open-ended range "bytes=N-"
+	LD	(DE),A
+	INC	DE
+.NO_RANGE
 	LD	HL,LIT_REST
 	LD	BC,LIT_REST_LEN
 	LDIR
@@ -388,6 +457,8 @@ LIT_HOST	DB "Host: "
 LIT_HOST_LEN	EQU $ - LIT_HOST
 LIT_REST	DB 13,10,"Connection: close",13,10,13,10
 LIT_REST_LEN	EQU $ - LIT_REST
+LIT_RANGE	DB 13,10,"Range: bytes="
+LIT_RANGE_LEN	EQU $ - LIT_RANGE
 
 
 COPY_ASCIIZ
@@ -716,7 +787,31 @@ PARSE_STATUS_LINE
 	; Tentatively mark redirect; cleared if Location is absent.
 	LD	A,1
 	LD	(HTTP_REDIRECT),A
+	RET
 .OK_2XX
+	; -r with a non-zero offset: 206 (Partial Content) is the
+	; only acceptable success.  A 200 means the server ignored
+	; Range and is sending the whole body -- appending that to
+	; the existing file would corrupt it, so abort.
+	LD	HL,(RESUME_OFFSET)
+	LD	A,H
+	OR	L
+	LD	HL,(RESUME_OFFSET + 2)
+	OR	H
+	OR	L
+	RET	Z
+	LD	HL,(STATUS_CODE)
+	LD	DE,200
+	OR	A
+	SBC	HL,DE
+	RET	NZ			; 206 -> resume accepted
+	; DSS print needs the ISA window closed; we are inside the
+	; recv loop here, so bracket it.
+	CALL	@ISA.ISA_CLOSE
+	PRINTLN MSG_E_RANGE
+	CALL	@ISA.ISA_OPEN
+	LD	A,1
+	LD	(HTTP_ABORT),A
 	RET
 
 
@@ -786,6 +881,48 @@ APPEND_TO_BUF
 
 
 ; ------------------------------------------------------
+; PRINT_PROGRESS: in-place "X / Y" line.
+;   X = RESUME_OFFSET + BODY_TOTAL (absolute file position);
+;   Y = RESUME_OFFSET + CONTENT_LEN (a 206 reply announces
+;       only the remainder), or "?" when the length is unknown.
+; ISA window must be CLOSED.  Trashes everything.
+; ------------------------------------------------------
+PRINT_PROGRESS
+	LD	HL,(BODY_TOTAL_LO)
+	LD	DE,(RESUME_OFFSET)
+	ADD	HL,DE
+	LD	(PROG_X),HL
+	LD	HL,(BODY_TOTAL_HI)
+	LD	DE,(RESUME_OFFSET + 2)
+	ADC	HL,DE
+	LD	(PROG_X + 2),HL
+	; Y: all-zero CONTENT_LEN stays all-zero ("?").
+	LD	HL,(CONTENT_LEN)
+	LD	DE,(CONTENT_LEN + 2)
+	LD	A,H
+	OR	L
+	OR	D
+	OR	E
+	JR	Z,.Y_UNKNOWN
+	LD	DE,(RESUME_OFFSET)
+	ADD	HL,DE
+	LD	(PROG_Y),HL
+	LD	HL,(CONTENT_LEN + 2)
+	LD	DE,(RESUME_OFFSET + 2)
+	ADC	HL,DE
+	LD	(PROG_Y + 2),HL
+	JR	.GO
+.Y_UNKNOWN
+	LD	HL,0
+	LD	(PROG_Y),HL
+	LD	(PROG_Y + 2),HL
+.GO
+	LD	HL,PROG_X
+	LD	DE,PROG_Y
+	JP	@UTIL.TPUT_PROGRESS
+
+
+; ------------------------------------------------------
 ; FLUSH_BUF: write the accumulated buffer to OUT_FH and
 ; reset the fill counter.  No-op when the buffer is empty.
 ;   Out: CF=0 ok; CF=1 DSS_WRITE error.
@@ -802,11 +939,7 @@ FLUSH_BUF
 	; done per flush.  A final repaint is forced at the end.
 	LD	A,(PROG_CNT)
 	AND	3
-	JR	NZ,.NO_PROG
-	LD	HL,BODY_TOTAL_LO	; LO+HI adjacent = 4-byte LE counter
-	LD	DE,CONTENT_LEN
-	CALL	@UTIL.TPUT_PROGRESS
-.NO_PROG
+	CALL	Z,PRINT_PROGRESS
 	LD	HL,PROG_CNT
 	INC	(HL)
 	LD	HL,(WGET_BUF_LEN)
@@ -902,6 +1035,15 @@ HDR_TRANSITION
 
 FILE_FAIL
 	CALL	@ISA.ISA_CLOSE
+	; "Cancel" at the Overwrite/Resume/Cancel prompt is a user
+	; decision, not an I/O error: file_lib already printed the
+	; abort line, so just leave with the cancel status.
+	LD	A,(FILE_CANCELLED)
+	OR	A
+	JR	Z,.REAL_ERR
+	LD	B,EX_CANCEL
+	JP	@UTIL.EXIT
+.REAL_ERR
 	PRINT MSG_E_FILE
 	PRINT LINE_END
 	LD	A,(OUT_FH)
@@ -915,6 +1057,7 @@ FILE_FAIL
 
 
 TCP_FAIL
+	CALL	CHECK_USER_CANCEL	; Esc/Ctrl+C exits quietly
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
@@ -951,6 +1094,19 @@ HTTP_FAIL
 	LD	A,NO_HANDLE
 	LD	(OUT_FH),A
 .NCL
+	; Resume (-r or the prompt's R) must never delete -- the
+	; partial file's bytes are the whole point, and this path is
+	; reachable with one (404, Range ignored, bad redirect).
+	LD	A,(RESUME_FLAG)
+	OR	A
+	JR	NZ,.NDEL
+	LD	HL,(RESUME_OFFSET)
+	LD	A,H
+	OR	L
+	LD	HL,(RESUME_OFFSET + 2)
+	OR	H
+	OR	L
+	JR	NZ,.NDEL
 	LD	HL,(OUTPUT_PTR)
 	LD	A,(HL)
 	OR	A
@@ -1349,12 +1505,52 @@ ARP_TIMEOUT
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 .CAN
+USER_ABORT
+	; Order matters: the file work comes FIRST because FLUSH_BUF
+	; repaints the "X / Y" line, which would otherwise land
+	; between "Aborted" and "RESULT FAIL" and run into it.
+	;
+	; Keep what was already downloaded: flush the pending buffer
+	; and close the file, so the partial result is resumable with
+	; -r.  Unlike HTTP_FAIL this path never deletes the file.
+	LD	A,(OUT_FH)
+	CP	NO_HANDLE
+	JR	Z,.NOFH
+	CALL	@ISA.ISA_OPEN		; FLUSH_BUF expects the window open
+	CALL	FLUSH_BUF
 	CALL	@ISA.ISA_CLOSE
+	CALL	PRINT_PROGRESS		; final count = what is on disk now
+	LD	A,(OUT_FH)
+	LD	C,DSS_CLOSE_FILE
+	RST	DSS
+	LD	A,NO_HANDLE
+	LD	(OUT_FH),A
+.NOFH
+	CALL	@ISA.ISA_CLOSE
+	PRINT LINE_END			; close the "X / Y" progress line
 	PRINTLN MSG_ABORTED
 	LD	B,EX_CANCEL
 	JP	@UTIL.EXIT_FAIL
 
+
+; ------------------------------------------------------
+; CHECK_USER_CANCEL: leave through the abort path when the
+; TCP layer failed because the user pressed Esc/Ctrl+C.  A
+; cancel is a decision, not a fault: no error code and no
+; register dump, which otherwise buried the "Aborted" line
+; in diagnostics nobody asked for.  Returns only when the
+; failure was a real one.  May be called with the ISA
+; window open or closed.
+; ------------------------------------------------------
+CHECK_USER_CANCEL
+	LD	A,(TCP_LAST_FAIL)
+	CP	@TCP.F_CANCEL
+	JP	Z,USER_ABORT
+	RET
+
+
 TCP_OPEN_FAIL
+	CALL	CHECK_USER_CANCEL	; Esc/Ctrl+C exits quietly
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
@@ -1576,6 +1772,8 @@ HTTP_REDIRECT	EQU APP_BSS_BASE + 45		; 1 (1 if status 3xx + Location)
 HOP_COUNT	EQU APP_BSS_BASE + 46		; 1 (redirect hops so far)
 CONTENT_LEN	EQU APP_BSS_BASE + 47		; 4 (LE; Content-Length, 0 = unknown)
 PROG_CNT	EQU APP_BSS_BASE + 51		; 1 (progress repaint decimator)
+RESUME_FLAG	EQU APP_BSS_BASE + 52		; 1 (1 if -r was given)
+RESUME_OFFSET	EQU APP_BSS_BASE + 53		; 4 (LE; local size at open = Range offset)
 HDR_LINE_BUF_SIZE EQU 256
 REDIRECT_URL_BUF_SIZE EQU 256
 MAX_REDIRECT_HOPS EQU 5
@@ -1585,6 +1783,8 @@ REQUEST_BUF	EQU PATH_BUF + PATH_BUF_SIZE	; REQUEST_BUF_SIZE
 WGET_BUF_LEN	EQU REQUEST_BUF + REQUEST_BUF_SIZE	; 2 bytes
 HDR_LINE_BUF	EQU WGET_BUF_LEN + 2		; HDR_LINE_BUF_SIZE bytes
 REDIRECT_URL_BUF EQU HDR_LINE_BUF + HDR_LINE_BUF_SIZE	; REDIRECT_URL_BUF_SIZE bytes
+PROG_X		EQU REDIRECT_URL_BUF + REDIRECT_URL_BUF_SIZE	; 4 (staged progress X)
+PROG_Y		EQU PROG_X + 4			; 4 (staged progress Y)
 
 
 MSG_BANNER	DB "RTL8019AS WGET v",PACKAGE_VERSION,0
@@ -1602,6 +1802,7 @@ MSG_E_ARP	DB "ARP request timed out.",0
 MSG_E_TCP_OPEN	DB "TCP connect failed, code 0x",0
 MSG_E_TCP_SEND	DB "TCP send failed, code 0x",0
 MSG_E_RECV	DB "TCP recv failed, code 0x",0
+MSG_OVW		DB " ovw 0x",0
 MSG_E_FILE	DB "[E] file create/write failed.",0
 MSG_E_HTTP_PRE	DB "[E] ",0
 MSG_REDIRECT_PRE DB "Redirect: ",0
@@ -1613,13 +1814,15 @@ MSG_E_RESOLVE	DB "[E] could not resolve host.",0
 MSG_DONE_PRE	DB "Done. ",0
 MSG_BYTES	DB " bytes received.",0
 MSG_USAGE_ERR	DB "[E] usage: missing or invalid URL",0
+MSG_E_RANGE	DB "[E] server ignored Range (no resume). Rerun without -r.",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  WGET url [-o output] [-y]",13,10
+	DB "  WGET url [-o output] [-y|-f] [-r]",13,10
 	DB "  WGET /?",13,10,13,10
 	DB "  url     http://host[:port][/path]",13,10
 	DB "  -o file write body to <file> (default: derived from URL).",13,10
-	DB "  -y      overwrite local file without prompt.",13,10,0
+	DB "  -y, -f  overwrite local file without prompt.",13,10
+	DB "  -r      resume: append to <file>, request Range from server.",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE

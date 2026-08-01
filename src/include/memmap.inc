@@ -126,9 +126,14 @@ RTL_TX_CFG0_POST	EQU LIBBSS_BASE + 0x16F	; page-3 CONFIG0 after PTX/TXE
 RTL_TX_CFG3_POST	EQU LIBBSS_BASE + 0x170	; page-3 CONFIG3 after PTX/TXE
 RTL_TX_LAST_NCR	EQU LIBBSS_BASE + 0x171	; page-0 collision count for last TX
 RTL_TX_LAST_TPSR EQU LIBBSS_BASE + 0x172	; page-2 read-back of TX start page before TXP
+; RX-ring overflow counter (saturating at 255).  Every OVW event
+; discards the whole ring, so a non-zero value tells a stalled
+; transfer apart from a peer that simply went quiet.  Cleared by
+; INIT_BASE.
+RTL_RX_OVW_COUNT EQU LIBBSS_BASE + 0x173	; 1 byte
 
 ; Total span of the LIBBSS_BASE region (util + rtl + netenv + rtl tx).
-LIBBSS_SIZE		EQU 0x173
+LIBBSS_SIZE		EQU 0x174
 
 ; netcfg_lib: parsed-field outputs + 1024-byte file read
 ; buffer.  Active only in NETCFG.EXE -- no other utility
@@ -278,6 +283,15 @@ PAGEMEM_PHYS		EQU 0xAB01	; PAGEMEM_MAX_PAGES bytes
 ; for the DSS path conventions.
 FILE_SAVED_CWD		EQU 0xAC00	; 128 bytes
 FILE_DIR_BUF		EQU 0xAC80	; 128 bytes
+
+; file_lib OPEN_APPEND (USE_FILE_APPEND): prior size of the
+; reopened file (4-byte LE) + handle scratch for the seek.
+FILE_APPEND_SIZE	EQU 0xAD00	; 4 bytes
+FILE_FH_SCRATCH		EQU 0xAD04	; 1 byte
+; Set by OPEN_OUTPUT_ORC when the user answers Cancel, so the
+; caller can exit quietly (EX_CANCEL) instead of reporting an
+; I/O error.  Cleared at every OPEN_OUTPUT_ORC entry.
+FILE_CANCELLED		EQU 0xAD05	; 1 byte
 
 ; ----- Per-app private BSS (0xB000+) ---------------------
 

@@ -55,7 +55,7 @@ Utilities that wait for the network respond to **Esc** and
 ## Hostnames vs IPv4 literals
 
 Utilities that take a destination (`PING`, `UDPTEST`, `TFTP`,
-`NTP`, `WGET`, `FTP`) accept either a dotted-decimal IPv4 address
+`NTP`, `WGET`, `FTP`, `TELNET`) accept either a dotted-decimal IPv4 address
 or a DNS hostname.  When a hostname is supplied, the utility issues
 a DNS A-record query to `NET_DNS1` before the actual operation.
 If `NET_DNS1` is unset, the utility prints a configuration error

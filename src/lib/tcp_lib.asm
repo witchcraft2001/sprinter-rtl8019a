@@ -936,27 +936,9 @@ RECV
 	SCF
 	RET
 .NO_RST
-	; Validate seq == RCV_NXT.
-	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4	; seq BE
-	LD	DE,TCP_RCV_NXT
-	LD	B,4
-.CMPSEQ
-	LD	A,(DE)
-	CP	(HL)
-	JP	NZ,.OUT_OF_ORDER
-	INC	DE
-	INC	HL
-	DJNZ	.CMPSEQ
-	; If has ACK, copy ack number into SND_UNA.
-	LD	A,(.FLAGS)
-	AND	TF_ACK
-	JR	Z,.NO_ACK
-	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 8	; ack BE
-	LD	DE,TCP_SND_UNA
-	LD	BC,4
-	LDIR
-.NO_ACK
-	; Compute data offset and data length.
+	; Segment geometry first: the sequence classification below
+	; needs the payload length to recognise a retransmit that
+	; OVERLAPS RCV_NXT (see .SEQ_MISMATCH).
 	; data_offset_bytes = (TCP[12] >> 4) * 4
 	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 12)
 	AND	0xF0
@@ -975,14 +957,41 @@ RECV
 	LD	C,A
 	LD	B,0
 	OR	A
-	SBC	HL,BC			; HL = data length
-	LD	(TCP_RX_DATA_LEN),HL
+	SBC	HL,BC			; HL = data length as sent
+	LD	(.SEG_LEN),HL
 	; data ptr = RX_BUF + 14 + 20 + data_offset
 	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN
 	LD	A,(.DATA_OFFSET)
 	LD	C,A
 	LD	B,0
 	ADD	HL,BC
+	LD	(.SEG_PTR),HL
+
+	; Validate seq == RCV_NXT.
+	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4	; seq BE
+	LD	DE,TCP_RCV_NXT
+	LD	B,4
+.CMPSEQ
+	LD	A,(DE)
+	CP	(HL)
+	JP	NZ,.SEQ_MISMATCH
+	INC	DE
+	INC	HL
+	DJNZ	.CMPSEQ
+.SEQ_OK
+	; If has ACK, copy ack number into SND_UNA.
+	LD	A,(.FLAGS)
+	AND	TF_ACK
+	JR	Z,.NO_ACK
+	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 8	; ack BE
+	LD	DE,TCP_SND_UNA
+	LD	BC,4
+	LDIR
+.NO_ACK
+	; Publish the (possibly trimmed) payload.
+	LD	HL,(.SEG_LEN)
+	LD	(TCP_RX_DATA_LEN),HL
+	LD	HL,(.SEG_PTR)
 	LD	(TCP_RX_DATA_PTR),HL
 	; Advance RCV_NXT by data length.
 	LD	BC,(TCP_RX_DATA_LEN)
@@ -1048,6 +1057,67 @@ RECV
 .PEER_FIN
 	SCF
 	RET
+.SEQ_MISMATCH
+	; seq != RCV_NXT.  Three cases -- only the third is new, and
+	; getting it wrong deadlocks a transfer for good:
+	;   seq > RCV_NXT           -> a hole; we cannot buffer out of
+	;                              order, so dup-ACK and wait.
+	;   seq + len <= RCV_NXT    -> pure duplicate; dup-ACK.
+	;   seq < RCV_NXT < seq+len -> the peer retransmitted a segment
+	;                              that STARTS before what we have
+	;                              but carries new data past it
+	;                              (senders coalesce queued data on
+	;                              retransmit).  Rejecting it means
+	;                              the peer resends the same bytes
+	;                              forever while we dup-ACK, until
+	;                              RECV times out -- the "transfer
+	;                              dies mid-file" failure.  RFC 793
+	;                              says trim the overlap and accept
+	;                              the remainder.
+	; delta = RCV_NXT - seq, LSB-first over the big-endian fields.
+	; Only LD instructions sit between the SBCs, so the borrow
+	; chains correctly across all four bytes.
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4 + 3)
+	LD	B,A
+	LD	A,(TCP_RCV_NXT + 3)
+	SUB	B
+	LD	(.DELTA_LO),A
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4 + 2)
+	LD	B,A
+	LD	A,(TCP_RCV_NXT + 2)
+	SBC	A,B
+	LD	(.DELTA_LO + 1),A
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4 + 1)
+	LD	B,A
+	LD	A,(TCP_RCV_NXT + 1)
+	SBC	A,B
+	LD	C,A				; third byte of the difference
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4 + 0)
+	LD	B,A
+	LD	A,(TCP_RCV_NXT + 0)
+	SBC	A,B
+	JP	C,.OUT_OF_ORDER			; borrow: seq is AHEAD (hole)
+	OR	C
+	JP	NZ,.OUT_OF_ORDER		; delta >= 65536: ancient copy
+	; delta (low 16 bits) vs segment length.
+	LD	HL,(.DELTA_LO)
+	LD	A,H
+	OR	L
+	JP	Z,.OUT_OF_ORDER			; delta 0 cannot reach here
+	EX	DE,HL				; DE = delta
+	LD	HL,(.SEG_LEN)
+	OR	A
+	SBC	HL,DE				; seg_len - delta
+	JP	Z,.OUT_OF_ORDER			; exact duplicate
+	JP	C,.OUT_OF_ORDER			; wholly old data
+	; Overlap: keep the tail.  new_len = seg_len - delta,
+	; new_ptr = seg_ptr + delta.
+	LD	(.SEG_LEN),HL
+	LD	HL,(.SEG_PTR)
+	ADD	HL,DE
+	LD	(.SEG_PTR),HL
+	JP	.SEQ_OK
+
 .OUT_OF_ORDER
 	; Out-of-order or duplicate segment.  Never drop it silently:
 	; immediately re-ACK RCV_NXT so the peer re-syncs.  Silent drop
@@ -1071,6 +1141,9 @@ RECV
 	RET
 .FLAGS		DB 0
 .DATA_OFFSET	DB 0
+.SEG_PTR	DW 0		; payload ptr/length of the segment being
+.SEG_LEN	DW 0		; classified (trimmed on overlap)
+.DELTA_LO	DW 0		; low 16 bits of RCV_NXT - seq
 
 ; Counter of segments processed since the last outbound ACK.  Reset
 ; on TCP.OPEN and on every actual ACK send; bumped on every accepted

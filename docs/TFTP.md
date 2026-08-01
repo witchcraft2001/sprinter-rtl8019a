@@ -7,14 +7,15 @@ are supported by the current package.
 ## Usage
 
 ```
-TFTP host GET remote-file [-o local-name] [-y]
-TFTP host PUT local-file  [-o remote-name]
+TFTP host[:port] GET remote-file [-o local-name] [-y|-f]
+TFTP host[:port] PUT local-file  [-o remote-name]
 TFTP /?
 ```
 
 | Option       | Meaning                                            |
 |--------------|----------------------------------------------------|
-| `host`       | TFTP server IPv4 or hostname                       |
+| `host[:port]`| TFTP server IPv4 or hostname; request port         |
+|              | defaults to 69 (`TFTP srv:6969 GET a.bin`).        |
 | `GET / PUT`  | Direction of transfer                              |
 | `filename`   | Remote name (GET) or local name (PUT).  Local      |
 |              | side supports directory prefix per "Output paths"  |
@@ -26,7 +27,7 @@ TFTP /?
 |              |        (`GET pub/foo.bin` saves as `foo.bin`).     |
 |              |   PUT: wire = basename of the local path           |
 |              |        (`PUT C:\docs\a.txt` uploads as `a.txt`).   |
-| `-y`         | Overwrite local file without prompt (GET only)     |
+| `-y`, `-f`   | Overwrite local file without prompt (GET only)     |
 
 The RRQ asks for `blksize=1428` (Ethernet MTU minus the IP /
 UDP / TFTP headers); a server that ignores the option falls

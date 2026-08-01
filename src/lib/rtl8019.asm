@@ -95,6 +95,8 @@ INIT_BASE
 	; helpers see a clean slate.
 	LD	HL,0
 	LD	(RTL_BASE_PTR),HL
+	XOR	A
+	LD	(RTL_RX_OVW_COUNT),A
 
 	; Stage 1: env override.
 	CALL	TRY_ENV_OVERRIDE
@@ -1438,6 +1440,15 @@ RING_HAS_PACKET
 ; In:  IX = chip base.  Trashes A.  (DELAY_2MS preserves IX/DE/HL.)
 ; ------------------------------------------------------
 RECOVER_OVERFLOW
+	; Count the event (saturating): the flush below drops every
+	; queued frame, so a stalled transfer with OVW > 0 lost data
+	; here and is waiting on peer retransmits -- a completely
+	; different diagnosis from OVW = 0 (peer went silent).
+	LD	A,(RTL_RX_OVW_COUNT)
+	INC	A
+	JR	Z,.NO_WRAP
+	LD	(RTL_RX_OVW_COUNT),A
+.NO_WRAP
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP	; STP + abort DMA
 	; Wait with the system page restored and IRQs enabled.  Reopen the
 	; same slot/base and reload IX before touching the NIC again.

@@ -318,6 +318,15 @@ CHECKSUM
 ;   EXIT_OK    Print "RESULT OK", exit B=0.
 ;   EXIT_FAIL  In: B = exit code. Print "RESULT FAIL", exit.
 ; ------------------------------------------------------
+	; USE_UTIL_FORMAT_DEC32 implies USE_UTIL_PRINT_DEC_32 (it
+	; reuses PRINT_DEC_32's in-place divide-by-10 helper).
+	; This implication must precede the gate below.
+	IFDEF USE_UTIL_FORMAT_DEC32
+	IFNDEF USE_UTIL_PRINT_DEC_32
+	DEFINE USE_UTIL_PRINT_DEC_32
+	ENDIF
+	ENDIF
+
 	IFDEF USE_UTIL_PRINT_DEC_32
 ; ------------------------------------------------------
 ; PRINT_DEC_32: print 32-bit value as unsigned decimal,
@@ -782,6 +791,53 @@ TPUT_PROGRESS
 _TPUT_S_PROG_MID	DB "KB / ",0
 _TPUT_S_PROG_KB		DB "KB",0
 	ENDIF
+	ENDIF
+
+
+	IFDEF USE_UTIL_FORMAT_DEC32
+; ------------------------------------------------------
+; FORMAT_DEC_32: write a 32-bit value as unsigned ASCII
+; decimal (no leading zeros) at (IX).  No terminator.
+;   In:  HL = low word, DE = high word, IX = dest.
+;   Out: IX -> past the last digit.
+; Trashes A,BC,DE,HL.  Uses UTIL_DEC32_SCRATCH.
+; ------------------------------------------------------
+FORMAT_DEC_32
+	LD	(UTIL_DEC32_SCRATCH),HL
+	LD	(UTIL_DEC32_SCRATCH + 2),DE
+	; Special-case zero.
+	LD	A,H
+	OR	L
+	OR	D
+	OR	E
+	JR	NZ,.NZ
+	LD	(IX+0),'0'
+	INC	IX
+	RET
+.NZ
+	LD	B,0			; digit count
+.LP
+	CALL	PRINT_DEC_32.DIV32_10
+	ADD	A,'0'
+	PUSH	AF
+	INC	B
+	LD	A,(UTIL_DEC32_SCRATCH)
+	LD	C,A
+	LD	A,(UTIL_DEC32_SCRATCH + 1)
+	OR	C
+	LD	C,A
+	LD	A,(UTIL_DEC32_SCRATCH + 2)
+	OR	C
+	LD	C,A
+	LD	A,(UTIL_DEC32_SCRATCH + 3)
+	OR	C
+	JR	NZ,.LP
+.OUT
+	POP	AF
+	LD	(IX+0),A
+	INC	IX
+	DJNZ	.OUT
+	RET
 	ENDIF
 
 
