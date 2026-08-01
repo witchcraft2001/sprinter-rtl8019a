@@ -129,6 +129,9 @@ for dll in ${BUILD_DLLS[@]+"${BUILD_DLLS[@]}"}; do
 done
 
 for rel_path in "${DIST_DOC_FILES[@]}"; do
+  if is_excluded "$rel_path" ${ZIP_EXCLUDE_DOC_FILES[@]+"${ZIP_EXCLUDE_DOC_FILES[@]}"}; then
+    continue
+  fi
   copy_doc "$rel_path"
 done
 

@@ -54,7 +54,7 @@ Utilities that wait for the network respond to **Esc** and
 
 ## Hostnames vs IPv4 literals
 
-Utilities that take a destination (`PING`, `UDPTEST`, `TFTP`,
+Utilities that take a destination (`PING`, `TFTP`,
 `NTP`, `WGET`, `FTP`, `TELNET`) accept either a dotted-decimal IPv4 address
 or a DNS hostname.  When a hostname is supplied, the utility issues
 a DNS A-record query to `NET_DNS1` before the actual operation.
@@ -94,21 +94,6 @@ intermediate directories.
 
 
 ## Configuration
-
-Before first network use on a physical card, run:
-
-```text
-NICINFO
-NICMODE
-```
-
-If both report `DUPLEX=FULL` while the switch/router port is left at its
-normal auto-negotiation setting, run `NICMODE HALF -y` once, then repeat
-`NICINFO`.  Legacy RTL8019AS does not negotiate duplex; a modern peer can
-parallel-detect 10 Mbit/s but must assume half-duplex.  Keep full-duplex only
-when the peer port is manually forced to 10 Mbit/s full-duplex.  See
-`NICMODE.TXT` for the EEPROM verification and recovery rules.
-
 
 The kit relies on DSS environment variables populated by
 `NETCFG -i` from `NET.CFG`:

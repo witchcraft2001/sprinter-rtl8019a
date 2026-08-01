@@ -49,7 +49,7 @@ accepted.
 only** -- it does not search `PATH` or the program's own directory.
 A consumer launched through `PATH` should ask DSS `APPINFO`
 (`B = APPINFO_EXE_HOMEDIR`) for its own directory and pass a full
-path; `UNETTEST.EXE` shows the pattern.
+path.
 
 ### Window rules
 
@@ -150,50 +150,9 @@ for the same reason: both use the shared `ISA_OPEN`/`ISA_CLOSE`
 pair, and the system's 50 Hz interrupt must be serviced between
 chip accesses.
 
-## Testing
-
-`UNETTEST.EXE` walks the whole API and prints each step:
-
-```
-UNETTEST [-d FILE.DLL] [-u UDPPORT] HOST [PORT]
-
-UNETTEST example.com 80
-UNETTEST -d UNETESP.DLL example.com 80
-UNETTEST -u 7777 192.168.7.1
-```
-
-It loads the DLL, prints its L1 name and version, checks `GETCAPS`
-and the ABI major version, then runs `STATUS`, `NETINIT`, `GETINFO`,
-`RESOLVE`, `PING`, `CONNECT`, `SEND`, a short `RECV` loop, `CLOSE`
-and `NETDONE`.  Because everything goes through the DLL, the same
-binary is the conformance test for both backends.
-
-`-u PORT` swaps the TCP half for `UDPOPEN` / `SEND` / `RECV` against
-a datagram echo responder, and reports whether the reply came back
-byte for byte:
-
-```
-udp 192.168.7.1:7777
-request sent
-udp reply: len=21 data=SPRINTER UNETTEST UDP
-udp echo ok
-```
-
-Start the responder on the host with
-`sudo python3 tools/dev/udp_echo.py --bind 192.168.7.1 --port 7777`.
-The UDP exercise *replaces* the TCP one rather than following it:
-the v1 ABI has a single channel and `UDPOPEN` requires it closed, so
-covering both transports takes two runs.  A backend without
-`CAP_UDP` answers `NERR_NOTSUP`, which UNETTEST reports as a skip
-(exit `0`), not a failure.
-
-Exit codes: `0` ok, `1` usage, `2` hardware not found, `3`
-communication or protocol error, `4` network not configured.
-
 `UNETRTL.DLL` is published at the repository root and ships in both
 the release archive and the floppy image, so a consumer can take the
 ready-built file without installing the assembler or libman.  Its L1
 header records the ABI line in the numeric version field and the full
 package revision in the 15-byte text tag, for example
-`UNETRTL v0.2.20`.  `UNETTEST.EXE` remains a floppy-only conformance
-harness.
+`UNETRTL v0.2.20`.

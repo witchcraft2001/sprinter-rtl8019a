@@ -8,10 +8,9 @@ short reference page.
 Read these in order on a fresh setup:
 
 1. `HOWTO.TXT` -- conventions, env vars, exit codes, batch idioms.
-2. `NICMODE.TXT`-- check legacy 10BASE-T duplex before first use.
-3. `NETCFG.TXT` -- `NETCFG -i` to seed env from `NET.CFG`.
-4. `IFUP.TXT`   -- bring the link up (static or DHCP).
-5. `PING.TXT`   -- verify reachability.
+2. `NETCFG.TXT` -- `NETCFG -i` to seed env from `NET.CFG`.
+3. `IFUP.TXT`   -- bring the link up (static or DHCP).
+4. `PING.TXT`   -- verify reachability.
 
 Then use whichever utility you need.  All `<NAME>.TXT` files use
 the same layout: usage syntax, options, examples, exit codes.
@@ -21,31 +20,25 @@ the same layout: usage syntax, options, examples, exit codes.
 | `HOWTO.TXT`   | Common conventions and configuration (start here)    |
 | `NETCFG.TXT`  | NET.CFG / env-var management                         |
 | `IFUP.TXT`    | Static or DHCP interface bring-up                    |
-| `ARP.TXT`     | Single ARP probe                                     |
-| `PING.TXT`    | ICMP echo; includes PINGALT packet-RAM A/B          |
-| `UDPTEST.TXT` | UDP echo smoke test                                  |
+| `PING.TXT`    | ICMP echo                                             |
 | `NSLOOKUP.TXT`| DNS A-record lookup                                  |
 | `NTP.TXT`     | NTPv3 client; sets the DSS clock                     |
 | `WGET.TXT`    | HTTP download with redirect following                |
 | `FTP.TXT`     | FTP download + directory listing                     |
 | `TELNET.TXT`  | ANSI/VT100 Telnet client with Zmodem/Ymodem          |
 | `TFTP.TXT`    | TFTP download with RFC 2348 blksize                  |
-| `ISAPROBE.TXT`| ISA bus diagnostic when NICINFO can't find the card  |
-| `NICMODE.TXT` | Read/repair persistent RTL8019AS duplex mode         |
+| `ISAPROBE.TXT`| ISA bus troubleshooting and raw window inspection    |
 | `UNETRTL.TXT` | UNET network DLL: TCP/UDP/DNS/ping for your own code |
 
 `UNETRTL.DLL` is for developers: it exposes the kit's network stack
 to your own DSS programs through the same numbered API the Sprinter
 Wi-Fi kit implements, so one binary can drive either card.  The
 ready-built DLL is also committed at the repository root and ships in
-the archive and floppy image; `UNETTEST.EXE` is floppy-only.
+the archive and floppy image.
 
-`PINGALT.EXE` is a diagnostic twin of PING with TX moved to packet-RAM page
-`46`; use the same `PING.TXT` reference.  The other `NIC*` utilities
-(`NICINFO`, `NICRAM`, `NICLB`, `NICTX`,
-`NICRX`) are stage diagnostics for the driver itself; their use
-is described in `sprinter_rtl8019_soft.md` in the source tree, not
-shipped on the floppy.
+`NICINFO.EXE` prints the detected RTL8019AS identity, MAC address, packet
+RAM layout, and register snapshot. If the card is not detected normally,
+use `ISAPROBE.EXE` with the procedures in `ISAPROBE.TXT`.
 
 For driver-level details, NIC register descriptions, and MAME
 network setup see `sprinter_rtl8019_soft.md` and

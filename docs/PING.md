@@ -77,11 +77,8 @@ The following `PHY C0=pre>post C3=pre>post NCR=xx` line captures page-3
 `CONFIG0`/`CONFIG3` immediately around TXP and the page-0 collision count.
 On the affected physical card, v0.2.10 measured stable
 `C0=08>08 C3=70>70 NCR=00`: UTP stayed selected but FUDUP remained enabled.
-With an auto-negotiating peer this is a duplex mismatch, because legacy
-10BASE-T parallel detection selects half-duplex at the peer.  Run `NICMODE`
-and normally `NICMODE HALF -y`; after that the same card should report
-`C3=30>30`.  A changed `C0` would instead indicate TP/CX auto-detect
-switching away from UTP while the frame is sent.
+A changed `C0` would instead indicate TP/CX auto-detect switching away from
+UTP while the frame is sent.
 
 The `-b` switch changes only the Ethernet destination to
 `FF:FF:FF:FF:FF:FF`; the target IPv4 address and ICMP packet remain intact.
@@ -103,17 +100,3 @@ tests the real-card condition where the broadcast ARP is visible on the wire,
 the following unicast ICMP is absent, but the NIC nevertheless reports
 `PTX/TSR=03`.  Timeout diagnostics also print page-2 `TPSR`; the expected
 value is `40`, matching the verified TXRAM address `0x4000`.
-
-`PINGALT.EXE` is a field-diagnostic build with identical command-line and
-protocol logic.  It moves the six-page TX buffer from page `40` to `46` and
-the RX ring from `46..5F` to `4C..5F`.  Its banner prints:
-
-```text
-RTL8019AS PINGALT v0.2.16
-[D] TX=46 RX=4C..5F (alternate packet RAM layout)
-```
-
-Compare normal `PING -n 1 target` and `PINGALT -n 1 target` in one packet
-capture.  A PINGALT-only success isolates a defective/unstable local-DMA path
-at packet-RAM page `40`; equal failure moves the cause past packet-RAM layout
-towards the serializer/PHY or the physical card.

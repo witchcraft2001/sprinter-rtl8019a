@@ -11,14 +11,10 @@ notes for MAME network setup are in `docs/MAME_NETWORK.md`.
 
 ## Status
 
-Stages 0..10 implemented and tested in MAME with a pcap
-backend on macOS:
+The release archive contains the supported end-user utilities:
 
-- `HELLO`, `NICINFO`, `NICMODE`, `NICRAM`, `NICLB`, `NICTX`, `NICRX`
-  -- driver bring-up.
-- `ARP`, `PING` (with `-t/-n/-l/-i/-w` Windows-style
-  flags), `UDPTEST`, `TFTP`, `NTP`, `NSLOOKUP` -- IPv4
-  + UDP utilities.
+- `PING` (with `-t/-n/-l/-i/-w` Windows-style flags), `TFTP`,
+  `NTP`, and `NSLOOKUP`.
 - `NETCFG`, `IFUP` (static + DHCP), `WGET` (HTTP/1.0),
   `FTP` (passive mode, work in progress), `TELNET` (ANSI/VT100,
   Zmodem and Ymodem).
@@ -28,8 +24,7 @@ stack to other DSS programs through the same numbered API the
 Sprinter Wi-Fi kit implements, so one consumer binary can drive
 either card.  The ready-built DLL is committed at the repository root
 and ships in both release formats; its L1 header includes the full
-human-readable package tag.  Its conformance test `UNETTEST.EXE`
-ships on the floppy image.  See `docs/UNETRTL.md`.
+human-readable package tag. See `docs/UNETRTL.md`.
 
 ## Installing on Sprinter DSS
 
@@ -45,11 +40,9 @@ REN NETSMPL.CFG NET.CFG
 Then edit `NET.CFG` for your local network (`RTL_IOBASE`, `IP`, `NETMASK`,
 `GATEWAY`, ...).
 
-On a physical RTL8019AS card, run `NICINFO` and read-only `NICMODE` before
-the first `IFUP`.  If the card reports `DUPLEX=FULL` while the switch/router
-port is left at auto-negotiation, run `NICMODE HALF -y` once.  Legacy
-10BASE-T does not negotiate duplex; the peer otherwise selects half-duplex
-while the card remains full-duplex, causing intermittent frame loss.
+Run `NETCFG -i`, then `IFUP`, and use `PING` to verify connectivity.
+For hardware troubleshooting, `NICINFO` and `ISAPROBE` are included in the
+archive; detailed probe procedures are in `ISAPROBE.TXT`.
 
 ## Build
 
@@ -66,7 +59,7 @@ make clean      # remove build/ and the two distr artifacts
 Direct sjasmplus invocation for a single source:
 
 ```
-sjasmplus -I src/include -I src/lib --raw=build/HELLO.EXE src/apps/hello.asm
+sjasmplus -I src/include -I src/lib --raw=build/PING.EXE src/apps/ping.asm
 ```
 
 ## Running in MAME
@@ -89,10 +82,9 @@ helpers that live next to MAME:
 
 | Sprinter utility       | Host service / role                               |
 |------------------------|---------------------------------------------------|
-| `PING`, `ARP`          | none (kernel of the host replies natively)        |
+| `PING`                 | none (kernel of the host replies natively)        |
 | `IFUP` (DHCP mode)     | `dnsmasq` -- DHCP server                          |
 | `NSLOOKUP`             | `dnsmasq` -- DNS forwarder (or local A records)   |
-| `UDPTEST`              | `tools/dev/udp_echo.py` -- UDP echo (port 7777)   |
 | `TFTP`                 | any TFTP server (`tftpd-hpa`, `dnsmasq --enable-tftp`) |
 | `NTP`                  | `tools/dev/ntp_serve.py` -- minimal NTP responder |
 | `WGET`                 | `python3 -m http.server` -- static HTTP/1.0       |
@@ -155,9 +147,6 @@ sudo dnsmasq -k --listen-address=192.168.7.1 --bind-interfaces \
 
 # HTTP for WGET (run from the directory you want to serve)
 cd /tmp/web-test && sudo python3 -m http.server 80 --bind 192.168.7.1
-
-# UDP echo for UDPTEST
-python3 tools/dev/udp_echo.py
 
 # NTP responder
 sudo python3 tools/dev/ntp_serve.py --bind 192.168.7.1

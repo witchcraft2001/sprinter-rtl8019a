@@ -42,13 +42,27 @@ BUILD_DLLS=(
   unetrtl
 )
 
-# Diagnostics that ship on the floppy image but stay out of the release
-# ZIP.  UNETTEST is a conformance harness.  UNETRTL.DLL is a published
-# runtime artifact and therefore ships in both the ZIP and the image.
+# Diagnostics that ship on the developer floppy image but stay out of the
+# release ZIP. UNETRTL.DLL is a published runtime artifact and therefore
+# ships in both formats.
 ZIP_EXCLUDE_APPS=(
+  hello
+  nicmode
+  nicram
+  niclb
+  nictx
+  nicrx
+  arp
+  pingalt
+  udptest
   unettest
 )
 ZIP_EXCLUDE_DLLS=()
+ZIP_EXCLUDE_DOC_FILES=(
+  docs/ARP.md
+  docs/UDPTEST.md
+  docs/NICMODE.md
+)
 
 # Text/documentation files copied to the distribution root.
 # docs/MAME_NETWORK.md is intentionally NOT shipped: it is developer-only.
