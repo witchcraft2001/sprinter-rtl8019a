@@ -71,12 +71,14 @@ EXE_HEADER
 	DW 0
 	DW START
 	DW START
-	DW 0xBFFF
+	DW 0x8000			; entry stack in WIN1 (own page);
+					; START moves it into WIN2
 	DS 234, 0
 
 	ORG 0x4200
 
 START
+	CLAIM_RUNTIME_PAGE		; WIN2 is the caller's page until this runs
 	LD	(CMDL_SOURCE_PTR),IX	; must precede every CALL/RST DSS
 	PRINTLN MSG_BANNER
 
@@ -1828,6 +1830,7 @@ LINE_END	DB 13,10,0
 	ENDMODULE
 
 
+	INCLUDE "win2page.asm"
 	INCLUDE "netenv_lib.asm"
 	INCLUDE "cmdline_lib.asm"
 	INCLUDE "isa.asm"
@@ -1855,6 +1858,9 @@ RX_BUF		EQU RX_HDR + 4
 WGET_FILE_BUF_SIZE EQU 8192
 WGET_FILE_BUF	EQU RX_BUF + RX_BUF_SIZE
 WGET_BSS_END	EQU WGET_FILE_BUF + WGET_FILE_BUF_SIZE
+
+	; The runtime stack lives at the top of the same WIN2 page.
+	ASSERT WGET_BSS_END < RT_STACK_TOP - 0x0100
 
 	ENDMODULE
 

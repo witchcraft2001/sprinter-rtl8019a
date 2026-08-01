@@ -299,4 +299,16 @@ FILE_CANCELLED		EQU 0xAD05	; 1 byte
 ; Apps never share BSS (different EXEs, different sessions).
 APP_BSS_BASE		EQU 0xB000
 
+; ----- Runtime stack top ---------------------------------
+
+; Stack top for large-variant utilities (image at 0x4200), used
+; by the CLAIM_RUNTIME_PAGE macro.  It is deliberately inside
+; WIN2 rather than WIN1: a stack in WIN1 does not survive a DSS
+; console print that scrolls, because BIOS WIN_MOVE maps the
+; video page over WIN1 and restores SLOT1 from a POP taken while
+; that page is still mapped.  The page under it is the private
+; one claimed by WIN2PAGE.CLAIM, so every app BSS map must stay
+; clear of the space below this address.
+RT_STACK_TOP		EQU 0xBFF0
+
 	ENDIF

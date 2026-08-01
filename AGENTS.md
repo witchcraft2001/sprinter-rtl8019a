@@ -288,10 +288,42 @@ DSS EXE header conventions used in this project (locked, taken from the
   matches `sprinter_wifi/network/src/apps/ping.asm:21-33`.
 
 - **Large utilities (> 16 KB code+data).** `ORG 0x4100` for the header,
-  entry point at `0x4200`, stack pointer at `0xBFFF`. This moves the image
-  out of the `0x8000..0xBFFF` window and gives ~32 KB linear room before
-  the `0xC000` banking window kicks in. Required for `WGET`, `TFTP`, `FTP`
-  and any future utility that pulls in large library code.
+  entry point at `0x4200`, and the header stack field set to `0x8000`.
+  This moves the image out of the `0x8000..0xBFFF` window and gives ~32 KB
+  linear room before the `0xC000` banking window kicks in. Required for
+  `WGET`, `TFTP`, `FTP` and any future utility that pulls in large library
+  code.
+
+  **Such a utility MUST claim WIN2 before it touches any BSS**, because
+  DSS `EXEC` maps only the windows the image itself occupies, starting at
+  the window of the load address: an image of one page loaded at `0x4200`
+  owns WIN1 only, and `0x8000..0xBFFF` still holds the *caller's* page.
+  Writing BSS (`LIBBSS_BASE`, `APP_BSS_BASE`, per-library regions) or
+  running the stack there corrupts the launcher -- the Sprinter File
+  Manager runs its own code at `0x8000` and hangs as soon as the utility
+  returns. The first instruction of `START` is therefore
+
+  ```
+  START
+  	CLAIM_RUNTIME_PAGE	; WIN2 is the caller's page until this runs
+  	LD	(CMDL_SOURCE_PTR),IX
+  ```
+
+  which allocates one page, maps it over WIN2 (`src/lib/win2page.asm`,
+  add `INCLUDE "win2page.asm"` to the library list) and sets
+  `SP = RT_STACK_TOP`. DSS frees the block and restores SLOT2 at `EXIT`,
+  so there is no teardown call. Every app BSS map must then stay clear of
+  the space below `RT_STACK_TOP`; assert it.
+
+  **The stack must never be left in WIN1** (`0x4000..0x7FFF`) across DSS
+  console output. Printing scrolls when the cursor is on the last row, and
+  `Dss.Scroll` -> `BIOS.WIN_MOVE` maps the video page over WIN1 and then
+  restores SLOT1 with `POP AF / OUT (SLOT1),A` -- the `POP` runs while the
+  video page is still mapped (`sprinter_bios` `FUNC_LOW_PRINT.ASM`,
+  `WIN_COPY_WIN1` / `WIN_RESTORE`). A WIN1 stack makes that byte come out
+  of video RAM, SLOT1 is restored to a random page, and the machine dies
+  inside the print. Only the syscalls of `CLAIM_RUNTIME_PAGE` itself, which
+  print nothing, may run on the WIN1 entry stack.
 
 **Choosing between the two variants is driven by command-line needs first,
 size only as a tie-breaker.** The small variant occupies `0x8080..0x80FF`

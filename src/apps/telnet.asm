@@ -12,8 +12,9 @@
 ; ======================================================
 
 EXE_VERSION		EQU 1
-STACK_TOP		EQU 0x8000
-SCROLL_STACK_TOP	EQU 0xBFF0
+STACK_TOP		EQU 0x8000	; DSS entry stack; used only until START
+					; maps WIN2 and switches to SCROLL_STACK_TOP
+SCROLL_STACK_TOP	EQU 0xBFF0	; the one real stack: WIN2, see START
 WIN2_BASE		EQU 0x8000
 HOST_SIZE		EQU 96
 PORT_SIZE		EQU 8
@@ -121,6 +122,17 @@ START
 	LD	(.RESTORE_CMD_PTR + 2),IX
 	CALL	INIT_RUNTIME_PAGE
 	JP	C,INIT_MEMORY_ERROR
+	; From here on the stack lives in the WIN2 page and MUST NEVER move
+	; back to STACK_TOP: a stack anywhere in WIN1 is fatal across any DSS
+	; console output that scrolls.  DSS PCHARS/Scroll reach BIOS WIN_MOVE,
+	; which maps video page 0x50 over WIN1 (SLOT1) for the block copy and
+	; then restores SLOT1 with "POP AF / OUT (SLOT1),A" -- the POP happens
+	; while WIN1 is still the video page (sprinter_bios
+	; FUNC_LOW_PRINT.ASM, WIN_COPY_WIN1 / WIN_RESTORE).  With the stack in
+	; WIN1 that POP reads video RAM, SLOT1 is restored to a random page,
+	; and the machine dies inside the print.  Only the two syscalls in
+	; INIT_RUNTIME_PAGE above run on the WIN1 stack; they print nothing.
+	LD	SP,SCROLL_STACK_TOP
 .RESTORE_CMD_PTR
 	LD	IX,0			; self-modified by the first instruction
 	LD	(CMDL_SOURCE_PTR),IX
@@ -257,7 +269,9 @@ REMOTE_CLOSED
 	PRINTLN	MSG_CLOSED
 	LD	A,(CLOSE_ERROR)
 	OR	A
-	JP	Z,@UTIL.EXIT_OK
+	JR	NZ,.FAIL
+	JP	@UTIL.EXIT_OK
+.FAIL
 	LD	B,3
 	JP	@UTIL.EXIT_FAIL
 
@@ -1435,8 +1449,8 @@ WRITE_GLYPH
 	RET
 
 ; SCROLL_TERM: scroll rows 0..TERM_ROWS-1 up by one and clear the new bottom
-; row. Dss.Scroll -> BIOS.WIN_MOVE temporarily repages WIN1. This RTL port's
-; stack lives in WIN2, so it remains valid across the DSS call.
+; row. Dss.Scroll -> BIOS.WIN_MOVE temporarily repages WIN1, so the stack must
+; be in WIN2 for the call -- which it always is (see START).
 SCROLL_TERM
 	PUSH	BC,DE,HL
 	LD	D,0
@@ -1454,15 +1468,13 @@ SCROLL_TERM
 	POP	HL,DE,BC
 	RET
 
+; The program stack already lives in WIN2, so this call needs no stack switch.
+; Loading SP with SCROLL_STACK_TOP here would reset it to the TOP of the very
+; region the live frames occupy, and DSS/BIOS pushes would then overwrite the
+; return addresses of the whole PROCESS_RX -> TERM_LF -> SCROLL_TERM chain.
 SCROLL_DSS_SAFE
-	DI
-	LD	(SCROLL_SAVED_SP),SP
-	LD	SP,SCROLL_STACK_TOP
 	LD	C,DSS_SCROLL
 	RST	DSS
-	DI
-	LD	SP,(SCROLL_SAVED_SP)
-	EI
 	RET
 
 ; SYNC_CURSOR: position the hardware text cursor at CUR_ROW/CUR_COL.
@@ -1871,14 +1883,21 @@ TICK_AND_CHECK_KEY
 	OR	A
 	RET
 
+; DSS GETVMOD returns A = mode and B = the visible screen page (0/1); SETVMOD
+; consumes both. Keeping the page is not optional: SETVMOD ends with
+; "LD A,B / AND 1 / OUT (SCREEN_SWITCH),A", so calling it with a stale B flips
+; the displayed screen and the caller redraws into an invisible page.
 INIT_VMODE
 	LD	C,DSS_GETVMOD
 	RST	DSS
 	LD	(SAVE_VMODE),A
+	LD	A,B
+	LD	(SAVE_VPAGE),A
+	LD	A,(SAVE_VMODE)
 	CP	DSS_VMOD_T80
 	JR	Z,.DONE
 	LD	A,DSS_VMOD_T80
-	LD	C,DSS_SETVMOD
+	LD	C,DSS_SETVMOD		; B still holds the current screen page
 	RST	DSS
 .DONE
 	RET
@@ -1893,13 +1912,16 @@ REST_VMODE
 	EI
 	LD	A,(SAVE_VMODE)
 	CP	DSS_VMOD_T80
-	RET	Z
+	RET	Z			; never changed -> nothing to put back
+	LD	A,(SAVE_VPAGE)
+	LD	B,A			; B = screen page saved by INIT_VMODE
+	LD	A,(SAVE_VMODE)
 	LD	C,DSS_SETVMOD
 	RST	DSS
 	RET
 
-; Reserve and map one 16 KB DSS page into WIN2. Code and the normal stack
-; stay in WIN1; WIN2 holds all native stack BSS plus Z/Ymodem buffers.
+; Reserve and map one 16 KB DSS page into WIN2. Code stays in WIN1; START
+; moves the working stack to the top of WIN2, above BSS and transfer buffers.
 INIT_RUNTIME_PAGE
 	LD	B,1
 	LD	C,DSS_GETMEM
@@ -2092,7 +2114,8 @@ PORT_VALUE	EQU PORT_BUFF + PORT_SIZE
 CANCELLED	EQU PORT_VALUE + 2
 SESSION_ACTIVE	EQU CANCELLED + 1
 SAVE_VMODE	EQU SESSION_ACTIVE + 1
-INLINE_PORT	EQU SAVE_VMODE + 1
+SAVE_VPAGE	EQU SAVE_VMODE + 1
+INLINE_PORT	EQU SAVE_VPAGE + 1
 SEND_PTR	EQU INLINE_PORT + 1
 SEND_LEFT	EQU SEND_PTR + 2
 SEND_CHUNK	EQU SEND_LEFT + 2
@@ -2143,14 +2166,14 @@ STREAM_MAX	EQU STREAM_DEST + 2
 STREAM_TIMEOUT	EQU STREAM_MAX + 2
 STREAM_COUNT	EQU STREAM_TIMEOUT + 2
 STREAM_WAIT	EQU STREAM_COUNT + 2
-SCROLL_SAVED_SP EQU STREAM_WAIT + 1
-TELNET_BSS_END	EQU SCROLL_SAVED_SP + 2
+TELNET_BSS_END	EQU STREAM_WAIT + 1
 ZM_STATE_BASE	EQU TELNET_BSS_END
 YM_STATE_BASE	EQU ZM_STATE_BASE + 160
 TRANSFER_BSS_END EQU YM_STATE_BASE + 64
 
 	ASSERT TELNET_IMAGE_END < STACK_TOP - 0x0100
 	ASSERT TRANSFER_BSS_END < SCROLL_STACK_TOP - 0x0100
+	ASSERT SCROLL_STACK_TOP - TRANSFER_BSS_END >= 0x0400
 
 	ENDMODULE
 

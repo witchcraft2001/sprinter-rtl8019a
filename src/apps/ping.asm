@@ -95,12 +95,14 @@ EXE_HEADER
 	DW 0
 	DW START
 	DW START
-	DW 0xBFFF			; stack at top of directly-addressable RAM
+	DW 0x8000			; entry stack in WIN1 (own page);
+					; START moves it into WIN2
 	DS 234, 0
 
 	ORG 0x4200
 
 START
+	CLAIM_RUNTIME_PAGE		; WIN2 is the caller's page until this runs
 	LD	(CMDL_SOURCE_PTR),IX	; must precede every CALL/RST DSS
 	PRINTLN MSG_BANNER
 	IFDEF RTL_ALT_TX_LAYOUT
@@ -1664,6 +1666,7 @@ LINE_END	DB 13,10,0
 
 	; netenv_lib / cmdline_lib transitively DEFINE USE_UTIL_*
 	; helpers they need, so they must be included BEFORE util.asm.
+	INCLUDE "win2page.asm"
 	INCLUDE "netenv_lib.asm"
 	INCLUDE "cmdline_lib.asm"
 	INCLUDE "isa.asm"

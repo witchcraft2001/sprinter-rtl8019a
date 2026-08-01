@@ -47,4 +47,20 @@
 		DSS_EXEC DSS_EXIT
 	ENDM
 
+	; Mandatory first action of every large-variant utility (image
+	; loaded at 0x4200, BSS and stack in WIN2).  DSS gives such a
+	; program WIN1 only -- WIN2 still holds the caller's page --
+	; so it must allocate one and map it before touching any BSS,
+	; and move its stack into it before any console output.  See
+	; src/lib/win2page.asm for the full rationale.
+	; In:  IX = PSP pointer supplied by DSS (preserved).
+	; Out: WIN2 private, SP = RT_STACK_TOP.  No return on failure.
+	MACRO	CLAIM_RUNTIME_PAGE
+	PUSH	IX			; entry stack is in WIN1 (own image page)
+	CALL	@WIN2PAGE.CLAIM
+	POP	IX			; POP does not touch the carry flag
+	JP	C,@WIN2PAGE.NO_PAGE_EXIT
+	LD	SP,RT_STACK_TOP
+	ENDM
+
 	ENDIF
