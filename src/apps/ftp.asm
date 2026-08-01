@@ -150,6 +150,19 @@ START
 	LD	(RESUME_FLAG),A
 .NO_RESUME
 
+	; -d: dot progress instead of the "X / Y" counter line.  The
+	; counter is repainted through the DSS console, which costs
+	; transfer time; -d restores the old one-dot-per-flush output
+	; so the two can be compared on the same transfer.
+	XOR	A
+	LD	(DOTS_FLAG),A
+	LD	A,'d'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_DOTS
+	LD	A,1
+	LD	(DOTS_FLAG),A
+.NO_DOTS
+
 	; -u user (optional, default = anonymous)
 	XOR	A
 	LD	(USER_OVERRIDE),A
@@ -881,14 +894,9 @@ START
 	LD	(PUT_BLK_LEFT),DE
 	LD	HL,FTP_DATA_BUF
 	LD	(PUT_BLK_PTR),HL
-	; In-place "X / Y" progress every 4th 8 KB block (console
-	; repaint cost; ISA still closed here).  The final repaint
-	; is forced at close so X ends equal to Y.
-	LD	A,(PROG_CNT)
-	AND	3
-	CALL	Z,PRINT_PROGRESS
-	LD	HL,PROG_CNT
-	INC	(HL)
+	; Progress per 8 KB block (ISA still closed here); the final
+	; repaint is forced at close so X ends equal to Y.
+	CALL	PROGRESS_TICK
 	CALL	@ISA.ISA_OPEN
 .PUT_SLICE_LOOP
 	; Slice length = min(FTP_PUT_CHUNK, PUT_BLK_LEFT).
@@ -1539,9 +1547,13 @@ APPEND_DATA
 ; not adjacent in BSS, so stage a contiguous 4-byte LE copy
 ; in FTP_SCRATCH (helper scratch, dead during transfers).
 ; ISA window must be CLOSED (DSS console output).
+; Silent under -d, where PROGRESS_TICK owns the output line.
 ; Trashes everything.
 ; ------------------------------------------------------
 PRINT_PROGRESS
+	LD	A,(DOTS_FLAG)
+	OR	A
+	RET	NZ
 	; X = RESUME_OFFSET + BODY_TOTAL: with -r the display shows
 	; the absolute file position, not just this session's bytes.
 	; Y (EXPECTED_LEN from SIZE) is absolute already.
@@ -1559,6 +1571,31 @@ PRINT_PROGRESS
 
 
 ; ------------------------------------------------------
+; PROGRESS_TICK: per-flush progress output, ISA window CLOSED.
+; Default: repaint the "X / Y" line every 4th flush (32 KB) --
+; the DSS console repaint is slow enough to tax the transfer
+; when done per flush; the final repaint is forced at close.
+; Under -d: one dot per flush and nothing else, which is the
+; cheapest output the loop can make.
+; ------------------------------------------------------
+PROGRESS_TICK
+	LD	A,(DOTS_FLAG)
+	OR	A
+	JR	NZ,.DOT
+	LD	A,(PROG_CNT)
+	AND	3
+	CALL	Z,PRINT_PROGRESS
+	LD	HL,PROG_CNT
+	INC	(HL)
+	RET
+.DOT
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	RET
+
+
+; ------------------------------------------------------
 ; FLUSH_DATA: write FTP_DATA_BUF to OUT_FH and reset.
 ;   Out: CF=0 ok, CF=1 DSS_WRITE error.
 ; ------------------------------------------------------
@@ -1569,14 +1606,7 @@ FLUSH_DATA
 	RET	Z
 	; DSS console and file I/O must run with PAGE3 restored.
 	CALL	@ISA.ISA_CLOSE
-	; In-place "X / Y" line every 4th flush (32 KB): the DSS
-	; console repaint is slow enough to tax the transfer when
-	; done per flush.  The final repaint is forced at close.
-	LD	A,(PROG_CNT)
-	AND	3
-	CALL	Z,PRINT_PROGRESS
-	LD	HL,PROG_CNT
-	INC	(HL)
+	CALL	PROGRESS_TICK
 	LD	HL,(FTP_DATA_LEN)
 	LD	D,H
 	LD	E,L
@@ -1874,6 +1904,9 @@ DATA_RX_FAIL
 	PRINT MSG_OVW
 	LD	A,(RTL_RX_OVW_COUNT)
 	CALL	@UTIL.PRINT_HEX_A
+	PRINT MSG_TXF
+	LD	A,(RTL_TX_FAIL_COUNT)
+	CALL	@UTIL.PRINT_HEX_A
 	PRINT LINE_END
 	CALL	PRINT_REG_DUMP
 	LD	B,EX_NET_ERR
@@ -2168,6 +2201,7 @@ PROG_CNT	EQU EXPECTED_LEN + 4		; 1 (progress repaint decimator)
 RESUME_FLAG	EQU PROG_CNT + 1		; 1 (1 if -r was given)
 RESUME_OFFSET	EQU RESUME_FLAG + 1		; 4 (LE; local size at open, REST offset)
 CTRL_PORT	EQU RESUME_OFFSET + 4		; 2 (LE; control port, default 21)
+DOTS_FLAG	EQU CTRL_PORT + 2		; 1 (1 if -d was given)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
@@ -2202,11 +2236,12 @@ MSG_E_DATA_OPEN	DB "[E] data connection failed.",0
 MSG_E_DATA_RX	DB "[E] data recv failed",0
 MSG_CODE	DB ", code 0x",0
 MSG_OVW		DB " ovw 0x",0
+MSG_TXF		DB " tx 0x",0
 MSG_E_FILE	DB "[E] file create/write failed.",0
 MSG_USAGE_ERR	DB "[E] usage: missing host or filename",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  FTP host[:port] filename   [-u user] [-p pass] [-o output] [-y|-f] [-r]",13,10
+	DB "  FTP host[:port] filename   [-u user] [-p pass] [-o output] [-y|-f] [-r] [-d]",13,10
 	DB "  FTP host[:port] PUT local  [-u user] [-p pass] [-o remote-name]",13,10
 	DB "  FTP host[:port] [path] -l|-n  [-u user] [-p pass]",13,10
 	DB "  FTP /?",13,10,13,10
@@ -2222,7 +2257,9 @@ MSG_HELP
 	DB "  -o name    GET: alternate local output filename.",13,10
 	DB "             PUT: alternate remote name on the server.",13,10
 	DB "  -y, -f     overwrite local file without prompt (GET).",13,10
-	DB "  -r         resume GET: append locally, REST on server.",13,10,0
+	DB "  -r         resume GET: append locally, REST on server.",13,10
+	DB "  -d         dot progress instead of the KB counter (less",13,10
+	DB "             console work, use it to compare throughput).",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE

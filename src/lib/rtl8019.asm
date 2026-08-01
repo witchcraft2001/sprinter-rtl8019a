@@ -97,6 +97,9 @@ INIT_BASE
 	LD	(RTL_BASE_PTR),HL
 	XOR	A
 	LD	(RTL_RX_OVW_COUNT),A
+	LD	(RTL_TX_FAIL_COUNT),A
+	LD	A,RCR_AB		; sane default until INIT_NORMAL runs
+	LD	(RTL_RCR_SHADOW),A
 
 	; Stage 1: env override.
 	CALL	TRY_ENV_OVERRIDE
@@ -937,6 +940,7 @@ TX_LAST_TPSR	EQU RTL_TX_LAST_TPSR
 	IFDEF USE_RTL_INIT_NORMAL
 INIT_NORMAL
 	LD	(.RCR_VALUE),A
+	LD	(RTL_RCR_SHADOW),A	; RECOVER_OVERFLOW restores this value
 	XOR	A
 	LD	(RTL_RX_TO_TX_PENDING),A
 	PUSH	HL
@@ -1045,6 +1049,18 @@ INIT_LOOPBACK
 ; whole timeout waiting for PTX after the chip reported an error).
 ; ------------------------------------------------------
 	IFDEF USE_RTL_WAIT_PTX
+; TX_COUNT_FAIL: saturating count of SEND_FRAME/WAIT_PTX failures.
+; The app failure dumps print it next to ovw -- it separates a
+; deaf receiver (tx=0) from a dead transmitter (tx>0: our ACKs
+; never leave, the peer retransmits into silence).  Preserves
+; flags contract of the failure exits: callers SCF after it.
+TX_COUNT_FAIL
+	LD	A,(RTL_TX_FAIL_COUNT)
+	INC	A
+	RET	Z			; saturate at 255
+	LD	(RTL_TX_FAIL_COUNT),A
+	RET
+
 WAIT_PTX
 	LD	IX,(RTL_BASE_PTR)
 	LD	BC,PTX_LOOPS
@@ -1059,6 +1075,7 @@ WAIT_PTX
 	LD	A,TX_ERR_TIMEOUT
 	LD	(TX_LAST_STAGE),A
 	CALL	CAPTURE_TX_STATE
+	CALL	TX_COUNT_FAIL
 	SCF
 	RET
 .EVENT
@@ -1078,6 +1095,7 @@ WAIT_PTX
 	LD	(IX+RTL_ISR_OFF),A
 	LD	A,TX_ERR_TXE
 	LD	(TX_LAST_STAGE),A
+	CALL	TX_COUNT_FAIL
 	SCF
 	RET
 	ENDIF
@@ -1161,6 +1179,7 @@ SEND_FRAME
 	LD	A,TX_ERR_BUSY
 	LD	(TX_LAST_STAGE),A
 	CALL	CAPTURE_TX_STATE
+	CALL	TX_COUNT_FAIL
 	SCF
 	RET
 .IDLE
@@ -1195,6 +1214,7 @@ SEND_FRAME
 	DEC	(HL)
 	JR	NZ,.DMA_ATTEMPT
 	CALL	CAPTURE_TX_STATE
+	CALL	TX_COUNT_FAIL
 	SCF
 	RET
 .DMA_OK
@@ -1223,6 +1243,7 @@ SEND_FRAME
 	LD	A,TX_ERR_STALE_ISR
 	LD	(TX_LAST_STAGE),A
 	CALL	CAPTURE_TX_STATE
+	CALL	TX_COUNT_FAIL
 	SCF
 	RET
 .STATUS_CLEAR
@@ -1375,22 +1396,27 @@ CAPTURE_TX_PHY_POST
 	IFDEF USE_RTL_RING_HAS_PACKET
 RING_HAS_PACKET
 	LD	IX,(RTL_BASE_PTR)
-	; Service an RX-ring overflow before reporting ring state.  When
-	; CURR catches BNRY the DP8390/RTL8019AS sets ISR.OVW and STOPS
-	; storing further frames until the documented overflow-recovery
-	; runs -- otherwise RX is wedged for good (classic "got one packet
-	; then nothing" symptom).  Every wait loop polls through here, so
-	; recovering at this single point keeps all utilities unwedged
-	; under load (busy LAN, slow drain) without touching the apps.
-	; ISR == 0xFF is a floating-bus glitch read (all latched bits set
-	; incl. RST is implausible during normal RX), not a real overflow
-	; -- skip recovery so a glitch does not trigger a needless
-	; stop/restart.
-	LD	A,(IX+RTL_ISR_OFF)
-	CP	0xFF
-	JR	Z,.GLITCH
-	AND	ISR_OVW
-	CALL	NZ,RECOVER_OVERFLOW
+	; Overflow handling contract.  When CURR catches BNRY the
+	; DP8390/RTL8019AS latches ISR.OVW and HALTS the receive engine:
+	; no further frame is stored until the documented stop/restart
+	; recovery runs.  Frames already stored in the ring stay readable
+	; (remote DMA is independent of the halted receive DMA), so the
+	; correct order is DRAIN FIRST, RECOVER LAST:
+	;   ring non-empty -> report "has packet" even with OVW latched;
+	;                     the callers read the queued frames out.
+	;   ring empty + OVW -> run RECOVER_OVERFLOW now, report empty.
+	; Recovering before the drain (the old order) would flush frames
+	; that were stored intact, turning every overflow into a full
+	; in-flight-window loss and an RTO stall.
+	;
+	; READ_PACKET deliberately does NOT clear ISR.OVW: an overflow
+	; that latches DURING a drain (burst arriving while a slow 8-bit
+	; remote-DMA read is in progress -- the common case) must survive
+	; until this routine sees the ring go empty.  Blind-clearing the
+	; latch there skipped the recovery and left the receiver deaf
+	; for good: transfers died mid-file with "code 0x02 ovw 0x00/01",
+	; an empty ring and ISR=00 -- the NIC was halted and nobody knew.
+	;
 	; Read BNRY and validate it is a real ring page.  On marginal
 	; silicon a register read can float to 0xFF (undriven ISA bus);
 	; an out-of-range BNRY/CURR is such a glitch.  Treat it as "ring
@@ -1419,6 +1445,29 @@ RING_HAS_PACKET
 	LD	C,A
 	LD	A,B
 	CP	C
+	RET	NZ			; frames queued -> drain before any recovery
+	; Ring empty.  If an overflow is latched the receive engine is
+	; halted and will never store another frame -- restart it now.
+	; ISR == 0xFF is a floating-bus glitch read (all latched bits set
+	; incl. RST is implausible during normal RX), not a real overflow
+	; -- skip recovery so a glitch does not trigger a needless
+	; stop/restart.
+	LD	A,(IX+RTL_ISR_OFF)
+	CP	0xFF
+	JR	Z,.GLITCH
+	AND	ISR_OVW
+	JR	Z,.EMPTY
+	; Confirm with a second read before operating: on a marginal
+	; 8-bit ISA bus a single read can float a phantom bit, and a
+	; needless stop/restart is exactly the kind of clone-sensitive
+	; surgery this path must not perform by accident.
+	LD	A,(IX+RTL_ISR_OFF)
+	CP	0xFF
+	JR	Z,.GLITCH
+	AND	ISR_OVW
+	CALL	NZ,RECOVER_OVERFLOW
+.EMPTY
+	XOR	A			; ZF=1: ring empty
 	RET
 .GLITCH
 	; Impossible register read (floating 0xFF): report ring empty.
@@ -1427,46 +1476,80 @@ RING_HAS_PACKET
 
 ; ------------------------------------------------------
 ; RECOVER_OVERFLOW: DP8390/RTL8019AS RX-ring overflow recovery.
-; Follows the National DP8390 datasheet sequence: stop the chip,
-; let any in-flight DMA finish, mask the ring with internal
-; loopback, flush every queued frame by re-syncing BNRY/CURR,
-; clear ISR.OVW and resume normal RX.  Flushing (rather than
-; reading the queued frames out) costs us the packets that were
-; in the ring at overflow time -- acceptable: the higher-level
-; retransmit/retry recovers them, and the alternative (a wedged
-; receiver) loses every subsequent frame.  This driver polls TX
-; to completion before entering any RX wait, so no transmit is
-; ever in progress here and the datasheet "resend" step is moot.
-; In:  IX = chip base.  Trashes A.  (DELAY_2MS preserves IX/DE/HL.)
+; Follows the National DP8390 datasheet sequence EXACTLY -- the
+; order matters on strict clones.  The RTL8019AS forgives
+; liberties (clearing OVW while stopped, rewriting CURR); a
+; classic DP8390-compatible does not, and restarts with a dead
+; receive engine ("recovery ran once, then silence forever"):
+;   0. RCR = monitor + one max-frame time: the DP8390 erratum
+;      says STP during an ACTIVE reception leaves the chip in an
+;      undefined state.  After our drain-first policy the 8019
+;      may have resumed receiving on its own (space freed as
+;      BNRY advanced, the OVW latch is then stale), so a frame
+;      can be mid-wire right here -- and STP into it produced
+;      the residual "recovery ran once, then deaf" failures.
+;      Monitor mode blocks NEW receptions from starting; the
+;      2 ms wait (> 1.2 ms max frame @ 10 Mbit) lets a current
+;      one finish; only then is STP safe in both worlds
+;      (engine halted OR engine alive).
+;   1. STOP (STP + abort DMA)
+;   2. wait for ISR.RST (poll, ~40 ms cap; not a blind delay)
+;   3. RBCR0/1 = 0
+;   4. (resend check -- moot: this driver polls TX to completion
+;      before every RX wait, no transmit is in progress here)
+;   5. TCR = loopback
+;   6. START -- the receive state machine resets HERE
+;   7. (remove packets -- already done: RING_HAS_PACKET calls
+;      this only after the ring is drained, so BNRY/CURR are
+;      consistent and MUST NOT be rewritten)
+;   8. clear ISR.OVW -- after START, per the datasheet
+;   9. TCR = normal; RCR = the app's configured value
+; The only lost frames are the ones rejected while OVW/monitor
+; was pending; the peer's retransmit recovers those.
+; In:  IX = chip base.  Trashes A, B.  Preserves DE, HL.
 ; ------------------------------------------------------
 RECOVER_OVERFLOW
-	; Count the event (saturating): the flush below drops every
-	; queued frame, so a stalled transfer with OVW > 0 lost data
-	; here and is waiting on peer retransmits -- a completely
-	; different diagnosis from OVW = 0 (peer went silent).
+	; Count the event (saturating): a stalled transfer with OVW > 0
+	; lost in-flight frames here and is waiting on peer retransmits
+	; -- a different diagnosis from OVW = 0 (peer went silent).
 	LD	A,(RTL_RX_OVW_COUNT)
 	INC	A
 	JR	Z,.NO_WRAP
 	LD	(RTL_RX_OVW_COUNT),A
 .NO_WRAP
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP	; STP + abort DMA
-	; Wait with the system page restored and IRQs enabled.  Reopen the
-	; same slot/base and reload IX before touching the NIC again.
+	LD	(IX+RTL_RCR_OFF),RCR_MON	; no NEW receptions may start
 	CALL	@ISA.ISA_CLOSE
-	CALL	UTIL.DELAY_2MS			; wait out any in-flight RX/TX DMA (~1.6ms)
+	CALL	UTIL.DELAY_2MS			; > max frame time: current RX finishes
 	CALL	@ISA.ISA_OPEN
 	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP	; STP + abort DMA -- safe now
+	; Wait for the stop to complete: ISR.RST sets once the NIC has
+	; parked its local DMA (datasheet: >= 1.6 ms worst case).  Poll
+	; with the ISA window CLOSED between samples (discipline: never
+	; delay with the window open); proceed after ~40 ms regardless
+	; -- some emulations never model RST.
+	LD	B,40
+.WAIT_RST
+	CALL	@ISA.ISA_CLOSE
+	CALL	UTIL.DELAY_1MS
+	CALL	@ISA.ISA_OPEN
+	LD	IX,(RTL_BASE_PTR)
+	LD	A,(IX+RTL_ISR_OFF)
+	CP	0xFF				; floating-bus glitch, not a real RST
+	JR	Z,.RST_TICK
+	AND	ISR_RST
+	JR	NZ,.STOPPED
+.RST_TICK
+	DJNZ	.WAIT_RST
+.STOPPED
 	LD	(IX+RTL_RBCR0_OFF),0
 	LD	(IX+RTL_RBCR1_OFF),0
-	LD	(IX+RTL_TCR_OFF),TCR_LB_INTERNAL	; loopback: no new frames enter the ring
-	; Flush the ring while stopped: drop everything, re-sync pointers.
-	LD	(IX+RTL_BNRY_OFF),RTL_BNRY_INIT
-	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
-	LD	(IX+RTL_CURR_OFF),RTL_CURR_INIT
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP
-	LD	(IX+RTL_ISR_OFF),0xFF		; clear OVW + all latched status
+	LD	(IX+RTL_TCR_OFF),TCR_LB_INTERNAL	; mask RX across the restart
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START	; receive engine resets on STA
+	LD	(IX+RTL_ISR_OFF),0xFF		; clear OVW + latched status AFTER start
 	LD	(IX+RTL_TCR_OFF),TCR_NORMAL
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_START	; resume normal RX
+	LD	A,(RTL_RCR_SHADOW)
+	LD	(IX+RTL_RCR_OFF),A		; leave monitor mode: RX live again
 	RET
 	ENDIF
 
@@ -1607,7 +1690,13 @@ READ_PACKET
 	INC	HL
 	LD	A,(HL)
 	CALL	SET_BNRY_FROM_NEXT_A
-	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE | ISR_OVW
+	; NEVER clear ISR.OVW here.  An overflow can latch while the
+	; slow 8-bit remote-DMA read above is in progress; the latch is
+	; the ONLY record that the receive engine is halted.  It must
+	; survive until RING_HAS_PACKET drains the ring and runs the
+	; stop/restart recovery -- clearing it here left the receiver
+	; deaf for the rest of the session.
+	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE
 	LD	A,1
 	LD	(RTL_RX_TO_TX_PENDING),A
 	LD	BC,(.BODY_LEN)
@@ -1630,7 +1719,7 @@ READ_PACKET
 	CALL	VALID_RX_PAGE_A
 	JP	C,.DROP_ONE_PAGE
 	CALL	SET_BNRY_FROM_NEXT_A
-	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE | ISR_OVW
+	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE	; keep OVW latched (see .READ_DONE)
 	SCF
 	RET
 .DROP_ONE_PAGE
@@ -1638,7 +1727,7 @@ READ_PACKET
 	LD	HL,(.PKT_ADDR)
 	LD	A,H
 	LD	(IX+RTL_BNRY_OFF),A
-	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE | ISR_OVW
+	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE	; keep OVW latched (see .READ_DONE)
 	SCF
 	RET
 .HDR_PTR	DW 0

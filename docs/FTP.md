@@ -8,7 +8,7 @@ verbose directory listing (`-l`), and terse name-only listing
 ## Usage
 
 ```
-FTP host[:port] filename  [-u user] [-p pass] [-o output] [-y|-f] [-r]  (download)
+FTP host[:port] filename  [-u user] [-p pass] [-o output] [-y|-f] [-r] [-d]  (download)
 FTP host[:port] PUT local [-u user] [-p pass] [-o remote-name]          (upload)
 FTP host[:port] [path] -l [-u user] [-p pass]                           (LIST)
 FTP host[:port] [path] -n [-u user] [-p pass]                           (NLST)
@@ -51,6 +51,11 @@ FTP /?
 |              | send `REST <size>` so the server skips what is     |
 |              | already on disk.  Fails with a hint if the server  |
 |              | rejects REST.  Ignored for PUT and listings.       |
+| `-d`         | Dot progress: print one `.` per 8 KB flush instead |
+|              | of the in-place `<done>KB / <total>KB` counter.    |
+|              | The counter is repainted through the DSS console,  |
+|              | which competes with the transfer; run the same     |
+|              | transfer with and without `-d` to measure the cost.|
 
 ## Login flow
 

@@ -137,6 +137,19 @@ START
 	LD	(RESUME_FLAG),A
 .NO_RESUME
 
+	; -d: dot progress instead of the "X / Y" counter line.  The
+	; counter is repainted through the DSS console, which costs
+	; transfer time; -d restores the old one-dot-per-flush output
+	; so the two can be compared on the same download.
+	XOR	A
+	LD	(DOTS_FLAG),A
+	LD	A,'d'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_DOTS
+	LD	A,1
+	LD	(DOTS_FLAG),A
+.NO_DOTS
+
 	; Pull NET_IP, NET_MAC.
 	LD	HL,N_NET_IP
 	LD	DE,OUR_IP
@@ -354,8 +367,9 @@ START
 .NOCLOSE
 	; (TCP already CLOSEd by .HOP_RX_DONE.)
 
-	; Terminate the "X / Y" progress line emitted by FLUSH_BUF
-	; (it ends with CR only), then print summary.
+	; Terminate the progress line emitted by FLUSH_BUF -- "X / Y"
+	; ends with CR only, and -d leaves a run of dots -- then
+	; print the summary.
 	PRINT LINE_END
 	PRINT MSG_DONE_PRE
 	LD	HL,(BODY_TOTAL_LO)
@@ -381,6 +395,9 @@ START
 	; lost-data/retransmit story, not a silent peer.
 	PRINT MSG_OVW
 	LD	A,(RTL_RX_OVW_COUNT)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT MSG_TXF
+	LD	A,(RTL_TX_FAIL_COUNT)
 	CALL	@UTIL.PRINT_HEX_A
 	PRINT LINE_END
 	; Best-effort close of file/conn.
@@ -888,8 +905,12 @@ APPEND_TO_BUF
 ;   Y = RESUME_OFFSET + CONTENT_LEN (a 206 reply announces
 ;       only the remainder), or "?" when the length is unknown.
 ; ISA window must be CLOSED.  Trashes everything.
+; Silent under -d, where PROGRESS_TICK owns the output line.
 ; ------------------------------------------------------
 PRINT_PROGRESS
+	LD	A,(DOTS_FLAG)
+	OR	A
+	RET	NZ
 	LD	HL,(BODY_TOTAL_LO)
 	LD	DE,(RESUME_OFFSET)
 	ADD	HL,DE
@@ -925,6 +946,31 @@ PRINT_PROGRESS
 
 
 ; ------------------------------------------------------
+; PROGRESS_TICK: per-flush progress output, ISA window CLOSED.
+; Default: repaint the "X / Y" line every 4th flush (32 KB) --
+; the DSS console repaint is slow enough to tax the transfer
+; when done per flush; a final repaint is forced at the end.
+; Under -d: one dot per flush and nothing else, which is the
+; cheapest output the loop can make.
+; ------------------------------------------------------
+PROGRESS_TICK
+	LD	A,(DOTS_FLAG)
+	OR	A
+	JR	NZ,.DOT
+	LD	A,(PROG_CNT)
+	AND	3
+	CALL	Z,PRINT_PROGRESS
+	LD	HL,PROG_CNT
+	INC	(HL)
+	RET
+.DOT
+	LD	A,'.'
+	LD	C,DSS_PUTCHAR
+	RST	DSS
+	RET
+
+
+; ------------------------------------------------------
 ; FLUSH_BUF: write the accumulated buffer to OUT_FH and
 ; reset the fill counter.  No-op when the buffer is empty.
 ;   Out: CF=0 ok; CF=1 DSS_WRITE error.
@@ -936,14 +982,7 @@ FLUSH_BUF
 	RET	Z
 	; DSS console and file I/O must run with PAGE3 restored.
 	CALL	@ISA.ISA_CLOSE
-	; In-place "X / Y" line every 4th flush (32 KB): the DSS
-	; console repaint is slow enough to tax the transfer when
-	; done per flush.  A final repaint is forced at the end.
-	LD	A,(PROG_CNT)
-	AND	3
-	CALL	Z,PRINT_PROGRESS
-	LD	HL,PROG_CNT
-	INC	(HL)
+	CALL	PROGRESS_TICK
 	LD	HL,(WGET_BUF_LEN)
 	LD	D,H
 	LD	E,L			; DE = byte count
@@ -1776,6 +1815,7 @@ CONTENT_LEN	EQU APP_BSS_BASE + 47		; 4 (LE; Content-Length, 0 = unknown)
 PROG_CNT	EQU APP_BSS_BASE + 51		; 1 (progress repaint decimator)
 RESUME_FLAG	EQU APP_BSS_BASE + 52		; 1 (1 if -r was given)
 RESUME_OFFSET	EQU APP_BSS_BASE + 53		; 4 (LE; local size at open = Range offset)
+DOTS_FLAG	EQU APP_BSS_BASE + 57		; 1 (1 if -d was given)
 HDR_LINE_BUF_SIZE EQU 256
 REDIRECT_URL_BUF_SIZE EQU 256
 MAX_REDIRECT_HOPS EQU 5
@@ -1805,6 +1845,7 @@ MSG_E_TCP_OPEN	DB "TCP connect failed, code 0x",0
 MSG_E_TCP_SEND	DB "TCP send failed, code 0x",0
 MSG_E_RECV	DB "TCP recv failed, code 0x",0
 MSG_OVW		DB " ovw 0x",0
+MSG_TXF		DB " tx 0x",0
 MSG_E_FILE	DB "[E] file create/write failed.",0
 MSG_E_HTTP_PRE	DB "[E] ",0
 MSG_REDIRECT_PRE DB "Redirect: ",0
@@ -1819,12 +1860,14 @@ MSG_USAGE_ERR	DB "[E] usage: missing or invalid URL",0
 MSG_E_RANGE	DB "[E] server ignored Range (no resume). Rerun without -r.",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  WGET url [-o output] [-y|-f] [-r]",13,10
+	DB "  WGET url [-o output] [-y|-f] [-r] [-d]",13,10
 	DB "  WGET /?",13,10,13,10
 	DB "  url     http://host[:port][/path]",13,10
 	DB "  -o file write body to <file> (default: derived from URL).",13,10
 	DB "  -y, -f  overwrite local file without prompt.",13,10
-	DB "  -r      resume: append to <file>, request Range from server.",13,10,0
+	DB "  -r      resume: append to <file>, request Range from server.",13,10
+	DB "  -d      dot progress instead of the KB counter (less",13,10
+	DB "          console work, use it to compare throughput).",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE

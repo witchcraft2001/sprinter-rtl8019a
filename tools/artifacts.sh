@@ -69,7 +69,7 @@ ZIP_EXCLUDE_DOC_FILES=(
 # Per-utility pages are short references; HOWTO.md collects everything
 # common (env vars, exit codes, batch examples).  USAGE.md is the index.
 DIST_DOC_FILES=(
-  README.md
+  README.TXT
   docs/USAGE.md
   docs/HOWTO.md
   docs/NETCFG.md
@@ -99,4 +99,5 @@ DIST_CONFIG_FILES=(
 # Extra files copied to the distribution root. Keep this for small required
 # runtime files that are neither docs nor configs.
 DIST_EXTRA_FILES=(
+  CONNECT.BAT
 )

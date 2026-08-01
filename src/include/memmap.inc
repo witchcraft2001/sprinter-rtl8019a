@@ -126,14 +126,23 @@ RTL_TX_CFG0_POST	EQU LIBBSS_BASE + 0x16F	; page-3 CONFIG0 after PTX/TXE
 RTL_TX_CFG3_POST	EQU LIBBSS_BASE + 0x170	; page-3 CONFIG3 after PTX/TXE
 RTL_TX_LAST_NCR	EQU LIBBSS_BASE + 0x171	; page-0 collision count for last TX
 RTL_TX_LAST_TPSR EQU LIBBSS_BASE + 0x172	; page-2 read-back of TX start page before TXP
-; RX-ring overflow counter (saturating at 255).  Every OVW event
-; discards the whole ring, so a non-zero value tells a stalled
-; transfer apart from a peer that simply went quiet.  Cleared by
-; INIT_BASE.
+; RX-ring overflow counter (saturating at 255).  A non-zero value
+; tells a stalled transfer apart from a peer that simply went
+; quiet.  Cleared by INIT_BASE.
 RTL_RX_OVW_COUNT EQU LIBBSS_BASE + 0x173	; 1 byte
+; RCR value the app configured via INIT_NORMAL.  RECOVER_OVERFLOW
+; must restore exactly this after its stop/restart (NICTX runs
+; RCR=0, the TCP utilities RCR_AB).  INIT_BASE defaults it to
+; RCR_AB for code paths that touch recovery before INIT_NORMAL.
+RTL_RCR_SHADOW	EQU LIBBSS_BASE + 0x174	; 1 byte
+; SEND_FRAME/WAIT_PTX failure counter (saturating at 255).
+; Printed by the app failure dumps next to ovw: separates a deaf
+; receiver (tx=0, silence) from a dead transmitter (tx>0, our
+; ACKs never leave).  Cleared by INIT_BASE.
+RTL_TX_FAIL_COUNT EQU LIBBSS_BASE + 0x175	; 1 byte
 
 ; Total span of the LIBBSS_BASE region (util + rtl + netenv + rtl tx).
-LIBBSS_SIZE		EQU 0x174
+LIBBSS_SIZE		EQU 0x176
 
 ; netcfg_lib: parsed-field outputs + 1024-byte file read
 ; buffer.  Active only in NETCFG.EXE -- no other utility
@@ -218,6 +227,12 @@ TCP_LAST_FAIL		EQU TCP_BSS_BASE + 0x1E	; 1 byte
 TCP_TX_LEN		EQU TCP_BSS_BASE + 0x20	; 2 bytes (last TX segment size)
 TCP_RX_DATA_PTR		EQU TCP_BSS_BASE + 0x22	; 2 bytes (-> data inside RX_BUF)
 TCP_RX_DATA_LEN		EQU TCP_BSS_BASE + 0x24	; 2 bytes (data byte count)
+; Ephemeral-port salt, deliberately OUTSIDE the TCP_CTX_SIZE swap
+; block: it must evolve monotonically across every OPEN (including
+; FTP's ctrl/data context swaps), never travel with a saved
+; context.  Never initialized: the power-on/previous-run RAM
+; content is the entropy seed, mixed with R on every OPEN.
+TCP_PORT_SALT		EQU TCP_BSS_BASE + 0x26	; 2 bytes
 
 ; Total per-session TCP state size; copied wholesale by
 ; TCP.SAVE_CTX / TCP.RESTORE_CTX so apps can multiplex

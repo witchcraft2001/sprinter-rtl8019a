@@ -10,6 +10,10 @@ if ! command -v mformat >/dev/null 2>&1 || ! command -v mcopy >/dev/null 2>&1; t
   echo "Error: mtools is required (mformat and mcopy were not found)." >&2
   exit 1
 fi
+if ! command -v iconv >/dev/null 2>&1 || ! command -v perl >/dev/null 2>&1; then
+  echo "Error: iconv and perl are required to create CP866 plain-text documentation." >&2
+  exit 1
+fi
 
 "$script_dir/build.sh"
 
@@ -32,7 +36,7 @@ is_text_ext() {
 copy_to_image_root() {
   local src="$1"
   local dest="$2"
-  local upper_ext
+  local upper_ext source_ext rendered dos_text encoded
 
   if [ ! -f "$src" ]; then
     echo "Warning: $src not found, skipping" >&2
@@ -43,19 +47,24 @@ copy_to_image_root() {
   upper_ext="$(printf '%s' "$upper_ext" | tr '[:lower:]' '[:upper:]')"
 
   if is_text_ext "$upper_ext"; then
-    # The DSS text viewer renders bytes through CP866; UTF-8 multi-byte
-    # sequences come out as mojibake. Until an explicit transcoding step
-    # is added, shipped text files must be 7-bit ASCII.
-    if LC_ALL=C grep -lP '[^\x00-\x7F]' "$src" >/dev/null 2>&1; then
-      echo "Error: $src contains non-ASCII bytes; convert to ASCII (or add CP866 transcoding) before shipping." >&2
-      LC_ALL=C grep -nP '[^\x00-\x7F]' "$src" >&2 || true
+    rendered="$(mktemp)"
+    dos_text="$(mktemp)"
+    encoded="$(mktemp)"
+    source_ext="${src##*.}"
+    source_ext="$(printf '%s' "$source_ext" | tr '[:lower:]' '[:upper:]')"
+    if [ "$source_ext" = "MD" ]; then
+      perl "$script_dir/markdown_to_text.pl" "$src" > "$rendered"
+    else
+      cp "$src" "$rendered"
+    fi
+    LC_ALL=C awk 'BEGIN{ORS="\r\n"} {sub(/\r$/, ""); print}' "$rendered" > "$dos_text"
+    if ! iconv -f UTF-8 -t CP866 "$dos_text" > "$encoded"; then
+      echo "Error: $src contains characters that cannot be encoded as CP866." >&2
+      rm -f "$rendered" "$dos_text" "$encoded"
       exit 1
     fi
-    local tmp
-    tmp="$(mktemp)"
-    awk 'BEGIN{ORS="\r\n"} {sub(/\r$/, ""); print}' "$src" > "$tmp"
-    mcopy -i "$image_path" -o "$tmp" "::$dest"
-    rm -f "$tmp"
+    mcopy -i "$image_path" -o "$encoded" "::$dest"
+    rm -f "$rendered" "$dos_text" "$encoded"
   else
     mcopy -i "$image_path" -o "$src" "::$dest"
   fi

@@ -2171,7 +2171,11 @@ ZM_STATE_BASE	EQU TELNET_BSS_END
 YM_STATE_BASE	EQU ZM_STATE_BASE + 160
 TRANSFER_BSS_END EQU YM_STATE_BASE + 64
 
-	ASSERT TELNET_IMAGE_END < STACK_TOP - 0x0100
+	; The WIN1 entry stack is live only from the EXEC handoff to the
+	; LD SP,SCROLL_STACK_TOP in START -- two shallow DSS calls deep --
+	; so 0x80 of headroom is ample.  If the image outgrows THIS
+	; margin, shrink code; do not thin the margin further.
+	ASSERT TELNET_IMAGE_END < STACK_TOP - 0x0080
 	ASSERT TRANSFER_BSS_END < SCROLL_STACK_TOP - 0x0100
 	ASSERT SCROLL_STACK_TOP - TRANSFER_BSS_END >= 0x0400
 

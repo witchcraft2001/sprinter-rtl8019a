@@ -5,7 +5,7 @@ Plain HTTP/1.0 downloader with redirect following.  No HTTPS.
 ## Usage
 
 ```
-WGET url [-o output] [-y|-f] [-r]
+WGET url [-o output] [-y|-f] [-r] [-d]
 WGET /?
 ```
 
@@ -23,6 +23,11 @@ WGET /?
 |            | `Range: bytes=<size>-` from the server.  Expects a   |
 |            | 206 reply; a 200 (server without Range support)      |
 |            | aborts with a hint instead of corrupting the file.   |
+| `-d`       | Dot progress: print one `.` per 8 KB flush instead   |
+|            | of the in-place `<done>KB / <total>KB` counter.      |
+|            | The counter is repainted through the DSS console,    |
+|            | which competes with the transfer; run the same       |
+|            | download with and without `-d` to measure the cost.  |
 
 ## Behaviour
 

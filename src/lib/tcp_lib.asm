@@ -12,8 +12,9 @@
 ;
 ; Design choices:
 ;   - one session.
-;   - MSS 536 announced; advertised window 3584 (fits the
-;     8-bit-mode RX ring, see TCP_RECV_WIN_HI).
+;   - MSS 536 announced; advertised window 2680 = 5 * MSS (a
+;     full in-flight window must fit the 8-bit-mode RX ring
+;     with slack to spare, see TCP_RECV_WIN_HI).
 ;   - sequence numbers stored big-endian on disk to match
 ;     the wire format; arithmetic is done by reading bytes
 ;     manually (no native 32-bit ops on Z80).
@@ -60,7 +61,14 @@
 
 	IFDEF USE_TCP
 
-OPEN_TIMEOUT_MS		EQU 5000
+; Connect = up to SYN_ATTEMPTS handshake tries of SYN_TIMEOUT_MS
+; each (~5 s total, the old single-shot budget).  A lone lost SYN
+; or SYN+ACK on a real LAN used to fail the whole connect; every
+; retry now also draws a FRESH local port + ISN, so a server-side
+; TIME_WAIT collision (same tuple as a recent run) or a stray RST
+; self-heals instead of failing the run.
+SYN_ATTEMPTS		EQU 3
+SYN_TIMEOUT_MS		EQU 1700
 
 ; Receive window advertised in every outgoing SYN/ACK/DATA segment.
 ; Must fit the chip's RX ring: with the 8-bit-mode ring (PSTART
@@ -71,8 +79,25 @@ OPEN_TIMEOUT_MS		EQU 5000
 ; more (the old 8 KB was sized for the pre-PSTOP-fix 14.5 KB ring)
 ; makes every server burst overflow the ring; overflow recovery then
 ; flushes ALL queued frames, amplifying one loss into a stall.
-TCP_RECV_WIN_HI		EQU 0x0E		; 3584 = 0x0E00
-TCP_RECV_WIN_LO		EQU 0x00
+; Advertised receive window vs the RX ring, in 256-byte NIC pages:
+; the ring is 26 pages (0x46..0x5F) minus 1 for the BNRY!=CURR
+; empty-slot convention = 25 storable.  One MSS-536 frame occupies
+; 3 pages (14+40+536+4 = 594 bytes).  The peer may send a full
+; window in one burst while we are busy (disk flush, slow 8-bit
+; DMA drain), and RCR_AB adds every LAN broadcast on top, so the
+; window must leave real slack:
+;   3584 (old) -> 7 segments -> 21 pages, slack 4: overflowed on
+;   busy LANs / boards with slow ISA timing (mid-file stalls).
+;   2680 = 5 * MSS -> 15 pages, slack 10: a whole burst plus ten
+;   broadcast frames fit even during a flush pause.
+; Exactly 5 segments also meshes with TCP_ACK_THRESH = 4: the ACK
+; for segment 4 leaves while segment 5 is still in flight, so the
+; peer refills without a stop-and-go gap (a non-multiple-of-MSS
+; window such as 2048 = 3.8 MSS stalls the pipe on every window
+; exhaustion and cost 10-15 KB/s).  Throughput here is CPU/DMA-
+; bound per segment; RECOVER_OVERFLOW remains as the backstop.
+TCP_RECV_WIN_HI		EQU 0x0A		; 2680 = 0x0A78 (5 * MSS 536)
+TCP_RECV_WIN_LO		EQU 0x78
 
 ; Delayed-ACK threshold (RFC 1122 allows up to 2 segments unacked).
 ; We are slightly more aggressive (4) because the chip RX ring is
@@ -142,21 +167,38 @@ OPEN
 	XOR	A
 	LD	(TCP_LAST_FAIL),A
 	LD	(RECV_UNACKED),A
-	; Pick random local port in the ephemeral range
-	; 0xC000..0xFFFF.  Each invocation gets a fresh port so
-	; back-to-back runs don't collide on the server side.
+	LD	A,SYN_ATTEMPTS
+	LD	(.TRIES),A
+.ATTEMPT
+	; Fresh ephemeral port for EVERY attempt, drawn from a 14-bit
+	; salted sequence (0xC000..0xFFFF).  The old scheme (LO = R,
+	; HI = fixed SP byte) had a 128-port pool with the high byte
+	; identical on every run of the same app -- back-to-back runs
+	; collided with the server's TIME_WAIT of the previous session
+	; and the connect timed out.  TCP_PORT_SALT lives outside the
+	; context-swap block and is intentionally never initialized:
+	; leftover RAM is the seed, R stirs it per attempt.
+	LD	HL,(TCP_PORT_SALT)
+	LD	D,H
+	LD	E,L
+	ADD	HL,HL
+	ADD	HL,DE			; salt *= 3
 	LD	A,R
-	LD	(TCP_LOCAL_PORT_LO),A
-	LD	HL,0
-	ADD	HL,SP
+	LD	E,A
+	LD	D,0
+	ADD	HL,DE			; += R
+	LD	DE,0x9E37
+	ADD	HL,DE			; += odd constant (full-period walk)
+	LD	(TCP_PORT_SALT),HL
 	LD	A,L
+	LD	(TCP_LOCAL_PORT_LO),A
+	LD	A,H
 	OR	0xC0
 	LD	(TCP_LOCAL_PORT_HI),A
-	; Generate ISN from R + SP -- 4 mostly-pseudo-random bytes.
+	; Fresh ISN per attempt (R + salt): a retried handshake must
+	; not look like a duplicate of the aborted one to the server.
 	LD	A,R
 	LD	(TCP_SND_NXT + 0),A
-	LD	HL,0
-	ADD	HL,SP
 	LD	A,H
 	LD	(TCP_SND_NXT + 1),A
 	LD	A,L
@@ -195,11 +237,25 @@ OPEN
 .SENT
 
 	; Wait for SYN+ACK matching our (remote_ip, remote_port,
-	; local_port) tuple.
-	LD	HL,OPEN_TIMEOUT_MS
+	; local_port) tuple.  A late SYN+ACK for a PREVIOUS attempt
+	; is filtered by the port match (each attempt has a new port).
+	LD	HL,SYN_TIMEOUT_MS
 	LD	(TCP_TIMEOUT_LEFT),HL
 	CALL	WAIT_SYN_ACK
-	RET	C
+	JR	NC,.GOT_SYNACK
+	; Esc/Ctrl+C aborts immediately; timeout and RST burn one
+	; attempt and retry with a fresh port + ISN.
+	LD	A,(TCP_LAST_FAIL)
+	CP	F_CANCEL
+	SCF
+	RET	Z
+	LD	A,(.TRIES)
+	DEC	A
+	LD	(.TRIES),A
+	JP	NZ,.ATTEMPT
+	SCF
+	RET
+.GOT_SYNACK
 
 	; Validate that segment ACK matches ISN+1.
 	; (BUILD_SYN sent SYN with seq=ISN; SYN+ACK should ACK ISN+1.)
@@ -247,6 +303,7 @@ OPEN
 	LD	(TCP_LAST_FAIL),A
 	SCF
 	RET
+.TRIES	DB 0
 
 
 ; ------------------------------------------------------

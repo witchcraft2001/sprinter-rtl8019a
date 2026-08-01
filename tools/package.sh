@@ -10,6 +10,10 @@ if ! command -v zip >/dev/null 2>&1; then
   echo "Error: zip is not installed or not in PATH" >&2
   exit 1
 fi
+if ! command -v iconv >/dev/null 2>&1 || ! command -v perl >/dev/null 2>&1; then
+  echo "Error: iconv and perl are required to create CP866 plain-text documentation." >&2
+  exit 1
+fi
 
 # DOS expects CRLF in text files. Convert LF -> CRLF for known text
 # extensions when copying to the distribution; binaries pass through
@@ -22,19 +26,26 @@ is_text_ext() {
 }
 
 copy_with_crlf() {
-  local src="$1" dest="$2" upper_ext
+  local src="$1" dest="$2" upper_ext source_ext rendered dos_text
   upper_ext="${dest##*.}"
   upper_ext="$(printf '%s' "$upper_ext" | tr '[:lower:]' '[:upper:]')"
   if is_text_ext "$upper_ext"; then
-    # The DSS text viewer renders bytes through CP866; UTF-8 multi-byte
-    # sequences come out as mojibake. Until an explicit transcoding step
-    # is added, shipped text files must be 7-bit ASCII.
-    if LC_ALL=C grep -lP '[^\x00-\x7F]' "$src" >/dev/null 2>&1; then
-      echo "Error: $src contains non-ASCII bytes; convert to ASCII (or add CP866 transcoding) before shipping." >&2
-      LC_ALL=C grep -nP '[^\x00-\x7F]' "$src" >&2 || true
+    rendered="$(mktemp)"
+    dos_text="$(mktemp)"
+    source_ext="${src##*.}"
+    source_ext="$(printf '%s' "$source_ext" | tr '[:lower:]' '[:upper:]')"
+    if [ "$source_ext" = "MD" ]; then
+      perl "$script_dir/markdown_to_text.pl" "$src" > "$rendered"
+    else
+      cp "$src" "$rendered"
+    fi
+    LC_ALL=C awk 'BEGIN{ORS="\r\n"} {sub(/\r$/, ""); print}' "$rendered" > "$dos_text"
+    if ! iconv -f UTF-8 -t CP866 "$dos_text" > "$dest"; then
+      echo "Error: $src contains characters that cannot be encoded as CP866." >&2
+      rm -f "$rendered" "$dos_text" "$dest"
       exit 1
     fi
-    awk 'BEGIN{ORS="\r\n"} {sub(/\r$/, ""); print}' "$src" > "$dest"
+    rm -f "$rendered" "$dos_text"
   else
     cp "$src" "$dest"
   fi

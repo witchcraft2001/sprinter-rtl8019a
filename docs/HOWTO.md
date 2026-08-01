@@ -4,11 +4,6 @@ Conventions, configuration, exit codes and batch examples shared
 across every utility in the kit.  Per-utility command details
 live in the matching `<NAME>.TXT` document.
 
-For driver-level details, NIC register descriptions, MAME network
-setup, and stage-by-stage internals see `sprinter_rtl8019_soft.md`
-and `docs/MAME_NETWORK.md` in the source tree.
-
-
 ## Command-line flags
 
 All utilities follow a DOS / Windows convention:
@@ -41,8 +36,8 @@ Every utility writes one of these values to `ERRORLEVEL` on exit
 | 7    | Cancelled by user (Esc / Ctrl+C)                              |
 
 Each utility prints `RESULT OK` (`B=0`) or `RESULT FAIL` (`B != 0`)
-as its last line, so visual inspection in MAME and machine-readable
-batch checks agree.
+as its last line, so visual inspection and machine-readable batch
+checks agree.
 
 
 ## Cancelling a wait
@@ -211,14 +206,3 @@ Listing a remote FTP directory before pulling a specific file:
 FTP server.lan -l -u alice -p secret
 FTP server.lan target.zip -u alice -p secret -y
 ```
-
-
-## Versioning
-
-Every utility prints the same package version in its banner.  The
-current package version is `v0.2.20`: `0.2` identifies the common
-package/API feature line and the final `20` is the build/revision.
-Fix-only releases bump the third component.  A package-level API or
-feature-line change bumps the first or second component for every
-utility together.  The value is defined once in
-`src/include/version.inc` and must not be hardcoded per utility.
