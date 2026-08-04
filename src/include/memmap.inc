@@ -242,6 +242,8 @@ TCP_ACK_WAIT_STATE	EQU TCP_BSS_BASE + 0x28	; 0 idle, 1 ACK wait, 2 RX pending
 TCP_ACK_WAIT_TARGET	EQU TCP_BSS_BASE + 0x29	; 4 bytes (BE cumulative ACK target)
 TCP_SEND_SEQ		EQU TCP_BSS_BASE + 0x2D	; 4 bytes (BE sequence used by retries)
 TCP_SEND_RETRY_LEFT	EQU TCP_BSS_BASE + 0x31	; 1 byte
+TCP_RECV_UNACKED	EQU TCP_BSS_BASE + 0x32	; 1 byte (full-context DLL build)
+TCP_RECV_TIMEOUT	EQU TCP_BSS_BASE + 0x33	; 2 bytes (one-shot override)
 
 ; Total per-session TCP state size; copied wholesale by
 ; TCP.SAVE_CTX / TCP.RESTORE_CTX so apps can multiplex
@@ -252,7 +254,7 @@ TCP_CTX_SIZE		EQU 38		; 0x26: TCP_STATE .. TCP_RX_DATA_LEN+1
 
 ; Entire tcp_lib BSS span including non-context scratch above.
 ; Literal for relocatable DLL builds; never derive this from addresses.
-TCP_BSS_SIZE		EQU 50		; 0x32 bytes
+TCP_BSS_SIZE		EQU 53		; 0x35 bytes
 
 ; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + MSS(536)
 ; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF

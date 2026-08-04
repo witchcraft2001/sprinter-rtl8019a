@@ -66,6 +66,7 @@ F_NONE		EQU 0
 F_SEND		EQU 1
 F_TIMEOUT	EQU 2
 F_CANCEL	EQU 5
+F_OTHER		EQU 6	; head packet belongs to another UNET channel
 
 ; ------------------------------------------------------
 ; OPEN: latch the peer for subsequent SEND / RECV.
@@ -293,9 +294,40 @@ RECV
 	JR	Z,.TICK
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
+	IFDEF UNET_DLL
+	LD	BC,@MAIN.RX_BUF_SIZE
+	ELSE
 	LD	BC,1518				; see resolve_lib: RX_BUF is 1518
+	ENDIF
+	IFDEF USE_UDP_MULTICHAN
+	CALL	@RTL.PEEK_PACKET
+	ELSE
 	CALL	@RTL.READ_PACKET
+	ENDIF
 	JR	C,.MISS
+	IFDEF USE_UDP_MULTICHAN
+	CALL	MATCH
+	JR	NC,.COMMIT_MATCH
+	LD	A,2				; caller protocol = UDP
+	CALL	@UNET.HANDLE_FOREIGN_FRAME
+	JR	NC,.COMMIT_MISS
+	OR	A
+	JR	Z,.MISS				; consumed/queued by the other channel
+	LD	A,F_OTHER			; leave the packet at the ring head
+	LD	(UDPLIB_LAST_FAIL),A
+	SCF
+	RET
+.COMMIT_MISS
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	CALL	@ARP.ANSWER_REQUEST
+	JR	NC,.MISS
+	JR	.MISS
+.COMMIT_MATCH
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	JR	.DELIVER
+	ELSE
 	; Answer an ARP request for us while we wait; peers routinely ARP
 	; the sender before replying, and ignoring it looks like RX loss.
 	CALL	@ARP.ANSWER_REQUEST
@@ -304,6 +336,7 @@ RECV
 	JR	C,.MISS
 	; Match: copy min(payload, max) out.
 	JR	.DELIVER
+	ENDIF
 .MISS
 	LD	HL,(UDPLIB_TIMEOUT_LEFT)
 	DEC	HL

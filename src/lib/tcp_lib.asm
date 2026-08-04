@@ -119,7 +119,11 @@ TCP_RECV_WIN_LO		EQU 0x78
 ; We are slightly more aggressive (4) because the chip RX ring is
 ; large and the link is local; we still flush an ACK immediately
 ; whenever the ring drains, so the peer never waits for long.
+	IFDEF USE_TCP_MULTICHAN
+TCP_ACK_THRESH		EQU 1		; another channel's ring traffic must not defer us
+	ELSE
 TCP_ACK_THRESH		EQU 4
+	ENDIF
 
 ETH_TYPE_IPV4		EQU 0x0800
 IP_HDR_LEN		EQU 20
@@ -146,6 +150,7 @@ F_TIMEOUT		EQU 2
 F_RST			EQU 3
 F_BAD_SEG		EQU 4
 F_CANCEL		EQU 5
+F_OTHER			EQU 6	; head packet belongs to another UNET channel
 
 
 ; ------------------------------------------------------
@@ -773,14 +778,45 @@ WAIT_SYN_ACK
 .HAVE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
+	IFDEF UNET_DLL
+	LD	BC,@MAIN.RX_BUF_SIZE
+	ELSE
 	LD	BC,1518			; @MAIN.RX_BUF_SIZE is documented but the
 					; apps define RX_BUF_SIZE outside MODULE MAIN,
 					; so it is not referenceable here.  All callers
 					; (apps and the UNET DLL) size RX_BUF at 1518.
+	ENDIF
+	IFDEF USE_TCP_MULTICHAN
+	CALL	@RTL.PEEK_PACKET
+	ELSE
 	CALL	@RTL.READ_PACKET
+	ENDIF
 	JP	C,.TICK
 	; Validate IPv4 + TCP from remote.
 	CALL	IS_TCP_FROM_PEER
+	IFDEF USE_TCP_MULTICHAN
+	JR	C,.COMMIT_PEER
+	LD	A,1
+	CALL	@UNET.HANDLE_FOREIGN_FRAME
+	JR	NC,.COMMIT_OTHER
+	OR	A
+	JP	Z,.LP
+	LD	A,F_OTHER
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.COMMIT_OTHER
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	IFDEF USE_ARP_ANSWER
+	CALL	@ARP.ANSWER_REQUEST
+	ENDIF
+	JP	.TICK
+.COMMIT_PEER
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	JR	.PEER_SEG
+	ELSE
 	JR	C,.PEER_SEG
 	IFDEF USE_ARP_ANSWER
 	; Not our segment: if it is an ARP request for our IP, answer
@@ -791,6 +827,7 @@ WAIT_SYN_ACK
 	CALL	@ARP.ANSWER_REQUEST
 	ENDIF
 	JP	.TICK
+	ENDIF
 .PEER_SEG
 	; Check flags = SYN | ACK.
 	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)
@@ -1157,18 +1194,50 @@ RECV
 .HAVE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
+	IFDEF UNET_DLL
+	LD	BC,@MAIN.RX_BUF_SIZE
+	ELSE
 	LD	BC,1518			; @MAIN.RX_BUF_SIZE is documented but the
 					; apps define RX_BUF_SIZE outside MODULE MAIN,
 					; so it is not referenceable here.  All callers
 					; (apps and the UNET DLL) size RX_BUF at 1518.
+	ENDIF
+	IFDEF USE_TCP_MULTICHAN
+	CALL	@RTL.PEEK_PACKET
+	ELSE
 	CALL	@RTL.READ_PACKET
+	ENDIF
 	JP	C,.TICK
 	CALL	IS_TCP_FROM_PEER
+	IFDEF USE_TCP_MULTICHAN
+	JR	C,.COMMIT_PEER
+	LD	A,1			; caller protocol = TCP
+	CALL	@UNET.HANDLE_FOREIGN_FRAME
+	JR	NC,.COMMIT_OTHER
+	OR	A
+	JP	Z,.LP			; foreign frame consumed and queued
+	LD	A,F_OTHER		; foreign queue full: leave head in NIC ring
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.COMMIT_OTHER
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	IFDEF USE_ARP_ANSWER
+	CALL	@ARP.ANSWER_REQUEST	; see WAIT_SYN_ACK for rationale
+	ENDIF
+	JP	.TICK
+.COMMIT_PEER
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	JR	.PEER_SEG
+	ELSE
 	JR	C,.PEER_SEG
 	IFDEF USE_ARP_ANSWER
 	CALL	@ARP.ANSWER_REQUEST	; see WAIT_SYN_ACK for rationale
 	ENDIF
 	JP	.TICK
+	ENDIF
 .PEER_SEG
 	; Flags.
 	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)
@@ -1412,12 +1481,20 @@ RECV
 ; Counter of segments processed since the last outbound ACK.  Reset
 ; on TCP.OPEN and on every actual ACK send; bumped on every accepted
 ; (in-sequence) data segment.  See TCP_ACK_THRESH for the cap.
+	IFDEF USE_TCP_CONTEXT_FULL
+RECV_UNACKED	EQU TCP_RECV_UNACKED
+	ELSE
 RECV_UNACKED	DB 0
+	ENDIF
 
 ; One-shot RECV timeout override, in ms.  Caller writes here just
 ; before calling RECV; on entry RECV consumes the value and clears
 ; the slot back to 0 (= "use 30 000 ms default").
+	IFDEF USE_TCP_CONTEXT_FULL
+RECV_TIMEOUT	EQU TCP_RECV_TIMEOUT
+	ELSE
 RECV_TIMEOUT	DW 0
+	ENDIF
 
 
 ; ------------------------------------------------------

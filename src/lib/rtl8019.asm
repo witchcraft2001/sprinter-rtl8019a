@@ -33,6 +33,8 @@
 ;   RTL.SEND_FRAME       DMA-write + TX trigger + wait PTX.
 ;   RTL.RING_HAS_PACKET  is RX ring non-empty?
 ;   RTL.READ_PACKET      read 4-byte header + body, advance BNRY.
+;   RTL.PEEK_PACKET      read without advancing BNRY (optional).
+;   RTL.COMMIT_PACKET    advance BNRY after a successful peek.
 ;
 ; License: BSD 3-Clause
 ; ======================================================
@@ -1564,6 +1566,14 @@ RECOVER_OVERFLOW
 ; ------------------------------------------------------
 	IFDEF USE_RTL_READ_PACKET
 READ_PACKET
+	IFDEF USE_RTL_PEEK_PACKET
+	XOR	A
+	JR	READ_PACKET_COMMON
+PEEK_PACKET
+	LD	A,1
+READ_PACKET_COMMON
+	LD	(.PEEK_MODE),A
+	ENDIF
 	LD	(.HDR_PTR),HL
 	LD	(.BODY_PTR),DE
 	LD	(.MAX_LEN),BC
@@ -1685,6 +1695,14 @@ READ_PACKET
 	RET	C
 .READ_DONE
 	; Advance BNRY = hdr.next - 1, wrap PSTART -> PSTOP-1.
+	IFDEF USE_RTL_PEEK_PACKET
+	LD	A,(.PEEK_MODE)
+	OR	A
+	JR	NZ,.RETURN_BODY
+	LD	HL,(.HDR_PTR)
+	CALL	COMMIT_PACKET
+	JR	.RETURN_BODY
+	ELSE
 	LD	IX,(RTL_BASE_PTR)
 	LD	HL,(.HDR_PTR)
 	INC	HL
@@ -1699,6 +1717,8 @@ READ_PACKET
 	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE
 	LD	A,1
 	LD	(RTL_RX_TO_TX_PENDING),A
+	ENDIF
+.RETURN_BODY
 	LD	BC,(.BODY_LEN)
 	OR	A
 	RET
@@ -1738,6 +1758,22 @@ READ_PACKET
 .BODY_ADDR	DW 0
 .FIRST_LEN	DW 0
 .HDR_TRIES	DB 0
+	IFDEF USE_RTL_PEEK_PACKET
+.PEEK_MODE	DB 0
+
+; Commit the packet most recently returned by PEEK_PACKET.  The caller keeps
+; the four-byte header intact and passes its address in HL.  Until this call,
+; BNRY still protects the frame from reuse by the receive DMA engine.
+COMMIT_PACKET
+	LD	IX,(RTL_BASE_PTR)
+	INC	HL
+	LD	A,(HL)
+	CALL	SET_BNRY_FROM_NEXT_A
+	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE
+	LD	A,1
+	LD	(RTL_RX_TO_TX_PENDING),A
+	RET
+	ENDIF
 
 ; VALID_RX_PAGE_A: CF=0 if A is in [PSTART, PSTOP), CF=1 otherwise.
 VALID_RX_PAGE_A

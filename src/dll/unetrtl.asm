@@ -81,6 +81,7 @@
 	DEFINE	USE_RTL_WAIT_PTX
 	DEFINE	USE_RTL_RING_HAS_PACKET
 	DEFINE	USE_RTL_READ_PACKET
+	DEFINE	USE_RTL_PEEK_PACKET	; leave another channel's head frame queued
 	DEFINE	USE_ARP_BUILD_REQUEST
 	DEFINE	USE_ARP_ANSWER
 	DEFINE	USE_NETENV
@@ -88,7 +89,10 @@
 	DEFINE	USE_RESOLVE
 	DEFINE	USE_TCP
 	DEFINE	USE_TCP_RELIABLE_SEND	; bounded per-MSS ACK wait + retransmit
+	DEFINE	USE_TCP_CONTEXT_FULL	; all live receive state follows its channel
+	DEFINE	USE_TCP_MULTICHAN
 	DEFINE	USE_UDP
+	DEFINE	USE_UDP_MULTICHAN
 	DEFINE	USE_ICMP
 	DEFINE	USE_UTIL_FORMAT
 	DEFINE	USE_CMDL_PARSE		; resolve_lib calls CMDL.PARSE_IPV4
@@ -104,18 +108,20 @@
 ; Capability mask.  RXFLOW is CLEAR: the card buffers receive in its
 ; ~6.4 KB byte-mode ring, so RXPAUSE/RXRESUME are genuine no-ops here (unlike
 ; the ESP backend, where the consumer must honour them).
-; MULTICHAN/LISTEN/TRANSPARENT are v1 gaps.  RAWETH stays clear even
+; LISTEN/TRANSPARENT are v1 gaps.  RAWETH stays clear even
 ; though the card can do it: slots 0..17 have no raw-frame entry
 ; point, and advertising a capability with nothing to call would be
 ; a lie.
-UNETRTL_CAPS	EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING
+UNETRTL_CAPS	EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_MULTICHAN
 
+UNET_CHANNELS	EQU 2
 MAX_HOST_LEN	EQU 128			; matches UNETESP; also bounds the
 MAX_PORT_LEN	EQU 15			; resolver's own scratch usage
 TCP_MSS		EQU 536			; SEND chunk size, hidden by the ABI
 LASTERR_SIZE	EQU 128
 
 	ORG 0x0000			; the ONLY ORG; mkdll rewrites it
+DLL_IMAGE_ORIGIN	EQU $
 
 ; ======================================================
 ; libman export table.  Entry N is at image_base + 0x20 + 3*N.
@@ -157,21 +163,28 @@ LASTERR_SIZE	EQU 128
 ;
 ; Offsets are literals on purpose (see the layout notes above).  The
 ; region sizes come from memmap.inc: LIBBSS_SIZE 0x176, resolve 0x29,
-; tcp 0x32, udp 0x18, icmp 0x10.
+; tcp 0x35, udp 0x18, icmp 0x10.
 ; ======================================================
 BSS_LIB		EQU 0x0000		; 0x176 util + rtl + netenv + rtl tx
 BSS_RESOLVE	EQU 0x0176		; 0x029 resolve_lib
-BSS_TCP		EQU 0x019F		; 0x032 tcp_lib
-BSS_UDP		EQU 0x01D1		; 0x018 udp_lib
-BSS_ICMP	EQU 0x01E9		; 0x010 icmp_lib
-BSS_OUR_IP	EQU 0x01F9		; 4
-BSS_OUR_MAC	EQU 0x01FD		; 6
-BSS_CANCELLED	EQU 0x0203		; 1
+BSS_TCP		EQU 0x019F		; 0x035 tcp_lib
+BSS_UDP		EQU 0x01D4		; 0x018 udp_lib
+BSS_ICMP	EQU 0x01EC		; 0x010 icmp_lib
+BSS_OUR_IP	EQU 0x01FC		; 4
+BSS_OUR_MAC	EQU 0x0200		; 6
+BSS_CANCELLED	EQU 0x0206		; 1
 BSS_LASTERR	EQU 0x0208		; 0x080 formatted diagnostic line
 BSS_TX_BUF	EQU 0x0288		; 0x42A 1066 = 14+20+8+1024 (UDP cap)
 BSS_RX_HDR	EQU 0x06B2		; 4     NE2000 RX ring header
-BSS_RX_BUF	EQU 0x06B6		; 0x5EE 1518 = max Ethernet frame
-DLL_BSS_SIZE	EQU 0x0CA4		; 3236 total
+BSS_RX_BUF	EQU 0x06B6		; 0x42A 1066 = largest accepted UDP frame
+BSS_CH_TCP	EQU 0x0AE0		; 0x33 inactive TCP context (salt excluded)
+BSS_CH_UDP	EQU 0x0B13		; 0x18 inactive-channel UDP context
+BSS_PEND_LEN	EQU 0x0B2B		; 2 words
+BSS_PEND_OFF	EQU 0x0B2F		; 2 words
+BSS_CLOSED	EQU 0x0B33		; 2 bytes
+BSS_LOST	EQU 0x0B35		; 2 bytes
+BSS_PEND_BUF	EQU 0x0B37		; 2 * 536-byte TCP receive queues
+DLL_BSS_SIZE	EQU 0x0F67		; 3943 total
 
 DLL_BSS
 	DS	DLL_BSS_SIZE, 0
@@ -200,7 +213,16 @@ CANCELLED	EQU DLL_BSS + BSS_CANCELLED	; 1
 TX_BUF		EQU DLL_BSS + BSS_TX_BUF
 RX_HDR		EQU DLL_BSS + BSS_RX_HDR
 RX_BUF		EQU DLL_BSS + BSS_RX_BUF
-RX_BUF_SIZE	EQU 1518
+RX_BUF_SIZE	EQU 1066
+
+CH_TCP_CTX	EQU DLL_BSS + BSS_CH_TCP	; inactive channel swap slot
+CH_UDP_CTX	EQU DLL_BSS + BSS_CH_UDP	; inactive channel swap slot
+CH_PEND_LEN	EQU DLL_BSS + BSS_PEND_LEN
+CH_PEND_OFF	EQU DLL_BSS + BSS_PEND_OFF
+CH_CLOSED	EQU DLL_BSS + BSS_CLOSED
+CH_LOST		EQU DLL_BSS + BSS_LOST
+CH_PEND_BUF	EQU DLL_BSS + BSS_PEND_BUF
+CH_PEND_SIZE	EQU 536
 
 ; ------------------------------------------------------
 ; TICK_AND_CHECK_KEY: ~1 ms pace + optional cancel poll, called
@@ -306,6 +328,7 @@ F_NETINIT
 	LD	A,ST_NETINIT
 	LD	(STAGE),A
 	CALL	CLOSE_LINK			; a repeated NETINIT is safe
+	CALL	RESET_CHANNEL_STATE
 	CALL	ENV_IS_UP
 	JP	C,RET_NONET
 	; NET_IP / NET_MAC into the @MAIN contract slots.
@@ -348,8 +371,11 @@ F_NETINIT
 ; Function 8 - CLOSE / Function 4 - NETDONE (shared tail).
 ; ------------------------------------------------------
 F_CLOSE
-	AND	A
-	JP	NZ,RET_PARAM			; v1: channel 0 only
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
+	CALL	CLOSE_CHANNEL
+	XOR	A
+	RET
 F_NETDONE
 	CALL	CLOSE_LINK
 	XOR	A
@@ -359,8 +385,8 @@ F_NETDONE
 ; Function 5 - CONNECT (TCP).
 ; ------------------------------------------------------
 F_CONNECT
-	AND	A
-	JP	NZ,RET_PARAM
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
 	LD	A,ST_CONNECT
@@ -368,7 +394,7 @@ F_CONNECT
 	LD	A,(INITED)
 	AND	A
 	JP	Z,RET_STATE
-	LD	A,(CH_STATE)
+	CALL	GET_CH_STATE
 	AND	A
 	JP	NZ,RET_STATE			; already open
 	CALL	CHECK_HOST_PORT
@@ -384,6 +410,10 @@ F_CONNECT
 	LD	(@MAIN.CANCELLED),A
 	CALL	RESOLVE_AND_ARP			; ISA open .. close inside
 	JP	C,MAP_RESOLVE_FAIL
+	LD	A,(ARG_CH)
+	CALL	SELECT_CHANNEL
+	LD	A,(ARG_CH)
+	CALL	PEND_CLEAR_A
 	; Fill the tcp_lib session tuple.
 	LD	HL,TARGET_IP
 	LD	DE,TCP_REMOTE_IP
@@ -400,16 +430,13 @@ F_CONNECT
 	LD	(TCP_REMOTE_PORT_LO),A
 	XOR	A
 	LD	(TCP_STATE),A			; force CLOSED before OPEN
-	LD	(PEND_LEN),A
-	LD	(PEND_LEN+1),A
-	LD	(CLOSED_PEND),A
 	CALL	@ISA.ISA_OPEN
 	CALL	@TCP.OPEN
 	JR	C,.fail
 	CALL	CAPTURE_DIAG
 	CALL	@ISA.ISA_CLOSE
 	LD	A,1
-	LD	(CH_STATE),A			; 1 = TCP
+	CALL	SET_CH_STATE			; 1 = TCP
 	XOR	A
 	LD	(LAST_NERR),A
 	RET
@@ -426,15 +453,18 @@ F_CONNECT
 ;   Out: DE = bytes actually sent, valid on the error paths too.
 ; ------------------------------------------------------
 F_SEND
-	AND	A
-	JP	NZ,RET_PARAM
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
 	LD	A,ST_SEND
 	LD	(STAGE),A
-	LD	A,(CH_STATE)
+	CALL	GET_CH_STATE
 	AND	A
 	JP	Z,RET_STATE
+	LD	A,(ARG_CH)
+	CALL	SELECT_CHANNEL
+	CALL	GET_CH_STATE
 	CP	2
 	JP	Z,.udp
 	; -- TCP --
@@ -471,6 +501,7 @@ F_SEND
 	LD	BC,(CHUNK_LEN)
 	CALL	@TCP.SEND
 	JR	C,.fail
+	CALL	CAPTURE_SEND_PENDING
 	LD	HL,(SEND_DONE)
 	LD	BC,(CHUNK_LEN)
 	ADD	HL,BC
@@ -519,44 +550,48 @@ F_SEND
 ; ------------------------------------------------------
 ; Function 7 - RECV.
 ;
-; A TCP segment larger than the caller's buffer is NOT dropped: the
-; remainder stays in RX_BUF and is served from PEND_PTR on the next
-; call with no NIC access, which is exactly what IX bit1 tells the
-; caller.  Likewise a FIN that carried a final data segment delivers
-; the data first and reports NERR_CLOSED on the following call, so
-; the tail is never lost (the ABI guarantees this).
-;
-; IX bit0 (oversized datagram truncated) is set only on a UDP
-; channel; bit2 (UART overrun) is always 0 - there is no UART here,
-; so ESP-written consumers see a benign zero.
+; TCP payload is copied into a private 536-byte queue for the selected
+; channel before the shared frame buffer can be reused.  A foreign TCP frame
+; may therefore be ACKed and queued while the other channel is waiting; UDP
+; frames can remain protected at the NIC ring head until their owner is read.
 ; ------------------------------------------------------
 F_RECV
-	AND	A
-	JP	NZ,RET_PARAM
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
 	LD	(ARG_IY),IY
 	LD	A,ST_RECV
 	LD	(STAGE),A
-	LD	A,(CH_STATE)
+	CALL	GET_CH_STATE
 	AND	A
 	JP	Z,RET_STATE
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
 	JP	C,RET_PARAM
-	LD	A,(CH_STATE)
+	LD	A,(ARG_CH)
+	CALL	SELECT_CHANNEL
+	CALL	GET_CH_STATE
 	CP	2
 	JP	Z,.udp
 	; -- TCP: serve any pending remainder first, no NIC access --
-	LD	HL,(PEND_LEN)
-	LD	A,H
-	OR	L
+	LD	A,(ARG_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	LD	A,D
+	OR	E
 	JP	NZ,.serve_pending
 	; A FIN seen last time with trailing data already delivered.
-	LD	A,(CLOSED_PEND)
-	AND	A
+	LD	A,(ARG_CH)
+	CALL	CLOSED_ADDR_A
+	LD	A,(HL)
+	OR	A
 	JP	NZ,.report_closed
+	LD	A,0xFF
+	LD	(FOREIGN_HINT),A
 	XOR	A
 	LD	(@MAIN.CANCELLED),A
 	; IY = 0 would be read by tcp_lib as "use the 30 s default", so
@@ -572,8 +607,9 @@ F_RECV
 	CALL	@TCP.RECV			; -> HL=data, BC=len
 	JR	C,.rx_err
 	CALL	@ISA.ISA_CLOSE
-	LD	(PEND_PTR),HL
-	LD	(PEND_LEN),BC
+	LD	A,(ARG_CH)
+	CALL	QUEUE_TCP_DATA
+	JP	C,.queue_fail
 	JP	.serve_pending
 .rx_err
 	CALL	CAPTURE_DIAG
@@ -584,6 +620,8 @@ F_RECV
 	; Timeout is not an error at this layer: idle, link still alive.
 	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_TIMEOUT
+	JR	Z,.idle
+	CP	@TCP.F_OTHER
 	JR	Z,.idle
 	CP	@TCP.F_CANCEL
 	JR	Z,.cancelled
@@ -603,14 +641,16 @@ F_RECV
 	JP	RET_A
 .reset_by_peer
 	XOR	A
-	LD	(CH_STATE),A
+	CALL	SET_CH_STATE
+	LD	A,(ARG_CH)
+	CALL	PEND_CLEAR_A
 	LD	DE,0
-	LD	IX,0
+	CALL	BUILD_RECV_FLAGS
 	LD	A,NERR_CLOSED
 	JP	RET_A
 .idle
 	LD	DE,0
-	LD	IX,0
+	CALL	BUILD_RECV_FLAGS
 	XOR	A
 	RET
 .cancelled
@@ -622,27 +662,37 @@ F_RECV
 	JP	RET_A
 .peer_fin
 	; FIN, possibly carrying a last data segment.
-	LD	A,1
-	LD	(CLOSED_PEND),A
-	LD	HL,(TCP_RX_DATA_LEN)
-	LD	A,H
-	OR	L
+	LD	A,(ARG_CH)
+	CALL	CLOSED_ADDR_A
+	LD	(HL),1
+	LD	BC,(TCP_RX_DATA_LEN)
+	LD	A,B
+	OR	C
 	JP	Z,.report_closed
-	LD	(PEND_LEN),HL
 	LD	HL,(TCP_RX_DATA_PTR)
-	LD	(PEND_PTR),HL
+	LD	A,(ARG_CH)
+	CALL	QUEUE_TCP_DATA
+	JP	C,.queue_fail
 	JP	.serve_pending
 .report_closed
+	LD	A,(ARG_CH)
+	CALL	CLOSED_ADDR_A
+	LD	(HL),0
 	XOR	A
-	LD	(CLOSED_PEND),A
-	LD	(CH_STATE),A
+	CALL	SET_CH_STATE
 	LD	DE,0
-	LD	IX,0
+	CALL	BUILD_RECV_FLAGS
 	LD	A,NERR_CLOSED
 	JP	RET_A
 .serve_pending
-	; n = min(PEND_LEN, max)
-	LD	HL,(PEND_LEN)
+	; n = min(channel pending length, caller max)
+	LD	A,(ARG_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	C,(HL)
+	INC	HL
+	LD	B,(HL)
+	LD	H,B
+	LD	L,C
 	LD	DE,(ARG_IX)
 	OR	A
 	SBC	HL,DE
@@ -651,35 +701,87 @@ F_RECV
 	LD	BC,(ARG_IX)
 	JR	.copy_out
 .take_all
-	LD	BC,(PEND_LEN)
+	LD	A,(ARG_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	C,(HL)
+	INC	HL
+	LD	B,(HL)
 .copy_out
 	LD	(COPY_LEN),BC
 	LD	A,B
 	OR	C
 	JR	Z,.nothing
-	LD	HL,(PEND_PTR)
+	LD	A,(ARG_CH)
+	CALL	PEND_BUF_ADDR_A
+	EX	DE,HL
+	LD	A,(ARG_CH)
+	CALL	PEND_OFF_ADDR_A
+	LD	C,(HL)
+	INC	HL
+	LD	B,(HL)
+	EX	DE,HL
+	ADD	HL,BC
 	LD	DE,(ARG_DE)
-	LDIR					; HL/DE advance past the copy
-	LD	(PEND_PTR),HL
+	LD	BC,(COPY_LEN)
+	LDIR
 .nothing
-	; PEND_LEN -= COPY_LEN
-	LD	HL,(PEND_LEN)
+	; pending length -= copy; offset += copy
+	LD	A,(ARG_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	EX	DE,HL
 	LD	DE,(COPY_LEN)
 	OR	A
 	SBC	HL,DE
-	LD	(PEND_LEN),HL
-	LD	IX,0
-	LD	A,H
-	OR	L
-	JR	Z,.no_more
-	LD	IX,2				; bit1: more data pending
-.no_more
+	PUSH	HL
+	LD	A,(ARG_CH)
+	CALL	PEND_LEN_ADDR_A
+	POP	DE
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	LD	A,D
+	OR	E
+	JR	Z,.clear_off
+	LD	A,(ARG_CH)
+	CALL	PEND_OFF_ADDR_A
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	EX	DE,HL
+	LD	DE,(COPY_LEN)
+	ADD	HL,DE
+	EX	DE,HL
+	LD	A,(ARG_CH)
+	CALL	PEND_OFF_ADDR_A
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	JR	.pending_done
+.clear_off
+	LD	A,(ARG_CH)
+	CALL	PEND_OFF_ADDR_A
+	XOR	A
+	LD	(HL),A
+	INC	HL
+	LD	(HL),A
+.pending_done
+	CALL	BUILD_RECV_FLAGS
 	LD	DE,(COPY_LEN)
 	XOR	A
 	LD	(LAST_NERR),A
 	RET
+.queue_fail
+	LD	DE,0
+	CALL	BUILD_RECV_FLAGS
+	LD	A,NERR_PROTO
+	JP	RET_A
 .udp
 	; -- UDP: one datagram per call --
+	LD	A,0xFF
+	LD	(FOREIGN_HINT),A
 	XOR	A
 	LD	(@MAIN.CANCELLED),A
 	CALL	@ISA.ISA_OPEN
@@ -698,11 +800,15 @@ F_RECV
 	CALL	@UDP.RECV
 	JR	C,.udp_err
 	CALL	@ISA.ISA_CLOSE
-	LD	IX,0
+	CALL	BUILD_RECV_FLAGS
 	LD	A,(UDPLIB_RX_FLAGS)
 	AND	1
 	JR	Z,.udp_ok
-	LD	IX,1				; bit0: datagram was truncated
+	PUSH	IX
+	POP	HL
+	SET	0,L				; bit0: datagram was truncated
+	PUSH	HL
+	POP	IX
 .udp_ok
 	LD	DE,(UDPLIB_RX_LEN)
 	XOR	A
@@ -716,13 +822,55 @@ F_RECV
 	LD	A,(UDPLIB_LAST_FAIL)
 	CP	@UDP.F_CANCEL
 	JR	Z,.udp_cancel
-	XOR	A				; timeout = idle, per the ABI
+	CP	@UDP.F_TIMEOUT
+	JR	Z,.udp_idle
+	CP	@UDP.F_OTHER
+	JR	NZ,.udp_proto
+.udp_idle
+	CALL	BUILD_RECV_FLAGS
+	XOR	A				; timeout/XCHAN = idle, per the ABI
 	RET
+.udp_proto
+	LD	A,NERR_PROTO
+	JP	RET_A
 .udp_cancel
 	XOR	A
 	LD	(@MAIN.CANCELLED),A
 	LD	A,NERR_CANCEL
 	JP	RET_A
+
+; Build IX flags for ARG_CH.  Loss is sticky until reported; the optional
+; XCHAN bit is driven by queued data/close on the other channel.
+BUILD_RECV_FLAGS
+	LD	HL,0
+	LD	(RECV_FLAGS),HL
+	LD	A,(ARG_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	JR	Z,.no_more
+	LD	HL,RECV_FLAGS
+	SET	1,(HL)
+.no_more
+	LD	A,(ARG_CH)
+	CALL	LOST_ADDR_A
+	LD	A,(HL)
+	OR	A
+	JR	Z,.no_lost
+	LD	(HL),0
+	LD	HL,RECV_FLAGS
+	SET	2,(HL)
+.no_lost
+	LD	A,(ARG_CH)
+	XOR	1
+	CALL	PEND_HAS_A
+	JR	Z,.no_xchan
+	LD	HL,RECV_FLAGS
+	SET	3,(HL)
+.no_xchan
+	LD	IX,(RECV_FLAGS)
+	RET
 
 ; ------------------------------------------------------
 ; Function 9 - STATUS.
@@ -732,16 +880,21 @@ F_RECV
 F_STATUS
 	CP	0xFF
 	JR	Z,.netstat
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
+	CALL	GET_CH_STATE
 	AND	A
-	JP	NZ,RET_PARAM
-	LD	A,(CH_STATE)
-	AND	A
-	JR	Z,.closed
-	LD	DE,2				; connected
-	XOR	A
-	RET
-.closed
 	LD	DE,0
+	JR	Z,.check_pending
+	LD	DE,UNET_ST_CONN
+.check_pending
+	LD	A,(ARG_CH)
+	CALL	PEND_HAS_A
+	JR	Z,.status_done
+	LD	A,E
+	OR	UNET_ST_RXPEND
+	LD	E,A
+.status_done
 	XOR	A
 	RET
 .netstat
@@ -764,8 +917,8 @@ F_STATUS
 ; Function 10 - UDPOPEN.
 ; ------------------------------------------------------
 F_UDPOPEN
-	AND	A
-	JP	NZ,RET_PARAM
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
 	LD	(ARG_IY),IY
@@ -774,7 +927,7 @@ F_UDPOPEN
 	LD	A,(INITED)
 	AND	A
 	JP	Z,RET_STATE
-	LD	A,(CH_STATE)
+	CALL	GET_CH_STATE
 	AND	A
 	JP	NZ,RET_STATE
 	CALL	CHECK_HOST_PORT
@@ -801,17 +954,31 @@ F_UDPOPEN
 	JP	C,RET_PARAM
 	LD	(ARG_LPORT),HL
 .no_lport
+	LD	HL,(ARG_LPORT)
+	LD	A,H
+	OR	L
+	JR	NZ,.have_lport
+	LD	HL,@UDP.DEF_LOCAL_PORT
+	LD	A,(ARG_CH)
+	ADD	A,L
+	LD	L,A			; defaults: channel 0=C400, channel 1=C401
+	LD	(ARG_LPORT),HL
+.have_lport
 	XOR	A
 	LD	(@MAIN.CANCELLED),A
 	CALL	RESOLVE_AND_ARP
 	JP	C,MAP_RESOLVE_FAIL
+	LD	A,(ARG_CH)
+	CALL	SELECT_CHANNEL
+	LD	A,(ARG_CH)
+	CALL	PEND_CLEAR_A
 	LD	HL,TARGET_IP
 	LD	DE,TARGET_MAC
 	LD	BC,(ARG_PORT)
 	LD	IY,(ARG_LPORT)
 	CALL	@UDP.OPEN
 	LD	A,2
-	LD	(CH_STATE),A			; 2 = UDP
+	CALL	SET_CH_STATE			; 2 = UDP
 	XOR	A
 	LD	(LAST_NERR),A
 	RET
@@ -1089,26 +1256,406 @@ RET_HW
 ; ======================================================
 
 ; ------------------------------------------------------
-; CLOSE_LINK: tear down whatever channel is open.  Idempotent.
+; Channel/context helpers.
 ; ------------------------------------------------------
-CLOSE_LINK
-	LD	A,(CH_STATE)
-	AND	A
+CHECK_CHANNEL
+	CP	UNET_CHANNELS
+	JR	NC,.bad
+	LD	(ARG_CH),A
+	OR	A
+	RET
+.bad
+	SCF
+	RET
+
+CH_STATE_ADDR
+	LD	A,(ARG_CH)
+	JR	CH_STATE_ADDR_A
+
+CH_STATE_ADDR_A
+	LD	HL,CH_STATE
+	ADD	A,L
+	LD	L,A
+	RET
+
+GET_CH_STATE
+	CALL	CH_STATE_ADDR
+	LD	A,(HL)
+	RET
+
+GET_CH_STATE_A
+	CALL	CH_STATE_ADDR_A
+	LD	A,(HL)
+	RET
+
+SET_CH_STATE
+	PUSH	AF
+	CALL	CH_STATE_ADDR
+	POP	AF
+	LD	(HL),A
+	RET
+
+; Map one channel's complete software-stack state into the libraries' working
+; BSS.  With exactly two channels, swapping the working state with one
+; inactive slot is smaller than keeping two snapshots.  This is memory-only
+; and is safe with either ISA window state.
+SELECT_CHANNEL
+	LD	B,A
+	LD	A,(ACTIVE_CH)
+	CP	B
 	RET	Z
+	CP	UNET_CHANNELS
+	JR	NC,.first
+	PUSH	BC
+	LD	HL,TCP_STATE
+	LD	DE,@MAIN.CH_TCP_CTX
+	LD	B,TCP_CTX_SIZE
+	CALL	SWAP_BYTES
+	; TCP_PORT_SALT is deliberately global: otherwise two channels opened
+	; against one peer can choose the same local port.  Swap the reliable-send
+	; and receive scratch after the two-byte salt as a second slice.
+	LD	HL,TCP_ACK_WAIT_STATE
+	LD	DE,@MAIN.CH_TCP_CTX + TCP_CTX_SIZE
+	LD	B,TCP_BSS_SIZE - 0x28
+	CALL	SWAP_BYTES
+	LD	HL,UDPLIB_REMOTE_IP
+	LD	DE,@MAIN.CH_UDP_CTX
+	LD	B,UDPLIB_BSS_SIZE
+	CALL	SWAP_BYTES
+	POP	BC
+.first
+	LD	A,B
+	LD	(ACTIVE_CH),A
+	RET
+
+SWAP_BYTES
+.loop
+	LD	A,(DE)
+	LD	C,(HL)
+	LD	(HL),A
+	LD	A,C
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	DJNZ	.loop
+	RET
+
+PEND_LEN_ADDR_A
+	ADD	A,A
+	LD	HL,@MAIN.CH_PEND_LEN
+	ADD	A,L
+	LD	L,A
+	RET
+
+PEND_OFF_ADDR_A
+	ADD	A,A
+	LD	HL,@MAIN.CH_PEND_OFF
+	ADD	A,L
+	LD	L,A
+	RET
+
+PEND_BUF_ADDR_A
+	LD	HL,@MAIN.CH_PEND_BUF
+	OR	A
+	RET	Z
+	LD	DE,@MAIN.CH_PEND_SIZE
+	ADD	HL,DE
+	RET
+
+CLOSED_ADDR_A
+	LD	HL,@MAIN.CH_CLOSED
+	ADD	A,L
+	LD	L,A
+	RET
+
+LOST_ADDR_A
+	LD	HL,@MAIN.CH_LOST
+	ADD	A,L
+	LD	L,A
+	RET
+
+PEND_CLEAR_A
+	PUSH	AF
+	CALL	PEND_LEN_ADDR_A
+	XOR	A
+	LD	(HL),A
+	INC	HL
+	LD	(HL),A
+	POP	AF
+	PUSH	AF
+	CALL	PEND_OFF_ADDR_A
+	XOR	A
+	LD	(HL),A
+	INC	HL
+	LD	(HL),A
+	POP	AF
+	LD	E,A
+	LD	D,0
+	LD	HL,@MAIN.CH_CLOSED
+	ADD	HL,DE
+	XOR	A
+	LD	(HL),A
+	LD	HL,@MAIN.CH_LOST
+	ADD	HL,DE
+	LD	(HL),A
+	LD	A,(FOREIGN_HINT)
+	CP	E
+	RET	NZ
+	LD	A,0xFF
+	LD	(FOREIGN_HINT),A
+	RET
+
+; Out: NZ if channel A has buffered bytes or a deferred peer close.
+PEND_HAS_A
+	LD	(QUEUE_CH),A
+	CALL	PEND_LEN_ADDR_A
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	LD	A,(QUEUE_CH)
+	CALL	CLOSED_ADDR_A
+	LD	A,D
+	OR	E
+	OR	(HL)
+	RET	NZ
+	LD	A,(FOREIGN_HINT)
+	LD	HL,QUEUE_CH
+	SUB	(HL)
+	JR	NZ,.no_hint
+	INC	A			; NZ: the queued ring head belongs to A
+	RET
+.no_hint
+	XOR	A			; Z: no pending work for this channel
+	RET
+
+; Append one accepted TCP payload to a channel's private queue.
+; In: A=channel, HL=source, BC=length. Out: CF=1 if it cannot fit.
+QUEUE_TCP_DATA
+	LD	(QUEUE_CH),A
+	LD	(QUEUE_SRC),HL
+	LD	(QUEUE_LEN),BC
+	LD	A,B
+	OR	C
+	RET	Z
+	LD	HL,(QUEUE_LEN)
+	LD	DE,@MAIN.CH_PEND_SIZE + 1
+	OR	A
+	SBC	HL,DE
+	JR	NC,.full
+	LD	A,(QUEUE_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	JR	NZ,.full		; one deferred MSS per channel
+	LD	A,(QUEUE_CH)
+	CALL	PEND_BUF_ADDR_A
+	EX	DE,HL			; DE = destination
+	LD	HL,(QUEUE_SRC)
+	LD	BC,(QUEUE_LEN)
+	LDIR
+	LD	A,(QUEUE_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	BC,(QUEUE_LEN)
+	LD	(HL),C
+	INC	HL
+	LD	(HL),B
+	OR	A
+	RET
+.full
+	LD	A,(QUEUE_CH)
+	CALL	LOST_ADDR_A
+	LD	(HL),1
+	SCF
+	RET
+
+; TCP.SEND may receive and ACK peer payload while it waits for the cumulative
+; ACK.  Move that payload out of the shared frame buffer before another chunk
+; or channel operation overwrites it.
+CAPTURE_SEND_PENDING
+	LD	A,(TCP_ACK_WAIT_STATE)
+	CP	2			; ACK_WAIT_RX_PENDING
+	RET	NZ
+	LD	HL,(TCP_RX_DATA_PTR)
+	LD	BC,(TCP_RX_DATA_LEN)
+	LD	A,(ARG_CH)
+	CALL	QUEUE_TCP_DATA
+	XOR	A
+	LD	(TCP_ACK_WAIT_STATE),A
+	RET
+
+; Check whether the peeked TCP payload fits the owner's pending queue.
+; In: A=owner. Out: CF=0 fits, CF=1 would overflow/malformed.
+FOREIGN_TCP_FITS
+	LD	(QUEUE_CH),A
+	CALL	PEND_LEN_ADDR_A
+	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	JR	NZ,.no
+	LD	A,(@MAIN.RX_BUF + 14 + 2)
+	LD	H,A
+	LD	A,(@MAIN.RX_BUF + 14 + 3)
+	LD	L,A
+	LD	DE,20
+	OR	A
+	SBC	HL,DE
+	JR	C,.no
+	LD	A,(@MAIN.RX_BUF + 14 + 20 + 12)
+	AND	0xF0
+	RRCA
+	RRCA
+	LD	E,A
+	LD	D,0
+	OR	A
+	SBC	HL,DE			; HL = payload length
+	JR	C,.no
+	LD	DE,@MAIN.CH_PEND_SIZE + 1
+	OR	A
+	SBC	HL,DE
+	CCF				; carry when total <= CH_PEND_SIZE
+	RET
+.no
+	SCF
+	RET
+
+; Called by tcp_lib/udp_lib after a peeked frame did not match the selected
+; context.  A foreign TCP frame is processed recursively under its owner's
+; saved context, ACKed, and queued.  Other foreign frames remain protected by
+; BNRY and make the outer RECV return XCHAN.
+; In: A=1 TCP caller, A=2 UDP caller.
+; Out: CF=0 not ours; CF=1/A=0 consumed, CF=1/A=1 leave queued in NIC.
+HANDLE_FOREIGN_FRAME
+	LD	A,(FOREIGN_BUSY)
+	OR	A
+	JP	NZ,.blocked
+	LD	A,(ACTIVE_CH)
+	CP	UNET_CHANNELS
+	JP	NC,.not_ours
+	LD	(FOREIGN_ORIG),A
+	XOR	1
+	LD	(FOREIGN_OWNER),A
+	CALL	GET_CH_STATE_A
+	AND	A
+	JP	Z,.not_ours
+	LD	(FOREIGN_PROTO),A	; owner protocol
+	LD	A,(FOREIGN_OWNER)
+	CALL	SELECT_CHANNEL
+	LD	A,(FOREIGN_PROTO)
+	CP	1
+	JR	NZ,.check_udp
+	CALL	@TCP.IS_TCP_FROM_PEER
+	JR	NC,.restore_not_ours
+	LD	A,(FOREIGN_OWNER)
+	CALL	FOREIGN_TCP_FITS
+	JR	C,.restore_blocked
+	LD	A,1
+	LD	(FOREIGN_BUSY),A
+	LD	HL,1
+	LD	(@TCP.RECV_TIMEOUT),HL
+	CALL	@TCP.RECV
+	JR	NC,.tcp_data
+	LD	A,(TCP_STATE)
+	CP	@TCP.ST_CLOSE_WAIT
+	JR	Z,.tcp_fin
+	LD	A,(TCP_LAST_FAIL)
+	CP	@TCP.F_RST
+	JR	NZ,.tcp_done		; timeout/F_OTHER after a consumed pure ACK
+	LD	A,(FOREIGN_OWNER)
+	CALL	CH_STATE_ADDR_A
+	LD	(HL),0
+	JR	.tcp_done
+.tcp_fin
+	LD	A,(FOREIGN_OWNER)
+	CALL	CLOSED_ADDR_A
+	LD	(HL),1
+	LD	HL,(TCP_RX_DATA_PTR)
+	LD	BC,(TCP_RX_DATA_LEN)
+.tcp_data
+	LD	A,(FOREIGN_OWNER)
+	CALL	QUEUE_TCP_DATA
+.tcp_done
+	XOR	A
+	LD	(FOREIGN_BUSY),A
+	LD	A,0xFF
+	LD	(FOREIGN_HINT),A
+	LD	A,(FOREIGN_ORIG)
+	CALL	SELECT_CHANNEL
+	XOR	A
+	SCF
+	RET
+.check_udp
+	CALL	@UDP.MATCH
+	JR	C,.restore_not_ours
+	; A UDP datagram remains in the NIC ring.  RECV can switch channels and
+	; deliver it without a fixed-size software defer buffer.
+.restore_blocked
+	LD	A,(FOREIGN_OWNER)
+	LD	(FOREIGN_HINT),A
+	LD	A,(FOREIGN_ORIG)
+	CALL	SELECT_CHANNEL
+.blocked
+	LD	A,1
+	SCF
+	RET
+.restore_not_ours
+	LD	A,(FOREIGN_ORIG)
+	CALL	SELECT_CHANNEL
+.not_ours
+	OR	A
+	RET
+
+; Forget both contexts and their receive queues.  Used after NETINIT has
+; closed the old links and reinitialised the card.
+RESET_CHANNEL_STATE
+	XOR	A
+	LD	(CH_STATE),A
+	LD	(CH_STATE+1),A
+	LD	HL,TCP_STATE
+	LD	(HL),A
+	LD	DE,TCP_STATE+1
+	LD	BC,0x0DC7		; TCP BSS .. end of DLL BSS, minus first byte
+	LDIR
+	DEC	A			; 0xFF = no live context selected
+	LD	(ACTIVE_CH),A
+	LD	(FOREIGN_HINT),A
+	RET
+
+; Close one selected channel.  Idempotent; pending bytes are discarded.
+CLOSE_CHANNEL
+	CALL	GET_CH_STATE
+	AND	A
+	JR	Z,.clear
+	LD	A,(ARG_CH)
+	CALL	SELECT_CHANNEL
+	CALL	GET_CH_STATE
 	CP	2
 	JR	Z,.udp
 	CALL	@ISA.ISA_OPEN
 	CALL	@TCP.CLOSE
 	CALL	@ISA.ISA_CLOSE
-	JR	.done
+	JR	.clear
 .udp
 	CALL	@UDP.CLOSE
-.done
+.clear
 	XOR	A
-	LD	(CH_STATE),A
-	LD	(PEND_LEN),A
-	LD	(PEND_LEN+1),A
-	LD	(CLOSED_PEND),A
+	CALL	SET_CH_STATE
+	LD	A,(ARG_CH)
+	CALL	PEND_CLEAR_A
+	RET
+
+; Close every channel; leave the NIC initialised.
+CLOSE_LINK
+	LD	A,(ARG_CH)
+	PUSH	AF
+	XOR	A
+	LD	(ARG_CH),A
+	CALL	CLOSE_CHANNEL
+	LD	A,1
+	LD	(ARG_CH),A
+	CALL	CLOSE_CHANNEL
+	POP	AF
+	LD	(ARG_CH),A
 	RET
 
 ; ------------------------------------------------------
@@ -1253,7 +1800,9 @@ MAP_TCP_SEND_FAIL
 	JP	RET_A
 .closed
 	XOR	A
-	LD	(CH_STATE),A
+	CALL	SET_CH_STATE
+	LD	A,(ARG_CH)
+	CALL	PEND_CLEAR_A
 	LD	A,NERR_CLOSED
 	JP	RET_A
 .hw
@@ -1619,11 +2168,12 @@ S_ST_PING	DB "PING",0
 ; ======================================================
 WIN_BASE	DB 0			; top 2 bits of our load address
 INITED		DB 0			; NETINIT completed
-CH_STATE	DB 0			; 0 closed, 1 TCP, 2 UDP
+CH_STATE	DB 0,0			; per channel: 0 closed, 1 TCP, 2 UDP
+ACTIVE_CH	DB 0xFF			; context currently mapped into tcp/udp BSS
+ARG_CH		DB 0			; channel argument of the call in progress
 CANCEL_MODE	DB 0			; SETOPT CANCELKEYS
 STAGE		DB 0			; ST_* of the last operation
 LAST_NERR	DB 0			; last status returned
-CLOSED_PEND	DB 0			; FIN seen; report it on the next RECV
 ARG_A		DB 0
 ARG_DE		DW 0
 ARG_IX		DW 0
@@ -1633,8 +2183,15 @@ ARG_LPORT	DW 0
 SEND_DONE	DW 0
 CHUNK_LEN	DW 0
 COPY_LEN	DW 0
-PEND_PTR	DW 0			; unread tail inside RX_BUF
-PEND_LEN	DW 0
+RECV_FLAGS	DW 0
+FOREIGN_BUSY	DB 0
+FOREIGN_ORIG	DB 0
+FOREIGN_OWNER	DB 0
+FOREIGN_PROTO	DB 0
+FOREIGN_HINT	DB 0xFF			; channel owning the current NIC ring head
+QUEUE_CH	DB 0
+QUEUE_SRC	DW 0
+QUEUE_LEN	DW 0
 TARGET_IP	DS 4, 0
 TARGET_MAC	DS 6, 0
 DIAG_REGS	DS 10, 0		; CR ISR DCR RCR TCR IMR PSTART PSTOP BNRY CURR
@@ -1661,7 +2218,7 @@ LASTERR_BUF	EQU DLL_BSS + BSS_LASTERR
 	INCLUDE "udp_lib.asm"
 	INCLUDE "icmp_lib.asm"
 
-; The whole image (code + relocation bitmap) must fit 16 KiB.  The
-; bitmap is one bit per code byte, so guard the code at 0x3800:
-; 0x3800 + 0x3800/8 = 0x3F00 < 0x4000.
-	ASSERT $ <= 0x3800
+; The whole L1 image is a 32-byte header, this code image, and one
+; relocation bit per code byte.  0x38C7 is the exact largest code image
+; for which 32 + size + ceil(size/8) still fits libman's 16 KiB window.
+	ASSERT $ <= DLL_IMAGE_ORIGIN + 0x38C7

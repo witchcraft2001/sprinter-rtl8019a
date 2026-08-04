@@ -568,10 +568,14 @@ WAIT_ARP
 	JR	Z,.TICK
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
+	IFDEF UNET_DLL
+	LD	BC,@MAIN.RX_BUF_SIZE
+	ELSE
 	LD	BC,1518			; @MAIN.RX_BUF_SIZE is documented but the
 					; apps define RX_BUF_SIZE outside MODULE MAIN,
 					; so it is not referenceable here.  All callers
 					; (apps and the UNET DLL) size RX_BUF at 1518.
+	ENDIF
 	CALL	@RTL.READ_PACKET
 	JR	C,.MISS
 	LD	A,(@MAIN.RX_BUF + 12)
@@ -653,10 +657,14 @@ WAIT_DNS
 	JP	Z,.TICK
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
+	IFDEF UNET_DLL
+	LD	BC,@MAIN.RX_BUF_SIZE
+	ELSE
 	LD	BC,1518			; @MAIN.RX_BUF_SIZE is documented but the
 					; apps define RX_BUF_SIZE outside MODULE MAIN,
 					; so it is not referenceable here.  All callers
 					; (apps and the UNET DLL) size RX_BUF at 1518.
+	ENDIF
 	CALL	@RTL.READ_PACKET
 	JP	C,.MISS
 	LD	A,(@MAIN.RX_BUF + 12)

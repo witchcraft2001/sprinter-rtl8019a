@@ -71,16 +71,16 @@ test `A`, never `CF`.
 
 ## What this backend supports
 
-`GETCAPS` reports `0x000F` = `TCP | UDP | RESOLVE | PING`, ABI
+`GETCAPS` reports `0x001F` = `TCP | UDP | RESOLVE | PING | MULTICHAN`, ABI
 `0x0100`.
 
 | Capability | State | Note |
 |------------|-------|------|
-| `TCP`      | yes   | one channel; `SEND` chunks at the 536-byte MSS |
+| `TCP`      | yes   | channels 0 and 1; `SEND` chunks at the 536-byte MSS |
 | `UDP`      | yes   | connected UDP, payload capped at 1024 bytes |
 | `RESOLVE`  | yes   | software DNS; never returns `NERR_NOTSUP` |
 | `PING`     | yes   | software ICMP echo |
-| `MULTICHAN`| no    | v1 accepts channel 0 only |
+| `MULTICHAN`| yes   | channels 0 and 1 may be open simultaneously |
 | `LISTEN`   | no    | client only |
 | `RAWETH`   | no    | no raw-frame entry point in the current ABI |
 | `RXFLOW`   | no    | the card buffers receive in its own ring |
@@ -138,8 +138,9 @@ wait per attempt.  Exhaustion returns `NERR_SEND`; `DE` still reports the
 bytes confirmed before the failing chunk.
 
 A payload-bearing ACK is not discarded while `SEND` waits.  Its payload
-is retained in the DLL receive buffer and returned by the next `RECV`.
-The consumer must drain that pending data before another `SEND`.
+is retained in that channel's 536-byte receive queue and returned by the
+next `RECV`.  The consumer must drain pending data before another `SEND` on
+the same channel.
 
 This remains a deliberately small TCP client, not a general TCP engine:
 there is one outstanding segment, no congestion window or fast retransmit,
@@ -150,6 +151,32 @@ the reliable path is enabled for `UNETRTL.DLL`.
 `RECV` also treats `IY=0` consistently for TCP and UDP: it polls the NIC
 once and returns idle instead of letting the UDP timeout counter wrap to
 approximately 65 seconds.
+
+## Two channels
+
+Channel arguments 0 and 1 have independent TCP/UDP tuples, sequence state,
+timeouts, close state and pending TCP data.  When a frame for the other TCP
+channel reaches the head of the RTL receive ring, the DLL processes and ACKs
+it under that channel's context, then queues its payload before continuing the
+original wait.  A foreign UDP datagram remains protected at the ring head
+until its owner is read.  `STATUS` reports `UNET_ST_RXPEND`, and `RECV` flag
+bit 3 reports `UNET_RXF_XCHAN`, when the other channel needs service.
+
+There is one deferred TCP segment per channel, up to the 536-byte MSS.
+Applications should follow the normal UNET rule: service `RXPEND`/`XCHAN`
+promptly and do not issue more work on a channel whose receive queue is
+already pending.
+
+Developer test:
+
+```
+python3 tools/dev/dual_server.py --control-port 9099 --data-port 9100
+UNETTEST -2 9100 192.168.7.1 9099
+```
+
+The test holds both TCP channels open, streams a counter on channel 1, injects
+a control reply on channel 0 during the stream, checks continuity, and verifies
+that the control reply survived as pending data.
 
 ## Interrupt and window state on return
 
@@ -165,4 +192,4 @@ the release archive and the floppy image, so a consumer can take the
 ready-built file without installing the assembler or libman.  Its L1
 header records the ABI line in the numeric version field and the full
 package revision in the 15-byte text tag, for example
-`UNETRTL v0.2.20`.
+`UNETRTL v0.2.39`.

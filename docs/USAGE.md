@@ -28,7 +28,7 @@ the same layout: usage syntax, options, examples, exit codes.
 | `TELNET.TXT`  | ANSI/VT100 Telnet client with Zmodem/Ymodem          |
 | `TFTP.TXT`    | TFTP download with RFC 2348 blksize                  |
 | `ISAPROBE.TXT`| ISA bus troubleshooting and raw window inspection    |
-| `UNETRTL.TXT` | UNET network DLL: TCP/UDP/DNS/ping for your own code |
+| `UNETRTL.TXT` | UNET DLL: TCP/UDP/DNS/ping, two channels, developer API |
 
 `UNETRTL.DLL` is for developers: it exposes the kit's network stack
 to your own DSS programs through the same numbered API the Sprinter
