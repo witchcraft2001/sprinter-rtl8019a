@@ -92,7 +92,7 @@ which card it got.  None of them changes the calling convention.
 
 - **`RXPAUSE` / `RXRESUME` are no-ops** and always return
   `NERR_OK`, including before `NETINIT`.  The card buffers receive
-  in its own ~14.5 KB ring, so there is no flow-control state to get
+  in its own ~6.4 KB byte-mode ring, so there is no flow-control state to get
   wrong.  `CAP_RXFLOW` is clear, so a consumer that checks
   capabilities skips them anyway.
 - **`SETOPT RXTRIG` returns `NERR_NOTSUP`.**  It selects a 16550
@@ -128,18 +128,28 @@ which card it got.  None of them changes the calling convention.
   values are captured at the moment of failure, so `LASTERR` never
   reports a chip that has since recovered.
 
-## Known limitation: multi-segment SEND is best-effort
+## Bounded TCP retransmission
 
-The TCP layer has **no retransmit timer**, and `SEND` does not wait
-for an acknowledgement.  Payloads longer than the 536-byte MSS are
-split and sent back to back; if a segment is lost, it is lost.  In
-practice the kit's own utilities send short requests (an HTTP GET,
-an FTP command), which is the tested path.
+`UNETRTL.DLL` splits TCP payloads at the 536-byte MSS and sends them
+stop-and-wait: each segment must receive its cumulative ACK before the
+next segment is sent.  A missing data segment or ACK is retried with the
+same TCP sequence number, up to four transmissions with a one-second ACK
+wait per attempt.  Exhaustion returns `NERR_SEND`; `DE` still reports the
+bytes confirmed before the failing chunk.
 
-If your consumer sends bulk data, keep individual `SEND` calls at or
-below one MSS and drive your own acknowledgement at the application
-protocol level.  This is a genuine capability difference from the
-ESP backend, where the firmware owns retransmission.
+A payload-bearing ACK is not discarded while `SEND` waits.  Its payload
+is retained in the DLL receive buffer and returned by the next `RECV`.
+The consumer must drain that pending data before another `SEND`.
+
+This remains a deliberately small TCP client, not a general TCP engine:
+there is one outstanding segment, no congestion window or fast retransmit,
+and close is still best-effort.  Stand-alone utilities compile the compact
+legacy send path unless they explicitly define `USE_TCP_RELIABLE_SEND`;
+the reliable path is enabled for `UNETRTL.DLL`.
+
+`RECV` also treats `IY=0` consistently for TCP and UDP: it polls the NIC
+once and returns idle instead of letting the UDP timeout counter wrap to
+approximately 65 seconds.
 
 ## Interrupt and window state on return
 

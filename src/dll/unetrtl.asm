@@ -87,6 +87,7 @@
 	DEFINE	USE_DNS
 	DEFINE	USE_RESOLVE
 	DEFINE	USE_TCP
+	DEFINE	USE_TCP_RELIABLE_SEND	; bounded per-MSS ACK wait + retransmit
 	DEFINE	USE_UDP
 	DEFINE	USE_ICMP
 	DEFINE	USE_UTIL_FORMAT
@@ -101,7 +102,7 @@
 	INCLUDE "unet.inc"
 
 ; Capability mask.  RXFLOW is CLEAR: the card buffers receive in its
-; ~14.5 KB ring, so RXPAUSE/RXRESUME are genuine no-ops here (unlike
+; ~6.4 KB byte-mode ring, so RXPAUSE/RXRESUME are genuine no-ops here (unlike
 ; the ESP backend, where the consumer must honour them).
 ; MULTICHAN/LISTEN/TRANSPARENT are v1 gaps.  RAWETH stays clear even
 ; though the card can do it: slots 0..17 have no raw-frame entry
@@ -155,22 +156,22 @@ LASTERR_SIZE	EQU 128
 ; EQU chains for mkdll's two-pass byte diff to trip over.
 ;
 ; Offsets are literals on purpose (see the layout notes above).  The
-; region sizes come from memmap.inc: LIBBSS_SIZE 0x173, resolve 0x29,
-; tcp 0x26, udp 0x18, icmp 0x10.
+; region sizes come from memmap.inc: LIBBSS_SIZE 0x176, resolve 0x29,
+; tcp 0x32, udp 0x18, icmp 0x10.
 ; ======================================================
-BSS_LIB		EQU 0x0000		; 0x173 util + rtl + netenv + rtl tx
-BSS_RESOLVE	EQU 0x0173		; 0x029 resolve_lib
-BSS_TCP		EQU 0x019C		; 0x026 tcp_lib
-BSS_UDP		EQU 0x01C2		; 0x018 udp_lib
-BSS_ICMP	EQU 0x01DA		; 0x010 icmp_lib
-BSS_OUR_IP	EQU 0x01EA		; 4
-BSS_OUR_MAC	EQU 0x01EE		; 6
-BSS_CANCELLED	EQU 0x01F4		; 1
-BSS_LASTERR	EQU 0x01F8		; 0x080 formatted diagnostic line
-BSS_TX_BUF	EQU 0x0278		; 0x42A 1066 = 14+20+8+1024 (UDP cap)
-BSS_RX_HDR	EQU 0x06A2		; 4     NE2000 RX ring header
-BSS_RX_BUF	EQU 0x06A6		; 0x5EE 1518 = max Ethernet frame
-DLL_BSS_SIZE	EQU 0x0C94		; 3220 total
+BSS_LIB		EQU 0x0000		; 0x176 util + rtl + netenv + rtl tx
+BSS_RESOLVE	EQU 0x0176		; 0x029 resolve_lib
+BSS_TCP		EQU 0x019F		; 0x032 tcp_lib
+BSS_UDP		EQU 0x01D1		; 0x018 udp_lib
+BSS_ICMP	EQU 0x01E9		; 0x010 icmp_lib
+BSS_OUR_IP	EQU 0x01F9		; 4
+BSS_OUR_MAC	EQU 0x01FD		; 6
+BSS_CANCELLED	EQU 0x0203		; 1
+BSS_LASTERR	EQU 0x0208		; 0x080 formatted diagnostic line
+BSS_TX_BUF	EQU 0x0288		; 0x42A 1066 = 14+20+8+1024 (UDP cap)
+BSS_RX_HDR	EQU 0x06B2		; 4     NE2000 RX ring header
+BSS_RX_BUF	EQU 0x06B6		; 0x5EE 1518 = max Ethernet frame
+DLL_BSS_SIZE	EQU 0x0CA4		; 3236 total
 
 DLL_BSS
 	DS	DLL_BSS_SIZE, 0
@@ -484,7 +485,7 @@ F_SEND
 .fail
 	CALL	CAPTURE_DIAG
 	CALL	@ISA.ISA_CLOSE
-	CALL	MAP_TCP_FAIL			; A = NERR_*, CF=0
+	CALL	MAP_TCP_SEND_FAIL		; A = NERR_*, CF=0
 	LD	DE,(SEND_DONE)
 	RET
 .udp
@@ -685,6 +686,15 @@ F_RECV
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	LD	DE,(ARG_IY)
+	; UNET defines IY=0 as a non-blocking poll.  udp_lib uses a
+	; decrementing 16-bit budget, where zero would underflow to
+	; 0xFFFF and wait about 65 seconds.  Match the TCP adapter:
+	; inspect the ring once, then expire on its first 1 ms tick.
+	LD	A,D
+	OR	E
+	JR	NZ,.udp_have_to
+	INC	DE
+.udp_have_to
 	CALL	@UDP.RECV
 	JR	C,.udp_err
 	CALL	@ISA.ISA_CLOSE
@@ -1215,6 +1225,36 @@ MAP_TCP_FAIL
 	CP	@TCP.F_SEND
 	JR	Z,.hw
 	LD	A,NERR_CONNECT
+	JP	RET_A
+.hw
+	LD	A,NERR_HW
+	JP	RET_A
+.cancel
+	XOR	A
+	LD	(@MAIN.CANCELLED),A
+	LD	A,NERR_CANCEL
+	JP	RET_A
+
+; ------------------------------------------------------
+; MAP_TCP_SEND_FAIL: SEND has one additional failure class:
+; the NIC transmitted locally, but the cumulative peer ACK did not
+; arrive after the bounded retransmits.  Report that as NERR_SEND,
+; while retaining the hardware/cancel distinctions above.
+; ------------------------------------------------------
+MAP_TCP_SEND_FAIL
+	LD	A,(TCP_LAST_FAIL)
+	CP	@TCP.F_CANCEL
+	JR	Z,.cancel
+	CP	@TCP.F_SEND
+	JR	Z,.hw
+	CP	@TCP.F_RST
+	JR	Z,.closed
+	LD	A,NERR_SEND
+	JP	RET_A
+.closed
+	XOR	A
+	LD	(CH_STATE),A
+	LD	A,NERR_CLOSED
 	JP	RET_A
 .hw
 	LD	A,NERR_HW

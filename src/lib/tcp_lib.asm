@@ -4,7 +4,9 @@
 ; Scope:
 ;   * TCP.OPEN  -- send SYN, wait SYN+ACK, send ACK, set
 ;                  state to ESTABLISHED.
-;   * TCP.SEND  -- one PSH+ACK segment (1..MSS bytes).
+;   * TCP.SEND  -- one PSH+ACK segment (1..MSS bytes); with
+;                  USE_TCP_RELIABLE_SEND, wait cumulative ACK
+;                  and retransmit on timeout.
 ;   * TCP.RECV  -- poll for payload/FIN/RST, delayed ACKs.
 ;   * TCP.CLOSE -- send FIN+ACK, no post-FIN drain.
 ;   * TCP.SAVE_CTX / RESTORE_CTX -- swap the single session
@@ -18,7 +20,8 @@
 ;   - sequence numbers stored big-endian on disk to match
 ;     the wire format; arithmetic is done by reading bytes
 ;     manually (no native 32-bit ops on Z80).
-;   - no retransmit timer; per-call overall timeout in ms.
+;   - optional bounded stop-and-wait retransmit for outbound data;
+;     receive waits retain their per-call overall timeout in ms.
 ;   - caller ARPs the next hop and writes the MAC into
 ;     TCP_REMOTE_MAC before TCP.OPEN.
 ;
@@ -69,6 +72,19 @@
 ; self-heals instead of failing the run.
 SYN_ATTEMPTS		EQU 3
 SYN_TIMEOUT_MS		EQU 1700
+
+; USE_TCP_RELIABLE_SEND uses a deliberately small stop-and-wait sender: one
+; MSS segment is outstanding at a time, with a bounded cumulative-ACK
+; wait.  Four one-second attempts cover a lost data segment and a lost
+; ACK without introducing an unbounded wait into SEND.  The original
+; caller buffer remains valid for the whole synchronous call, so every
+; retry can rebuild the exact segment without a second 536-byte buffer.
+SEND_ATTEMPTS		EQU 4
+SEND_ACK_TIMEOUT_MS	EQU 1000
+
+ACK_WAIT_IDLE		EQU 0
+ACK_WAIT_ACTIVE		EQU 1
+ACK_WAIT_RX_PENDING	EQU 2
 
 ; Receive window advertised in every outgoing SYN/ACK/DATA segment.
 ; Must fit the chip's RX ring: with the 8-bit-mode ring (PSTART
@@ -167,6 +183,9 @@ OPEN
 	XOR	A
 	LD	(TCP_LAST_FAIL),A
 	LD	(RECV_UNACKED),A
+	IFDEF USE_TCP_RELIABLE_SEND
+	LD	(TCP_ACK_WAIT_STATE),A
+	ENDIF
 	LD	A,SYN_ATTEMPTS
 	LD	(.TRIES),A
 .ATTEMPT
@@ -887,34 +906,187 @@ ADD32_BE_BC
 
 
 ; ------------------------------------------------------
-; SEND: send caller's data as one PSH+ACK segment.  No
-; ACK-wait at this layer; the next RECV/CLOSE will pick
-; up the ACK and update SND_UNA.
+; SEND: send caller's data as one PSH+ACK segment, wait for
+; its cumulative ACK, and retransmit the same sequence on a
+; bounded timeout.  Only one segment is outstanding at once.
+;
+; If peer data is piggybacked on the ACK, RECV processes and
+; acknowledges it here, then ACK_WAIT_RX_PENDING makes the next
+; public RECV return that same RX_BUF payload without touching the
+; NIC.  A caller must drain such pending data before another SEND.
 ;   In:  HL = data ptr, BC = length (1..MSS=536).
 ;   Out: CF=0 ok; CF=1 fail.
 ; ------------------------------------------------------
 SEND
 	LD	(.SAVE_LEN),BC
 	LD	(.SAVE_DATA),HL
-	; Build the segment.
+	IFDEF USE_TCP_RELIABLE_SEND
+	; RX_BUF already holds data captured by the preceding SEND.  Reading
+	; more ACKs would overwrite it, so make the caller drain RECV first.
+	LD	A,(TCP_ACK_WAIT_STATE)
+	CP	ACK_WAIT_RX_PENDING
+	JR	NZ,.READY
+	LD	A,F_BAD_SEG
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.READY
+	; Save the first sequence and calculate the cumulative ACK target.
+	LD	HL,TCP_SND_NXT
+	LD	DE,TCP_SEND_SEQ
+	LD	BC,4
+	LDIR
+	LD	HL,TCP_SEND_SEQ
+	LD	DE,TCP_ACK_WAIT_TARGET
+	LD	BC,4
+	LDIR
+	LD	BC,(.SAVE_LEN)
+	LD	DE,TCP_ACK_WAIT_TARGET
+	CALL	ADD32_BE_BC
+	LD	A,SEND_ATTEMPTS
+	LD	(TCP_SEND_RETRY_LEFT),A
+.TRY
+	; BUILD_DATA reads TCP_SND_NXT.  Put the original sequence there
+	; for the build, then restore the post-segment value before the
+	; frame goes on the wire.  Every retry therefore carries the same
+	; sequence number and is safely de-duplicated by the peer.
+	CALL	.RESTORE_SEQ
 	CALL	BUILD_DATA
+	CALL	.RESTORE_TARGET
 	LD	HL,@MAIN.TX_BUF
 	LD	BC,(TCP_TX_LEN)
 	CALL	@RTL.SEND_FRAME
-	JR	NC,.OK
+	JR	NC,.WAIT_ACK
+	CALL	.RESTORE_SEQ
+	XOR	A
+	LD	(TCP_ACK_WAIT_STATE),A
 	LD	A,F_SEND
 	LD	(TCP_LAST_FAIL),A
 	SCF
 	RET
-.OK
-	; Advance SND_NXT by data length.
+.WAIT_ACK
+	LD	A,ACK_WAIT_ACTIVE
+	LD	(TCP_ACK_WAIT_STATE),A
+	LD	HL,SEND_ACK_TIMEOUT_MS
+	LD	(RECV_TIMEOUT),HL
+	CALL	RECV
+	JR	C,.WAIT_FAIL
+	; A pure ACK returns BC=0.  Payload piggybacked on the ACK is
+	; already published through TCP_RX_DATA_PTR/LEN by RECV.
+	CALL	ACK_TARGET_MATCH
+	JR	NZ,.UNACKED_DATA
+	LD	A,B
+	OR	C
+	LD	A,ACK_WAIT_IDLE
+	JR	Z,.SET_WAIT_STATE
+	LD	A,ACK_WAIT_RX_PENDING
+.SET_WAIT_STATE
+	LD	(TCP_ACK_WAIT_STATE),A
+	XOR	A
+	LD	(TCP_LAST_FAIL),A
+	OR	A
+	RET
+.WAIT_FAIL
+	XOR	A
+	LD	(TCP_ACK_WAIT_STATE),A
+	LD	A,(TCP_LAST_FAIL)
+	CP	F_TIMEOUT
+	JR	NZ,.FATAL
+	LD	A,(TCP_SEND_RETRY_LEFT)
+	DEC	A
+	LD	(TCP_SEND_RETRY_LEFT),A
+	JR	NZ,.TRY
+	; Keep SND_NXT and SND_UNA at the first unacknowledged byte on
+	; failure.  A caller that elects to
+	; retry the same application write will therefore fill the same
+	; TCP sequence hole rather than creating an unrecoverable new one.
+	CALL	.RESTORE_SEQ
+	LD	A,F_TIMEOUT
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.FATAL
+	; RST/cancel/ACK-transmit failures terminate the attempt.  Restore
+	; the unacknowledged sequence for a consistent local state.
+	CALL	.RESTORE_SEQ
+	SCF
+	RET
+.UNACKED_DATA
+	; Full-duplex peer data with an ACK below our target is retained,
+	; but RX_BUF cannot be reused for a further ACK wait until the caller
+	; drains it.  Report a bounded protocol failure instead of silently
+	; overwriting the peer data or claiming this send was acknowledged.
+	LD	A,ACK_WAIT_RX_PENDING
+	LD	(TCP_ACK_WAIT_STATE),A
+	CALL	.RESTORE_SEQ
+	LD	A,F_BAD_SEG
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.RESTORE_SEQ
+	LD	HL,TCP_SEND_SEQ
+	LD	DE,TCP_SND_NXT
+	LD	BC,4
+	LDIR
+	LD	HL,TCP_SEND_SEQ
+	LD	DE,TCP_SND_UNA
+	LD	BC,4
+	LDIR
+	RET
+.RESTORE_TARGET
+	LD	HL,TCP_ACK_WAIT_TARGET
+	LD	DE,TCP_SND_NXT
+	LD	BC,4
+	LDIR
+	RET
+	ELSE
+	; Compact legacy path for size-constrained stand-alone clients.
+	; UNETRTL defines USE_TCP_RELIABLE_SEND and does not use this path.
+	CALL	BUILD_DATA
+	LD	HL,@MAIN.TX_BUF
+	LD	BC,(TCP_TX_LEN)
+	CALL	@RTL.SEND_FRAME
+	JR	NC,.BEST_EFFORT_OK
+	LD	A,F_SEND
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.BEST_EFFORT_OK
 	LD	BC,(.SAVE_LEN)
 	LD	DE,TCP_SND_NXT
 	CALL	ADD32_BE_BC
 	OR	A
 	RET
+	ENDIF
 .SAVE_LEN	DW 0
 .SAVE_DATA	DW 0
+
+
+	IFDEF USE_TCP_RELIABLE_SEND
+; ------------------------------------------------------
+; ACK_TARGET_MATCH: ZF=1 when SND_UNA reached the target of
+; the active SEND.  Preserves all registers and CF is irrelevant.
+; ------------------------------------------------------
+ACK_TARGET_MATCH
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	LD	HL,TCP_SND_UNA
+	LD	DE,TCP_ACK_WAIT_TARGET
+	LD	B,4
+.LP
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.DONE
+	INC	DE
+	INC	HL
+	DJNZ	.LP
+.DONE
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -930,6 +1102,22 @@ SEND
 ;        CF=1 + LAST_FAIL set: error / timeout / RST.
 ; ------------------------------------------------------
 RECV
+	IFDEF USE_TCP_RELIABLE_SEND
+	; SEND may have consumed a payload-bearing ACK while waiting for
+	; its own cumulative ACK.  Deliver that payload exactly once before
+	; reading another NIC frame, otherwise RX_BUF would be overwritten.
+	LD	A,(TCP_ACK_WAIT_STATE)
+	CP	ACK_WAIT_RX_PENDING
+	JR	NZ,.START_WAIT
+	XOR	A
+	LD	(TCP_ACK_WAIT_STATE),A
+	LD	(TCP_LAST_FAIL),A
+	LD	HL,(TCP_RX_DATA_PTR)
+	LD	BC,(TCP_RX_DATA_LEN)
+	OR	A
+	RET
+.START_WAIT
+	ENDIF
 	; Initial budget: caller's RECV_TIMEOUT (set via the public
 	; knob) or the 30 000 ms default if the caller didn't touch
 	; it.  After consuming the budget we re-arm the default so
@@ -1103,10 +1291,29 @@ RECV
 	LD	A,(TCP_STATE)
 	CP	ST_CLOSE_WAIT
 	JR	Z,.PEER_FIN
+	IFDEF USE_TCP_RELIABLE_SEND
+	; Internal SEND wait: a pure cumulative ACK is a successful
+	; zero-length return to SEND instead of an idle RECV timeout.
+	LD	A,(TCP_ACK_WAIT_STATE)
+	CP	ACK_WAIT_ACTIVE
+	JR	NZ,.NORMAL_RETURN
+	CALL	ACK_TARGET_MATCH
+	JR	NZ,.NORMAL_RETURN
+	LD	HL,(TCP_RX_DATA_LEN)
+	LD	A,H
+	OR	L
+	JR	NZ,.RETURN_DATA
+	LD	HL,0
+	LD	BC,0
+	OR	A
+	RET
+.NORMAL_RETURN
+	ENDIF
 	LD	HL,(TCP_RX_DATA_LEN)
 	LD	A,H
 	OR	L
 	JP	Z,.TICK			; pure ACK -- back to wait
+.RETURN_DATA
 	LD	HL,(TCP_RX_DATA_PTR)
 	LD	BC,(TCP_RX_DATA_LEN)
 	OR	A
@@ -1219,6 +1426,10 @@ RECV_TIMEOUT	DW 0
 ;   Out: CF=0 cleanly closed; CF=1 on send/timeout error.
 ; ------------------------------------------------------
 CLOSE
+	IFDEF USE_TCP_RELIABLE_SEND
+	XOR	A
+	LD	(TCP_ACK_WAIT_STATE),A
+	ENDIF
 	LD	A,(TCP_STATE)
 	CP	ST_CLOSED
 	JR	NZ,.NEED_CLOSE

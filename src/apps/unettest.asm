@@ -652,6 +652,20 @@ UDP_PHASE
 	OR	A
 	JP	NZ,ERR_UDPOPEN
 
+	; --- Zero-timeout regression: this is a poll, not a 16-bit
+	;     countdown wrap.  A stale matching datagram is harmless; the
+	;     acceptance condition here is simply a successful quick return. ---
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,0
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL
+	OR	A
+	JR	NZ,.err
+	LD	HL,MSG_UDP_POLL0
+	CALL	PUTS_LN
+
 	; --- SEND the probe payload straight from the image ---
 	XOR	A				; channel 0
 	LD	DE,UDP_PAYLOAD
@@ -1172,6 +1186,7 @@ MSG_ERR_CONNECT	DB "Connect failed.",0
 MSG_ERR_SEND	DB "Send failed.",0
 MSG_ERR_UDPOPEN	DB "UDPOPEN failed.",0
 MSG_UDP		DB "udp ",0
+MSG_UDP_POLL0	DB "udp poll0 ok",0
 MSG_UDP_REPLY	DB "udp reply: len=",0
 MSG_UDP_DATA	DB " data=",0
 MSG_UDP_TRUNC	DB "(datagram truncated to the receive buffer)",0

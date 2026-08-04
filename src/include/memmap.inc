@@ -234,12 +234,25 @@ TCP_RX_DATA_LEN		EQU TCP_BSS_BASE + 0x24	; 2 bytes (data byte count)
 ; content is the entropy seed, mixed with R on every OPEN.
 TCP_PORT_SALT		EQU TCP_BSS_BASE + 0x26	; 2 bytes
 
+; Synchronous SEND/retransmit scratch.  Also outside TCP_CTX_SIZE because
+; the option is currently enabled only by the one-session UNETRTL DLL.
+; ACK_WAIT_RX_PENDING may remain live after SEND returns, so a future
+; context-swapping consumer must move this state into its saved context.
+TCP_ACK_WAIT_STATE	EQU TCP_BSS_BASE + 0x28	; 0 idle, 1 ACK wait, 2 RX pending
+TCP_ACK_WAIT_TARGET	EQU TCP_BSS_BASE + 0x29	; 4 bytes (BE cumulative ACK target)
+TCP_SEND_SEQ		EQU TCP_BSS_BASE + 0x2D	; 4 bytes (BE sequence used by retries)
+TCP_SEND_RETRY_LEFT	EQU TCP_BSS_BASE + 0x31	; 1 byte
+
 ; Total per-session TCP state size; copied wholesale by
 ; TCP.SAVE_CTX / TCP.RESTORE_CTX so apps can multiplex
 ; multiple sessions sequentially (FTP control + data).
 ; Literal, NOT a difference of two addresses: in a relocatable DLL
 ; image the operands would be relocated and the size would be wrong.
 TCP_CTX_SIZE		EQU 38		; 0x26: TCP_STATE .. TCP_RX_DATA_LEN+1
+
+; Entire tcp_lib BSS span including non-context scratch above.
+; Literal for relocatable DLL builds; never derive this from addresses.
+TCP_BSS_SIZE		EQU 50		; 0x32 bytes
 
 ; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + MSS(536)
 ; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF

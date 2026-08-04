@@ -58,8 +58,10 @@ files use DSS paths and are created or opened by the transfer engine.
 ## Limits
 
 - One TCP session; no TLS.
-- The native TCP layer has no general retransmission timer. Zmodem/Ymodem add
-  their own protocol retries, but a very lossy network can still abort.
+- This stand-alone client uses the compact native TCP send path; it has no
+  general retransmission timer. Zmodem/Ymodem add their own protocol retries,
+  but a very lossy network can still abort. The bounded stop-and-wait sender
+  is currently enabled in `UNETRTL.DLL`, not TELNET.EXE.
 - The RTL8019AS byte-mode RX ring is small. Transfer windows remain bounded.
 
 ## Exit codes
