@@ -867,6 +867,24 @@ DUAL_PHASE
 	LD	HL,MSG_SENT
 	CALL	PUTS_LN
 
+	; Did the peer's reply ride in on our own command's ACK?  If it did,
+	; the backend captured it into this channel's pend slot DURING the
+	; SEND -- exactly the state in which the chunk loop's pend guard
+	; used to refuse a send that had already fully landed.  Without this
+	; line a passing --lockstep run is only consistent with the fix: a
+	; server whose stack ACKed before replying never reaches that state,
+	; and the screen looks identical either way.
+	XOR	A
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL
+	LD	A,E
+	AND	UNET_ST_RXPEND
+	LD	HL,MSG_ACK_RIDE
+	JR	NZ,.ack_verdict
+	LD	HL,MSG_ACK_NORIDE
+.ack_verdict
+	CALL	PUTS_LN
+
 	XOR	A
 	LD	(DUAL_NEXT),A
 	LD	(DUAL_BAD),A
@@ -1615,6 +1633,8 @@ MSG_DUAL_CLOSED	DB "data channel closed by peer",0
 MSG_DUAL_BYTES	DB "data bytes: ",0
 MSG_DUAL_SEQ_OK	DB "data stream continuous",0
 MSG_DUAL_SEQ_BAD DB "data stream GAP - bytes were lost",0
+MSG_ACK_RIDE	DB "reply rode our ACK - SEND guard path exercised",0
+MSG_ACK_NORIDE	DB "no reply on our ACK - SEND guard path not hit",0
 MSG_DUAL_PEND	DB "control reply pending (STATUS RXPEND)",0
 MSG_DUAL_NOPEND	DB "no control reply pending",0
 MSG_DUAL_CTRL	DB "control reply: ",0

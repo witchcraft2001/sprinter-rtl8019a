@@ -512,37 +512,17 @@ F_SEND
 	LD	(SEND_DONE),HL
 	CALL	@ISA.ISA_OPEN
 .chunk
-	; The channel's own pend slot must be empty before this chunk's
-	; SEND runs.  TCP.SEND's internal wait can receive and ACK
-	; payload piggybacked on our peer's ACK; CAPTURE_SEND_PENDING
-	; below has nowhere to put it if an earlier RECV was never
-	; drained.  That used to silently drop the just-ACKed bytes --
-	; an ACK is a promise to the peer that the data is ours for good,
-	; so losing it after the fact is a protocol-level bug, not a
-	; buffering inconvenience.  Refuse instead: the caller drains via
-	; RECV and retries, exactly as the ABI already documents for the
-	; ESP backend ("peer data arriving during a send may be dropped -
-	; drain RECV before sending").  DE reports bytes sent by EARLIER
-	; chunks in this same call, per the ABI's "valid on error paths".
-	;
-	; NERR_BUSY, deliberately NOT NERR_PARAM: PARAM already means "bad
-	; argument" (CHECK_BUF_RANGE above returns it for a rejected
-	; buffer), and a consumer keying "drain RECV, then retry" on a
-	; code that also covers permanent caller bugs will loop forever on
-	; those (real FTPC bug report, 2026-08-05).  BUSY is the frozen
-	; ABI's transient-refusal code; NERR_AGAIN is off-limits here
-	; because unet.inc reserves it for UNET_CAP_ASYNCSEND backends.
-	LD	A,(ARG_CH)
-	CALL	PEND_LEN_ADDR_A
-	LD	A,(HL)
-	INC	HL
-	OR	(HL)
-	JR	Z,.chunk_ready
-	CALL	@ISA.ISA_CLOSE
-	LD	DE,(SEND_DONE)
-	LD	A,NERR_BUSY
-	JP	RET_A
-.chunk_ready
+	; "Anything left to send?" MUST be tested before the pend guard
+	; below, never after.  CAPTURE_SEND_PENDING fills this channel's
+	; pend slot with any reply that rode in on our own segment's ACK,
+	; so after the FINAL chunk the loop comes back here with the work
+	; complete AND the slot occupied.  Guarding first turned that into
+	; NERR_BUSY for a send that had already fully landed -- and a
+	; consumer reacting to BUSY by draining and retrying then sent the
+	; command twice (real FTPC bug report: every FTP login failed, with
+	; the server's own reply to the "refused" PASS sitting in the drain
+	; buffer).  On a lockstep request/response protocol over a fast
+	; link that is the common case, not a corner case.
 	LD	HL,(ARG_IX)
 	LD	DE,(SEND_DONE)
 	OR	A
@@ -562,6 +542,37 @@ F_SEND
 	LD	C,L
 .have
 	LD	(CHUNK_LEN),BC
+	; The channel's own pend slot must be empty before this chunk's
+	; SEND runs.  TCP.SEND's internal wait can receive and ACK
+	; payload piggybacked on our peer's ACK; CAPTURE_SEND_PENDING
+	; below has nowhere to put it if an earlier RECV was never
+	; drained.  That used to silently drop the just-ACKed bytes --
+	; an ACK is a promise to the peer that the data is ours for good,
+	; so losing it after the fact is a protocol-level bug, not a
+	; buffering inconvenience.  Refuse instead: the caller drains via
+	; RECV and retries, exactly as the ABI already documents for the
+	; ESP backend ("peer data arriving during a send may be dropped -
+	; drain RECV before sending").  DE reports bytes sent by EARLIER
+	; chunks in this same call, per the ABI's "valid on error paths".
+	;
+	; Placed here, past the remaining-bytes test, so it can only veto a
+	; transmission that has not happened yet.  It costs nothing to sit
+	; here: A and HL are both reloaded from memory immediately below,
+	; so PEND_LEN_ADDR_A clobbering them is free.
+	;
+	; NERR_BUSY, deliberately NOT NERR_PARAM: PARAM already means "bad
+	; argument" (CHECK_BUF_RANGE above returns it for a rejected
+	; buffer), and a consumer keying "drain RECV, then retry" on a
+	; code that also covers permanent caller bugs will loop forever on
+	; those (real FTPC bug report, 2026-08-05).  BUSY is the frozen
+	; ABI's transient-refusal code; NERR_AGAIN is off-limits here
+	; because unet.inc reserves it for UNET_CAP_ASYNCSEND backends.
+	LD	A,(ARG_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	JR	NZ,.busy
 	LD	HL,(ARG_DE)
 	LD	DE,(SEND_DONE)
 	ADD	HL,DE
@@ -574,6 +585,11 @@ F_SEND
 	ADD	HL,BC
 	LD	(SEND_DONE),HL
 	JR	.chunk
+.busy
+	CALL	@ISA.ISA_CLOSE
+	LD	DE,(SEND_DONE)
+	LD	A,NERR_BUSY
+	JP	RET_A
 .done
 	CALL	@ISA.ISA_CLOSE
 	LD	DE,(SEND_DONE)

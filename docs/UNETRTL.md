@@ -145,7 +145,11 @@ is retained in that channel's 536-byte receive queue and returned by the
 next `RECV`.  The consumer must drain pending data before another `SEND`
 on the same channel; a `SEND` attempted with the queue still occupied is
 refused with `NERR_BUSY` (`DE` = bytes sent by earlier chunks of the same
-call).  The safe recovery sequence is: `STATUS` (bit 1, `RXPEND`, reports
+call).  A `SEND` that transmits its whole buffer always reports success,
+even when the peer's reply arrived on that last segment's ACK and is
+already queued -- the refusal can only ever veto a chunk that has not
+gone out, so `NERR_BUSY` never means "your data may or may not have been
+sent".  The safe recovery sequence is: `STATUS` (bit 1, `RXPEND`, reports
 whether the channel holds deliverable data), `RECV` until `RXPEND`
 clears, then repeat the `SEND`.  When the queue is occupied, `RECV`
 serves it directly from memory without touching the NIC.  All `RECV`

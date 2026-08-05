@@ -28,7 +28,7 @@ def counter_block(start, size):
     return bytes((start + index) & 0xFF for index in range(size))
 
 
-def serve(host, control_port, data_port, count, chunk, rate, reply):
+def serve(host, control_port, data_port, count, chunk, rate, reply, lockstep):
     control_server = listener(host, control_port)
     data_server = listener(host, data_port)
     log(
@@ -45,10 +45,29 @@ def serve(host, control_port, data_port, count, chunk, rate, reply):
         data.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         log(f"data connected from {address[0]}:{address[1]}")
 
-        control.setblocking(False)
         pending = bytearray()
         sent = 0
         replied = False
+        if lockstep:
+            # Answer the control command BEFORE streaming any data, the way
+            # a real FTP server answers USER/PASS.  The reply then rides in
+            # on the ACK of the client's own command segment, which is what
+            # makes UNETRTL's CAPTURE_SEND_PENDING fill that channel's pend
+            # slot while SEND is still running.  A backend whose SEND pend
+            # guard is ordered wrong reports the completed command as
+            # refused; UNETTEST shows that as a send error at "request
+            # sent" instead of proceeding.
+            control.settimeout(5.0)
+            try:
+                block = control.recv(4096)
+                if block:
+                    pending.extend(block)
+                    control.sendall(reply)
+                    replied = True
+                    log(f"lockstep: replied immediately ({len(reply)} bytes)")
+            except socket.timeout:
+                log("lockstep: no control command arrived within 5 s")
+        control.setblocking(False)
         try:
             while sent < count:
                 size = min(chunk, count - sent)
@@ -98,6 +117,12 @@ def main():
     # it to tell that apart from a duplicate inside the data stream
     # itself, whose size would not track this option.
     parser.add_argument("--reply", default="CONTROL REPLY DURING TRANSFER")
+    # Reply to the control command immediately instead of mid-transfer, so
+    # the reply piggybacks on that command's ACK.  This is the FTP
+    # USER/PASS shape and the one that exercises SEND's pend-guard
+    # ordering; the default mid-transfer reply exercises the
+    # foreign-channel receive path instead.  Both are worth running.
+    parser.add_argument("--lockstep", action="store_true")
     args = parser.parse_args()
     if min(args.control_port, args.data_port, args.count, args.chunk) <= 0:
         parser.error("ports, count and chunk must be positive")
@@ -112,6 +137,7 @@ def main():
             args.chunk,
             args.rate,
             args.reply.encode("ascii", "replace") + b"\r\n",
+            args.lockstep,
         )
     except KeyboardInterrupt:
         log("stopped")
