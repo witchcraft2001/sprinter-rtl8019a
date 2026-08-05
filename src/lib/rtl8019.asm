@@ -862,6 +862,103 @@ DMA_WRITE
 	OR	A
 	RET
 
+	IFDEF	UNET_DLL
+; ------------------------------------------------------
+; DMA_WRITE_SG: zero-copy counterpart to DMA_WRITE for SEND_FRAME_SG.
+; Streams THREE regions -- TX_BUF headers, the caller's own payload
+; buffer, and virtual zero padding -- into ONE remote-DMA write burst,
+; so the DP8390 sees a single TBCR-length frame without the payload
+; ever being copied into TX_BUF.  Mirrors only DMA_WRITE's fast path;
+; RTL_DMA_SETTLE's paced fallback has been dead code (EQU 0) on every
+; card this driver has been tested against, and re-deriving it for a
+; three-region burst is not worth the code size until a card needs it.
+;   In: DE = packet-RAM destination address.
+;       TX_SOURCE_PTR/TX_HDR_LEN = header region (HL/BC set by the
+;       caller before entry, same as DMA_WRITE's HL/BC would be).
+;       TX_PAY_PTR/TX_PAY_LEN = payload region (TX_PAY_LEN may be 0).
+;       TX_LENGTH = total burst length (hdr + payload + pad).
+;   Out: CF=0 OK, CF=1 RDC timeout.
+; ------------------------------------------------------
+DMA_WRITE_SG
+	ASSERT	RTL_DMA_SETTLE = 0
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	BC,(TX_LENGTH)
+	LD	(IX+RTL_RBCR0_OFF),C
+	LD	(IX+RTL_RBCR1_OFF),B
+	LD	(IX+RTL_RSAR0_OFF),E
+	LD	(IX+RTL_RSAR1_OFF),D
+	LD	(IX+RTL_CR_OFF),CR_DMA_WRITE
+	LD	HL,(RTL_BASE_PTR)
+	LD	DE,RTL_DATA_OFF
+	ADD	HL,DE
+	EX	DE,HL				; DE = fixed data-port address
+	LD	HL,(TX_SOURCE_PTR)
+	LD	BC,(TX_HDR_LEN)
+	CALL	.PUSH_REGION
+	LD	HL,(TX_PAY_PTR)
+	LD	BC,(TX_PAY_LEN)
+	CALL	.PUSH_REGION
+	; Virtual pad: TX_LENGTH - TX_HDR_LEN - TX_PAY_LEN zero bytes,
+	; written straight to the data port -- never into any buffer.
+	LD	HL,(TX_LENGTH)
+	LD	BC,(TX_HDR_LEN)
+	OR	A
+	SBC	HL,BC
+	LD	BC,(TX_PAY_LEN)
+	SBC	HL,BC
+	LD	B,H
+	LD	C,L
+	CALL	.PUSH_ZERO
+	LD	IX,(RTL_BASE_PTR)
+	LD	BC,RTL_RDC_LOOPS
+.WRDC
+	LD	A,(IX+RTL_ISR_OFF)
+	AND	ISR_RDC
+	JR	NZ,.OK
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.WRDC
+	SCF
+	RET
+.OK
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT
+	OR	A
+	RET
+.PUSH_REGION
+	; Copy BC bytes from (HL) to the fixed data port at (DE).
+	; Preserves DE.  Trashes A, BC, HL.
+	LD	A,B
+	OR	C
+	RET	Z
+.PLP
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.PLP
+	RET
+.PUSH_ZERO
+	; Write BC zero bytes to the fixed data port at (DE), without
+	; reading any buffer.  Preserves DE.  Trashes A, BC.
+	LD	A,B
+	OR	C
+	RET	Z
+	XOR	A
+.ZLP
+	LD	(DE),A
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.ZLP
+	RET
+	ENDIF
+
 
 ; ------------------------------------------------------
 ; DMA_SETTLE: short busy-wait giving the chip's remote-DMA FIFO
@@ -932,6 +1029,11 @@ TX_CFG0_POST	EQU RTL_TX_CFG0_POST
 TX_CFG3_POST	EQU RTL_TX_CFG3_POST
 TX_LAST_NCR	EQU RTL_TX_LAST_NCR
 TX_LAST_TPSR	EQU RTL_TX_LAST_TPSR
+	IFDEF	UNET_DLL
+TX_HDR_LEN	EQU RTL_TX_HDR_LEN
+TX_PAY_PTR	EQU RTL_TX_PAY_PTR
+TX_PAY_LEN	EQU RTL_TX_PAY_LEN
+	ENDIF
 
 ; ------------------------------------------------------
 ; INIT_NORMAL: full chip init for normal TX/RX.
@@ -1109,6 +1211,176 @@ WAIT_PTX
 ;   In: HL = source, BC = length.
 ; ------------------------------------------------------
 	IFDEF USE_RTL_SEND_FRAME
+	IFDEF	UNET_DLL
+; ------------------------------------------------------
+; SEND_FRAME / SEND_FRAME_SG: zero-copy scatter-gather transmit
+; (UNET_DLL build only).  SEND_FRAME_SG streams a small header
+; region (built by the caller in TX_BUF) plus the caller's OWN
+; payload buffer into ONE remote-DMA burst via DMA_WRITE_SG, so the
+; payload is never copied into TX_BUF -- this is what lets TX_BUF
+; shrink to RESOLVE_MAX_FRAME (320 bytes) while UDP/TCP payloads
+; stream straight from the application buffer.  Plain SEND_FRAME is
+; a thin wrapper that zeroes the payload descriptor and falls into
+; the same tail, so every existing single-buffer caller (ARP reply,
+; SYN/ACK/FIN, ICMP echo, DNS query) needs no changes.
+;   SEND_FRAME:    In: HL = source, BC = length (unchanged ABI).
+;   SEND_FRAME_SG: In: HL = header buffer (TX_BUF), BC = header
+;                  length; TX_PAY_PTR/TX_PAY_LEN = payload
+;                  descriptor, set by the caller first (TX_PAY_LEN=0
+;                  behaves exactly like plain SEND_FRAME).
+;   Out (both): CF=0 sent; CF=1 failed (TX_LAST_STAGE/TX_LAST_ISR/...).
+;   Trashes A, BC, DE, HL, IX.
+; ------------------------------------------------------
+SEND_FRAME
+	XOR	A
+	LD	(TX_PAY_LEN),A
+	LD	(TX_PAY_LEN+1),A
+SEND_FRAME_SG
+	LD	(TX_SOURCE_PTR),HL
+	LD	(TX_HDR_LEN),BC
+	; Ethernet minimum (60 bytes without FCS) applies to header+
+	; payload together.  Padding is virtual -- synthesized on the
+	; wire by DMA_WRITE_SG -- so, unlike the non-DLL body below,
+	; nothing is ever written into the header or payload buffer to
+	; reach it.
+	LD	HL,(TX_PAY_LEN)
+	ADD	HL,BC
+	LD	B,H
+	LD	C,L
+	LD	A,B
+	OR	A
+	JR	NZ,.LEN_OK
+	LD	A,C
+	CP	60
+	JR	NC,.LEN_OK
+	LD	BC,60
+.LEN_OK
+	LD	(TX_LENGTH),BC
+	; Mark per-attempt PHY diagnostics invalid until their exact phase is
+	; reached.  This prevents a pre-TX failure from printing values left by
+	; an older frame.
+	LD	A,0xFF
+	LD	(TX_CFG0_PRE),A
+	LD	(TX_CFG3_PRE),A
+	LD	(TX_CFG0_POST),A
+	LD	(TX_CFG3_POST),A
+	LD	(TX_LAST_NCR),A
+	LD	(TX_LAST_TPSR),A
+	; A successful RX immediately followed by TX was unreliable on the
+	; ORIGINAL card (see RX_TO_TX_GUARD_MS above); the guard compiles
+	; out at 0 and can be re-enabled there if TX verify errors return.
+	IF RX_TO_TX_GUARD_MS > 0
+	LD	A,(RTL_RX_TO_TX_PENDING)
+	OR	A
+	JR	Z,.NO_RX_GUARD
+	XOR	A
+	LD	(RTL_RX_TO_TX_PENDING),A
+	CALL	@ISA.ISA_CLOSE
+	LD	HL,RX_TO_TX_GUARD_MS
+	CALL	UTIL.DELAY_MS
+	CALL	@ISA.ISA_OPEN
+.NO_RX_GUARD
+	ENDIF
+	LD	IX,(RTL_BASE_PTR)
+	; Never overwrite TPSR packet RAM while an earlier transmit is
+	; still active.  More importantly, this establishes a clean
+	; transition instead of treating the previous packet's PTX as
+	; completion of the new one.
+	LD	BC,TX_IDLE_LOOPS
+.WAIT_IDLE
+	LD	A,(IX+RTL_CR_OFF)
+	AND	CR_TXP
+	JR	Z,.IDLE
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.WAIT_IDLE
+	LD	A,TX_ERR_BUSY
+	LD	(TX_LAST_STAGE),A
+	CALL	CAPTURE_TX_STATE
+	CALL	TX_COUNT_FAIL
+	SCF
+	RET
+.IDLE
+	LD	A,TX_STAGE_IDLE
+	LD	(TX_LAST_STAGE),A
+	LD	A,TX_DMA_TRIES
+	LD	(TX_RETRY_LEFT),A
+.DMA_ATTEMPT
+	LD	D,RTL_TPSR_INIT
+	LD	E,0
+	CALL	DMA_WRITE_SG
+	JR	C,.DMA_ERROR
+	; A successful RDC only proves that the byte count reached zero.
+	; Read back the protocol/header prefix before TXP so a marginal ISA
+	; write cannot silently turn into PTX=success for a malformed frame.
+	; The short (max 42-byte) verification keeps the ISA-open interval
+	; bounded; it covers both MAC addresses, EtherType and the complete
+	; IPv4 header (or most of an ARP body).  Header regions are always
+	; >= 42 bytes for every SG caller (UDP 42, TCP data 54), so this
+	; reads only the header buffer, never the payload.
+	LD	HL,(TX_SOURCE_PTR)
+	LD	BC,(TX_HDR_LEN)
+	CALL	VERIFY_TX_PREFIX
+	JR	NC,.DMA_OK
+	LD	A,TX_ERR_VERIFY
+	JR	.DMA_RETRY
+.DMA_ERROR
+	LD	A,TX_ERR_DMA
+.DMA_RETRY
+	LD	(TX_LAST_STAGE),A
+	LD	HL,TX_RETRY_LEFT
+	DEC	(HL)
+	JR	NZ,.DMA_ATTEMPT
+	CALL	CAPTURE_TX_STATE
+	CALL	TX_COUNT_FAIL
+	SCF
+	RET
+.DMA_OK
+	; Stage 02 now means DMA write AND prefix read-back both passed.
+	LD	A,TX_STAGE_DMA
+	LD	(TX_LAST_STAGE),A
+	; DMA_WRITE_SG loaded IX; reuse it for status/TBCR/CR.
+	LD	IX,(RTL_BASE_PTR)
+	LD	BC,(TX_LENGTH)
+	LD	(IX+RTL_TBCR0_OFF),C
+	LD	(IX+RTL_TBCR1_OFF),B
+	; ISR is write-one-to-clear.  Clear BOTH terminal TX bits and
+	; read them back until clear.  The old code wrote PTX once and
+	; immediately polled it after TXP; a delayed or lost clear can let
+	; the previous ARP's PTX masquerade as completion of the following
+	; ICMP frame.  The field retest will show whether this was the
+	; observed failure or only a latent repeat-TX bug.
+	LD	B,TX_CLEAR_TRIES
+.CLEAR_STATUS
+	LD	A,TX_STATUS_BITS
+	LD	(IX+RTL_ISR_OFF),A
+	LD	A,(IX+RTL_ISR_OFF)
+	AND	TX_STATUS_BITS
+	JR	Z,.STATUS_CLEAR
+	DJNZ	.CLEAR_STATUS
+	LD	A,TX_ERR_STALE_ISR
+	LD	(TX_LAST_STAGE),A
+	CALL	CAPTURE_TX_STATE
+	CALL	TX_COUNT_FAIL
+	SCF
+	RET
+.STATUS_CLEAR
+	; Capture the medium actually selected and duplex configuration at the
+	; physical TX boundary.  Page 3 is read-only here; restore page 0 before
+	; issuing the single TXP command.
+	CALL	CAPTURE_TX_PHY_PRE
+	; TXP is an edge-like command and MUST be written exactly once.
+	; Do not re-issue it when an immediate CR/ISR read has not yet
+	; exposed TXP/PTX: on real hardware those reads can lag, and the
+	; old three-try "acceptance" probe produced three ARP frames and
+	; could disturb an in-progress unicast transmission.  WAIT_PTX
+	; proves acceptance by observing a new PTX/TXE; no event -> E4.
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START | CR_TXP
+	LD	A,TX_STAGE_ARMED
+	LD	(TX_LAST_STAGE),A
+	JP	WAIT_PTX
+	ELSE
 SEND_FRAME
 	LD	(TX_SOURCE_PTR),HL
 	; Enforce the Ethernet minimum payload (60 bytes without FCS).
@@ -1263,6 +1535,7 @@ SEND_FRAME
 	LD	A,TX_STAGE_ARMED
 	LD	(TX_LAST_STAGE),A
 	JP	WAIT_PTX
+	ENDIF
 	ENDIF
 
 

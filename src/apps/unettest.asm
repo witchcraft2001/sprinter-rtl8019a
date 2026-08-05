@@ -1,13 +1,18 @@
 ; ======================================================
 ; UNETTEST - backend-neutral smoke test for the UNET network DLL.
 ;
-;   UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] HOST [PORT]
+;   UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT] HOST [PORT]
 ;
 ; Loads a UNET DLL (default UNETRTL.DLL) via libman into window 1, then walks
 ; the API: l_info, GETCAPS, SETOPT, STATUS, NETINIT, GETINFO, RESOLVE, PING,
 ; CONNECT, SEND (HTTP HEAD), a short RECV loop, CLOSE, NETDONE, l_free.
-; -u replaces TCP with a UDP echo test.  -2 replaces it with a simultaneous
-; two-channel TCP exercise: control on PORT and data on DATAPORT.
+; -u replaces TCP with a UDP echo test.  SIZE is optional (default: a fixed
+; 21-byte string); given, it sends a generated i&0xFF pattern of that many
+; bytes instead, pair with tools/dev/udp_echo.py on the host (recvfrom(2048)
+; already covers it) -- up to 1472 this exercises the standard-MTU zero-copy
+; TX path end to end, and above 1472 it exercises the backend's own
+; NERR_PARAM rejection.  -2 replaces it with a simultaneous two-channel TCP
+; exercise: control on PORT and data on DATAPORT.
 ; Because the whole exercise goes through the DLL, the SAME binary tests any
 ; backend - point -d at UNETESP.DLL to exercise the Wi-Fi card instead.
 ;
@@ -665,14 +670,55 @@ UDP_PHASE
 	LD	B,UNET_FN_RECV
 	CALL	DO_CALL
 	OR	A
-	JR	NZ,.err
+	JP	NZ,.err
 	LD	HL,MSG_UDP_POLL0
 	CALL	PUTS_LN
 
-	; --- SEND the probe payload straight from the image ---
-	XOR	A				; channel 0
+	; --- SEND the probe payload.  Default (-u PORT): the fixed
+	; 21-byte string, straight from the image, exactly as before.
+	; Sized (-u PORT SIZE): a generated i&0xFF pattern in PATTERN_BUF,
+	; exercising payload sizes up to the standard UDP MTU (1472) and
+	; the backend's own NERR_PARAM rejection just above it. ---
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	Z,.default_payload
+	LD	DE,PATTERN_BUF
+	LD	BC,(UDP_TEST_SIZE)
+	CALL	FILL_PATTERN
+	LD	DE,PATTERN_BUF
+	LD	IX,(UDP_TEST_SIZE)
+	JR	.have_payload
+.default_payload
 	LD	DE,UDP_PAYLOAD
 	LD	IX,UDP_PAYLOAD_LEN
+.have_payload
+	; Print the effective outgoing size before SEND.  A misplaced HOST
+	; argument between the UDP port and SIZE (e.g. "-u 7777 1.2.3.4
+	; 1472") makes SIZE parse as HOST instead of a decimal token, so
+	; PARSE_ARGS silently falls back to the default 21-byte payload;
+	; this line makes that visible on screen instead of requiring a
+	; wire capture to notice the size argument was never applied.
+	LD	HL,MSG_UDP_PAYLOAD
+	CALL	PUTS
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	NZ,.print_size
+	LD	HL,UDP_PAYLOAD_LEN
+.print_size
+	CALL	PUT_DEC_HL
+	LD	HL,MSG_UDP_BYTES
+	CALL	PUTS
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	NZ,.size_noted
+	LD	HL,MSG_UDP_DEFAULT
+	CALL	PUTS
+.size_noted
+	CALL	CRLF
+	XOR	A				; channel 0
 	LD	B,UNET_FN_SEND
 	CALL	DO_CALL				; -> A, DE=sent
 	OR	A
@@ -720,10 +766,19 @@ UDP_PHASE
 	CALL	PUTS
 	LD	HL,(UDP_RX_LEN)
 	CALL	PUT_DEC_HL
+	; The sized i&0xFF pattern embeds 0x00 every 256th byte, so
+	; PRINT_RECV (a plain ASCIIZ PUTS) would only show the first
+	; segment and print binary noise besides; skip the raw dump and
+	; go straight to the byte-for-byte PATTERN_MATCH verdict instead.
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	NZ,.sized_reply
 	LD	HL,MSG_UDP_DATA
 	CALL	PUTS
 	LD	DE,(UDP_RX_LEN)
 	CALL	PRINT_RECV			; terminates the buffer, then prints
+.sized_reply
 	CALL	CRLF
 	LD	A,(UDP_RX_FLAGS)
 	AND	1				; bit0: datagram was truncated
@@ -731,7 +786,15 @@ UDP_PHASE
 	LD	HL,MSG_UDP_TRUNC
 	CALL	PUTS_LN
 .compare
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	Z,.compare_default
+	CALL	PATTERN_MATCH
+	JR	.have_verdict
+.compare_default
 	CALL	UDP_ECHO_MATCH
+.have_verdict
 	LD	HL,MSG_UDP_OK
 	JR	Z,.verdict
 	LD	HL,MSG_UDP_BAD
@@ -960,6 +1023,50 @@ UDP_ECHO_MATCH
 	XOR	A				; ZF=1
 	RET
 
+; Fill (DE) with BC bytes of pattern byte[i] = i & 0xFF, used to
+; generate the sized -u payload up to the standard UDP MTU (1472)
+; without baking a multi-KB literal into the image.
+;   In: DE = dest, BC = count.  Trashes A, BC, DE, HL.
+FILL_PATTERN
+	LD	HL,0
+.loop
+	LD	A,B
+	OR	C
+	RET	Z
+	LD	A,L
+	LD	(DE),A
+	INC	DE
+	INC	HL
+	DEC	BC
+	JR	.loop
+
+; Verify RECV_BUF[0..UDP_TEST_SIZE-1] == i & 0xFF (sized -u payload
+; test), mirroring UDP_ECHO_MATCH's length-then-bytes structure.
+;   Out: ZF=1 match.  Trashes A, BC, DE, HL.
+PATTERN_MATCH
+	LD	HL,(UDP_RX_LEN)
+	LD	DE,(UDP_TEST_SIZE)
+	OR	A
+	SBC	HL,DE
+	RET	NZ				; length differs
+	LD	BC,(UDP_TEST_SIZE)
+	LD	HL,RECV_BUF
+	LD	DE,0
+.loop
+	LD	A,B
+	OR	C
+	JR	Z,.match
+	LD	A,(HL)
+	CP	E
+	RET	NZ
+	INC	HL
+	INC	DE
+	DEC	BC
+	JR	.loop
+.match
+	XOR	A				; ZF=1
+	RET
+
 ; ======================================================
 ; Build "HEAD / HTTP/1.0\r\nHost: <host>\r\nConnection: close\r\n\r\n"
 ; into REQ_BUF. Out: BC = length (no terminator sent).
@@ -1009,6 +1116,8 @@ PARSE_ARGS
 	LD	(DLL_ARG_FLAG),A		; default: no -d, resolve beside the EXE
 	LD	(UDP_MODE),A			; default: TCP exercise
 	LD	(DUAL_MODE),A
+	LD	(UDP_TEST_SIZE),A
+	LD	(UDP_TEST_SIZE+1),A		; default: fixed 21-byte payload
 	; init parse state
 	LD	HL,(CMDLINE_PTR)
 	LD	A,(HL)
@@ -1022,7 +1131,7 @@ PARSE_ARGS
 	RET	C				; no more args -> defaults
 	LD	A,(TOKEN_BUF)
 	CP	'-'
-	JR	NZ,.host_is_tok
+	JP	NZ,.host_is_tok
 	LD	HL,TOKEN_BUF
 	LD	DE,STR_DASH_D
 	CALL	STREQ				; trashes C
@@ -1051,7 +1160,40 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -u without a port
 	LD	A,1
 	LD	(UDP_MODE),A
-	JR	.next_flag
+	; Optional payload size: "-u PORT [SIZE]".  Peek the next token;
+	; if it is not purely decimal digits, it is not a size (most
+	; likely HOST) -- rewind the parse position so normal flag/host
+	; parsing continues from right after the port token, as before.
+	LD	HL,(PARSE_PTR)
+	LD	(SAVE_PARSE_PTR),HL
+	LD	A,(PARSE_LEFT)
+	LD	(SAVE_PARSE_LEFT),A
+	LD	DE,TOKEN_BUF
+	LD	C,TOKEN_BUF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,.next_flag			; no more tokens: default payload
+	LD	HL,TOKEN_BUF
+	CALL	PARSE_DEC_TOKEN			; -> HL=value, CF=1 invalid/empty
+	JR	C,.u_restore
+	; Clamp to PATTERN_BUF_SIZE so a mistyped size can never overflow
+	; it; the backend's own NERR_PARAM rejection above 1472 is still
+	; reachable (PATTERN_BUF_SIZE=1600 > 1472).
+	PUSH	HL
+	LD	DE,PATTERN_BUF_SIZE
+	OR	A
+	SBC	HL,DE
+	POP	HL
+	JR	C,.u_size_ok			; size < PATTERN_BUF_SIZE
+	LD	HL,PATTERN_BUF_SIZE
+.u_size_ok
+	LD	(UDP_TEST_SIZE),HL
+	JP	.next_flag
+.u_restore
+	LD	HL,(SAVE_PARSE_PTR)
+	LD	(PARSE_PTR),HL
+	LD	A,(SAVE_PARSE_LEFT)
+	LD	(PARSE_LEFT),A
+	JP	.next_flag
 .flag_2
 	LD	DE,DUAL_PORT_BUF
 	LD	C,PORT_BUFF_SIZE
@@ -1059,7 +1201,7 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -2 without a data port
 	LD	A,1
 	LD	(DUAL_MODE),A
-	JR	.next_flag
+	JP	.next_flag
 .host_is_tok
 	LD	HL,TOKEN_BUF
 	LD	DE,HOST_BUFF
@@ -1190,6 +1332,56 @@ NEXT_TOKEN
 	DEC	A
 	LD	(PARSE_LEFT),A
 	RET
+
+; Parse a pure-decimal ASCIIZ token (1-4 digits, 0..9999) at (HL),
+; used by "-u PORT [SIZE]" to tell an optional size token apart from
+; the next flag/HOST token.
+;   Out: HL = value; CF=1 if empty, contains a non-digit, or > 4 digits.
+;   Trashes A, BC, DE.
+PARSE_DEC_TOKEN
+	LD	DE,0
+	XOR	A
+	LD	(.DIGITS),A
+.loop
+	LD	A,(HL)
+	OR	A
+	JR	Z,.done
+	CP	'0'
+	JR	C,.bad
+	CP	'9'+1
+	JR	NC,.bad
+	LD	A,(.DIGITS)
+	CP	4
+	JR	NC,.bad				; more than 4 digits
+	INC	A
+	LD	(.DIGITS),A
+	LD	A,(HL)
+	SUB	'0'
+	LD	C,A
+	LD	B,0				; BC = digit (0..9)
+	PUSH	HL
+	LD	H,D
+	LD	L,E
+	ADD	HL,HL				; x2
+	ADD	HL,HL				; x4
+	ADD	HL,DE				; x5
+	ADD	HL,HL				; x10
+	ADD	HL,BC				; +digit
+	EX	DE,HL				; DE = new value
+	POP	HL
+	INC	HL
+	JR	.loop
+.done
+	LD	A,(.DIGITS)
+	OR	A
+	JR	Z,.bad				; no digits consumed
+	EX	DE,HL
+	OR	A				; CF=0
+	RET
+.bad
+	SCF
+	RET
+.DIGITS	DB 0
 
 ; ======================================================
 ; Small string / print helpers
@@ -1352,7 +1544,7 @@ PRINT_RECV
 ; Strings
 ; ======================================================
 MSG_BANNER	DB "UNETTEST - universal network DLL smoke test",0
-MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT] [-2 DATAPORT] [HOST [PORT]]",0
+MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT] [HOST [PORT]]",0
 MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
 MSG_VER		DB "  v",0
@@ -1404,6 +1596,9 @@ MSG_ERR_SEND	DB "Send failed.",0
 MSG_ERR_UDPOPEN	DB "UDPOPEN failed.",0
 MSG_UDP		DB "udp ",0
 MSG_UDP_POLL0	DB "udp poll0 ok",0
+MSG_UDP_PAYLOAD	DB "udp payload: ",0
+MSG_UDP_BYTES	DB " bytes",0
+MSG_UDP_DEFAULT	DB " (default)",0
 MSG_UDP_REPLY	DB "udp reply: len=",0
 MSG_UDP_DATA	DB " data=",0
 MSG_UDP_TRUNC	DB "(datagram truncated to the receive buffer)",0
@@ -1454,7 +1649,9 @@ UDP_PAYLOAD_LEN	EQU $ - UDP_PAYLOAD
 ; ======================================================
 	MODULE MAIN
 
-RECV_BUF_SIZE	EQU 512
+; 1514 = 14+20+8+1472, the standard UDP MTU the DLL now accepts
+; end to end (UDPLIB_MAX_PAYLOAD/RX_BUF_SIZE in memmap.inc/unetrtl.asm).
+RECV_BUF_SIZE	EQU 1514
 STR_BUF_SIZE	EQU 96
 REQ_BUF_SIZE	EQU 160
 TOKEN_BUF_SIZE	EQU 64
@@ -1463,6 +1660,11 @@ DLL_PATH_SIZE	EQU 272			; APPINFO dir (<=256) + '\' + name + NUL
 DLL_DEF_RESERVE	EQU 16			; '\' + "UNETRTL.DLL" + NUL headroom
 HOST_BUFF_SIZE	EQU 64
 PORT_BUFF_SIZE	EQU 16
+; Sized -u payload test ("-u PORT [SIZE]"): generated i&0xFF pattern,
+; sized a bit above the 1472 UDP MTU so a mistyped/deliberate over-limit
+; SIZE (e.g. 1473, to exercise the backend's own NERR_PARAM rejection)
+; can never overflow this buffer even before the clamp in PARSE_ARGS.
+PATTERN_BUF_SIZE	EQU 1600
 
 BSS_BASE	EQU $
 HANDLE		EQU BSS_BASE
@@ -1475,12 +1677,16 @@ RECV_LEFT	EQU REQ_LEN + 2
 CMDLINE_PTR	EQU RECV_LEFT + 1
 PARSE_PTR	EQU CMDLINE_PTR + 2
 PARSE_LEFT	EQU PARSE_PTR + 2
-DLL_ARG_FLAG	EQU PARSE_LEFT + 1	; 1 = -d given, use DLL_NAME verbatim
+SAVE_PARSE_PTR	EQU PARSE_LEFT + 1	; -u's optional-SIZE-token backtrack
+SAVE_PARSE_LEFT	EQU SAVE_PARSE_PTR + 2
+DLL_ARG_FLAG	EQU SAVE_PARSE_LEFT + 1	; 1 = -d given, use DLL_NAME verbatim
 USED_EXEDIR	EQU DLL_ARG_FLAG + 1	; 1 = first candidate was DLL_PATH
 UDP_MODE	EQU USED_EXEDIR + 1	; 1 = -u given, run the UDP exercise
 UDP_RX_LEN	EQU UDP_MODE + 1
 UDP_RX_FLAGS	EQU UDP_RX_LEN + 2
-DUAL_MODE	EQU UDP_RX_FLAGS + 1	; 1 = -2 given
+UDP_TEST_SIZE	EQU UDP_RX_FLAGS + 1	; 0 = default 21-byte payload;
+					; else generated-pattern size
+DUAL_MODE	EQU UDP_TEST_SIZE + 2	; 1 = -2 given
 DUAL_NEXT	EQU DUAL_MODE + 1
 DUAL_BAD	EQU DUAL_NEXT + 1
 DUAL_TOTAL	EQU DUAL_BAD + 1
@@ -1496,7 +1702,8 @@ TOKEN_BUF	EQU DUAL_PORT_BUF + PORT_BUFF_SIZE
 STR_BUF		EQU TOKEN_BUF + TOKEN_BUF_SIZE
 REQ_BUF		EQU STR_BUF + STR_BUF_SIZE
 RECV_BUF	EQU REQ_BUF + REQ_BUF_SIZE
-DLL_BASE_H	EQU RECV_BUF + RECV_BUF_SIZE
+PATTERN_BUF	EQU RECV_BUF + RECV_BUF_SIZE
+DLL_BASE_H	EQU PATTERN_BUF + PATTERN_BUF_SIZE
 SNAPSHOT_OLD_WIN	EQU DLL_BASE_H + 1
 SNAPSHOT_DSS_ERROR	EQU SNAPSHOT_OLD_WIN + 1
 DLL_PROBE	EQU SNAPSHOT_DSS_ERROR + 1

@@ -124,8 +124,25 @@ SEND
 	LD	(UDPLIB_PAYLOAD_PTR),HL
 	LD	(UDPLIB_PAYLOAD_LEN),BC
 	CALL	BUILD_FRAME			; -> BC = total frame length
+	IFDEF	UNET_DLL
+	; Zero-copy: BUILD_FRAME left the payload in the caller's own
+	; buffer (never copied into TX_BUF).  Hand that buffer to
+	; SEND_FRAME_SG as the payload descriptor and pass only the
+	; 42-byte ETH+IP+UDP header region built in TX_BUF; the DMA
+	; write streams both regions into one burst.  BUILD_FRAME's
+	; returned total length is unused here -- SEND_FRAME_SG derives
+	; it from the header/payload descriptors itself.
+	LD	HL,(UDPLIB_PAYLOAD_PTR)
+	LD	(@RTL.TX_PAY_PTR),HL
+	LD	HL,(UDPLIB_PAYLOAD_LEN)
+	LD	(@RTL.TX_PAY_LEN),HL
+	LD	HL,@MAIN.TX_BUF
+	LD	BC,14 + IP_HDR_LEN + UDP_HDR_LEN
+	CALL	@RTL.SEND_FRAME_SG
+	ELSE
 	LD	HL,@MAIN.TX_BUF
 	CALL	@RTL.SEND_FRAME
+	ENDIF
 	JR	C,.FAIL
 	XOR	A
 	LD	(UDPLIB_LAST_FAIL),A
@@ -239,6 +256,10 @@ BUILD_FRAME
 	INC	DE
 
 	; -- payload --
+	; UNET_DLL streams the payload straight from the caller's buffer
+	; via SEND_FRAME_SG (see SEND above) instead of copying it here;
+	; TX_BUF holds headers only, so there is nothing to LDIR.
+	IFNDEF	UNET_DLL
 	LD	HL,(UDPLIB_PAYLOAD_PTR)
 	LD	BC,(UDPLIB_PAYLOAD_LEN)
 	LD	A,B
@@ -246,6 +267,7 @@ BUILD_FRAME
 	JR	Z,.NO_PAYLOAD
 	LDIR
 .NO_PAYLOAD
+	ENDIF
 
 	; -- IPv4 header checksum over TX_BUF+14, 20 bytes --
 	PUSH	IX

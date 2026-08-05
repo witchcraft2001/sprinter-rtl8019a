@@ -77,7 +77,7 @@ test `A`, never `CF`.
 | Capability | State | Note |
 |------------|-------|------|
 | `TCP`      | yes   | channels 0 and 1; `SEND` chunks at the 536-byte MSS |
-| `UDP`      | yes   | connected UDP, payload capped at 1024 bytes |
+| `UDP`      | yes   | connected UDP, payload up to the standard 1472-byte MTU |
 | `RESOLVE`  | yes   | software DNS; never returns `NERR_NOTSUP` |
 | `PING`     | yes   | software ICMP echo |
 | `MULTICHAN`| yes   | channels 0 and 1 may be open simultaneously |
@@ -98,9 +98,6 @@ which card it got.  None of them changes the calling convention.
 - **`SETOPT RXTRIG` returns `NERR_NOTSUP`.**  It selects a 16550
   UART FIFO threshold, and there is no UART here.
   `SETOPT CANCELKEYS` works normally.
-- **UDP payloads are capped at 1024 bytes** (the ESP cap is 1472),
-  bounded by the DLL's in-image transmit buffer.  Longer `SEND`
-  lengths return `NERR_PARAM`.
 - **`NERR_BUSY` is never returned.**  There is no separate network
   processor that can still be warming up.
 - **`PING` round-trip time is coarse.**  This stack has no

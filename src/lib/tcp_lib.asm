@@ -685,6 +685,72 @@ WRITE_TCP_CSUM
 	LD	(@MAIN.TX_BUF + 14 + IP_HDR_LEN + 17),A
 	RET
 
+	IFDEF	UNET_DLL
+; ------------------------------------------------------
+; WRITE_TCP_CSUM_DATA_SG: zero-copy counterpart to WRITE_TCP_CSUM,
+; used ONLY by BUILD_DATA (UNET_DLL build).  BUILD_SYN/ACK/FIN build
+; their whole (payload-free) segment contiguously in TX_BUF and keep
+; using plain WRITE_TCP_CSUM above unchanged; only a DATA segment has
+; a payload living outside TX_BUF (SEND.SAVE_DATA/SAVE_LEN, set by
+; SEND before BUILD_DATA runs), so only this path needs the split.
+; Sums pseudo-header + the 20-byte TCP header (always even, straight
+; from TX_BUF) + the payload (from the caller's own buffer).  A
+; trailing odd payload byte is folded as (byte << 8) directly into
+; HL -- numerically identical to WRITE_TCP_CSUM's write-a-zero-then-
+; sum trick, but without writing into any buffer.
+; ------------------------------------------------------
+WRITE_TCP_CSUM_DATA_SG
+	LD	HL,0
+	LD	DE,@MAIN.OUR_IP
+	LD	BC,4
+	CALL	CSUM_ACCUM_BE
+	LD	DE,TCP_REMOTE_IP
+	LD	BC,4
+	CALL	CSUM_ACCUM_BE
+	LD	BC,0x0006
+	ADD	HL,BC
+	JR	NC,.PROTO_OK
+	INC	HL
+.PROTO_OK
+	LD	BC,(BUILD_ETH_IP.TCP_SEG_LEN)
+	ADD	HL,BC
+	JR	NC,.LEN_OK
+	INC	HL
+.LEN_OK
+	LD	DE,@MAIN.TX_BUF + 14 + IP_HDR_LEN
+	LD	BC,20
+	CALL	CSUM_ACCUM_BE
+	LD	BC,(SEND.SAVE_LEN)
+	LD	A,C
+	AND	0xFE
+	LD	C,A			; BC = even portion of the payload length
+	LD	DE,(SEND.SAVE_DATA)
+	CALL	CSUM_ACCUM_BE		; DE ends up at the odd trailing byte, if any
+	LD	A,(SEND.SAVE_LEN)
+	AND	1
+	JR	Z,.EVEN
+	LD	A,(DE)
+	LD	B,A
+	LD	C,0
+	ADD	HL,BC
+	JR	NC,.EVEN
+	INC	HL
+.EVEN
+	; 1's complement.
+	LD	A,H
+	CPL
+	LD	H,A
+	LD	A,L
+	CPL
+	LD	L,A
+	; Write to TCP[16..17].
+	LD	A,H
+	LD	(@MAIN.TX_BUF + 14 + IP_HDR_LEN + 16),A
+	LD	A,L
+	LD	(@MAIN.TX_BUF + 14 + IP_HDR_LEN + 17),A
+	RET
+	ENDIF
+
 
 ; ------------------------------------------------------
 ; CSUM_ACCUM_BE: add BC bytes (must be even) at (DE) into
@@ -990,9 +1056,24 @@ SEND
 	CALL	.RESTORE_SEQ
 	CALL	BUILD_DATA
 	CALL	.RESTORE_TARGET
+	IFDEF	UNET_DLL
+	; Zero-copy: TX_BUF holds only the 14+20+20=54-byte header built
+	; by BUILD_DATA; the payload streams straight from the caller's
+	; own buffer (still valid here -- SAVE_DATA/SAVE_LEN are re-read
+	; on every retry, same invariant as BUILD_DATA's own LDIR used to
+	; rely on).
+	LD	HL,(SEND.SAVE_DATA)
+	LD	(@RTL.TX_PAY_PTR),HL
+	LD	HL,(SEND.SAVE_LEN)
+	LD	(@RTL.TX_PAY_LEN),HL
+	LD	HL,@MAIN.TX_BUF
+	LD	BC,54
+	CALL	@RTL.SEND_FRAME_SG
+	ELSE
 	LD	HL,@MAIN.TX_BUF
 	LD	BC,(TCP_TX_LEN)
 	CALL	@RTL.SEND_FRAME
+	ENDIF
 	JR	NC,.WAIT_ACK
 	CALL	.RESTORE_SEQ
 	XOR	A
@@ -1594,13 +1675,23 @@ BUILD_DATA
 	INC	DE
 	LD	(DE),A			; urg lo
 	INC	DE
-	; Copy payload.
+	; Copy payload.  UNET_DLL streams it straight from the caller's
+	; buffer via SEND_FRAME_SG (see SEND) instead of copying it here;
+	; TX_BUF holds the 20-byte TCP header only, so there is nothing
+	; to LDIR, and the checksum is summed over the two regions
+	; separately by WRITE_TCP_CSUM_DATA_SG below.
+	IFNDEF	UNET_DLL
 	LD	HL,(SEND.SAVE_DATA)
 	LD	BC,(SEND.SAVE_LEN)
 	LDIR
+	ENDIF
 	; Checksums.
 	CALL	WRITE_IP_CSUM
+	IFDEF	UNET_DLL
+	CALL	WRITE_TCP_CSUM_DATA_SG
+	ELSE
 	CALL	WRITE_TCP_CSUM
+	ENDIF
 	; Frame length = 14 + 20 + 20 + data_len.
 	LD	HL,(SEND.SAVE_LEN)
 	LD	BC,54

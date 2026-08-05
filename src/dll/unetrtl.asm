@@ -165,26 +165,34 @@ DLL_IMAGE_ORIGIN	EQU $
 ; region sizes come from memmap.inc: LIBBSS_SIZE 0x176, resolve 0x29,
 ; tcp 0x35, udp 0x18, icmp 0x10.
 ; ======================================================
-BSS_LIB		EQU 0x0000		; 0x176 util + rtl + netenv + rtl tx
-BSS_RESOLVE	EQU 0x0176		; 0x029 resolve_lib
-BSS_TCP		EQU 0x019F		; 0x035 tcp_lib
-BSS_UDP		EQU 0x01D4		; 0x018 udp_lib
-BSS_ICMP	EQU 0x01EC		; 0x010 icmp_lib
-BSS_OUR_IP	EQU 0x01FC		; 4
-BSS_OUR_MAC	EQU 0x0200		; 6
-BSS_CANCELLED	EQU 0x0206		; 1
-BSS_LASTERR	EQU 0x0208		; 0x080 formatted diagnostic line
-BSS_TX_BUF	EQU 0x0288		; 0x42A 1066 = 14+20+8+1024 (UDP cap)
-BSS_RX_HDR	EQU 0x06B2		; 4     NE2000 RX ring header
-BSS_RX_BUF	EQU 0x06B6		; 0x42A 1066 = largest accepted UDP frame
-BSS_CH_TCP	EQU 0x0AE0		; 0x33 inactive TCP context (salt excluded)
-BSS_CH_UDP	EQU 0x0B13		; 0x18 inactive-channel UDP context
-BSS_PEND_LEN	EQU 0x0B2B		; 2 words
-BSS_PEND_OFF	EQU 0x0B2F		; 2 words
-BSS_CLOSED	EQU 0x0B33		; 2 bytes
-BSS_LOST	EQU 0x0B35		; 2 bytes
-BSS_PEND_BUF	EQU 0x0B37		; 2 * 536-byte TCP receive queues
-DLL_BSS_SIZE	EQU 0x0F67		; 3943 total
+; TX_BUF/RX_BUF sizes below assume zero-copy TX (SEND_FRAME_SG in
+; rtl8019.asm, IFDEF UNET_DLL): UDP/TCP-data payloads stream straight
+; from the caller's own buffer and are never copied into TX_BUF, so
+; TX_BUF only needs to hold the largest frame still built whole --
+; the DNS query via resolve_lib, bounded by RESOLVE_MAX_FRAME (320).
+; RX_BUF grows to the standard IPv4 MTU (14+20+8+1472=1514) now that
+; TX_BUF's shrink pays for it inside the libman 0x38C7 image budget.
+BSS_LIB		EQU 0x0000		; 0x17C util + rtl + netenv + rtl tx + SG desc
+BSS_RESOLVE	EQU 0x017C		; 0x029 resolve_lib
+BSS_TCP		EQU 0x01A5		; 0x035 tcp_lib
+BSS_UDP		EQU 0x01DA		; 0x018 udp_lib
+BSS_ICMP	EQU 0x01F2		; 0x010 icmp_lib
+BSS_OUR_IP	EQU 0x0202		; 4
+BSS_OUR_MAC	EQU 0x0206		; 6
+BSS_CANCELLED	EQU 0x020C		; 1
+BSS_LASTERR	EQU 0x020E		; 0x080 formatted diagnostic line
+BSS_TX_BUF	EQU 0x028E		; 0x140 320 = RESOLVE_MAX_FRAME (largest whole-built frame)
+BSS_RX_HDR	EQU 0x03CE		; 4     NE2000 RX ring header
+BSS_RX_BUF	EQU 0x03D2		; 0x5EA 1514 = 14+20+8+1472 (standard UDP MTU)
+BSS_CH_TCP	EQU 0x09BC		; 0x33 inactive TCP context (salt excluded)
+BSS_CH_UDP	EQU 0x09EF		; 0x18 inactive-channel UDP context
+BSS_PEND_LEN	EQU 0x0A07		; 2 words
+BSS_PEND_OFF	EQU 0x0A0B		; 2 words
+BSS_CLOSED	EQU 0x0A0F		; 2 bytes
+BSS_LOST	EQU 0x0A11		; 2 bytes
+BSS_PEND_BUF	EQU 0x0A13		; 2 * 536-byte TCP receive queues
+DLL_BSS_SIZE	EQU 0x0E43		; 3651 total
+	ASSERT	BSS_TX_BUF + 0x140 <= BSS_RX_HDR
 
 DLL_BSS
 	DS	DLL_BSS_SIZE, 0
@@ -199,6 +207,10 @@ UDP_BSS_BASE		EQU DLL_BSS + BSS_UDP
 ICMP_BSS_BASE		EQU DLL_BSS + BSS_ICMP
 
 	INCLUDE "memmap.inc"
+	; TX_BUF must still fit the largest frame BUILD_FRAME-style
+	; routines assemble whole (only resolve_lib's DNS query does,
+	; under zero-copy TX -- see the layout comment above).
+	ASSERT	RESOLVE_MAX_FRAME <= 0x140
 
 ; ======================================================
 ; The @MAIN contract the stack libraries compile against
@@ -213,7 +225,7 @@ CANCELLED	EQU DLL_BSS + BSS_CANCELLED	; 1
 TX_BUF		EQU DLL_BSS + BSS_TX_BUF
 RX_HDR		EQU DLL_BSS + BSS_RX_HDR
 RX_BUF		EQU DLL_BSS + BSS_RX_BUF
-RX_BUF_SIZE	EQU 1066
+RX_BUF_SIZE	EQU 1514		; 14+20+8+1472 (standard UDP MTU)
 
 CH_TCP_CTX	EQU DLL_BSS + BSS_CH_TCP	; inactive channel swap slot
 CH_UDP_CTX	EQU DLL_BSS + BSS_CH_UDP	; inactive channel swap slot
@@ -1614,7 +1626,11 @@ RESET_CHANNEL_STATE
 	LD	HL,TCP_STATE
 	LD	(HL),A
 	LD	DE,TCP_STATE+1
-	LD	BC,0x0DC7		; TCP BSS .. end of DLL BSS, minus first byte
+	; = DLL_BSS_SIZE - BSS_TCP - 1.  Literal, NOT a computed
+	; difference (relocation rule); recompute by hand and update
+	; this comment's numbers whenever DLL_BSS_SIZE or BSS_TCP moves.
+	; 0x0E43 - 0x01A5 - 1 = 0x0C9D.
+	LD	BC,0x0C9D		; TCP BSS .. end of DLL BSS, minus first byte
 	LDIR
 	DEC	A			; 0xFF = no live context selected
 	LD	(ACTIVE_CH),A
@@ -2040,18 +2056,20 @@ PARSE_U16
 	RET
 
 ; ------------------------------------------------------
-; Caller-buffer validation, mirroring UNETESP so both backends
-; accept and reject exactly the same arguments.
-;
-; CHECK_BUF: reject window 0 (DSS), window 3 (the ISA aperture) and
-; the DLL's own window.  Out: CF=1 invalid.  Preserves BC, DE, HL.
+; Caller-buffer validation.  Matches the frozen ABI contract in
+; unet.inc: WIN0 pointers are accepted -- mapping a caller-owned page
+; over DSS/system memory there, and restoring it safely, is entirely
+; the caller's duty, not this backend's to police.  Window 3 (the ISA
+; aperture) and the DLL's own window are still rejected: a buffer
+; there is not merely risky, it is physically the wrong data (the ISA
+; window swaps under us mid-call, and our own window holds our code
+; and BSS, not the caller's).  Out: CF=1 invalid.  Preserves BC, DE, HL.
 ; ------------------------------------------------------
 CHECK_BUF
 	LD	A,H
 	AND	0xC0
-	JR	Z,.bad				; window 0: system
 	CP	0xC0
-	JR	Z,.bad				; window 3: ISA
+	JR	Z,.bad				; window 3: ISA (any H in 0xC0..0xFF)
 	LD	A,(WIN_BASE)
 	XOR	H
 	AND	0xC0

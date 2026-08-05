@@ -141,8 +141,17 @@ RTL_RCR_SHADOW	EQU LIBBSS_BASE + 0x174	; 1 byte
 ; ACKs never leave).  Cleared by INIT_BASE.
 RTL_TX_FAIL_COUNT EQU LIBBSS_BASE + 0x175	; 1 byte
 
+; SEND_FRAME_SG payload descriptor (IFDEF UNET_DLL only; harmless
+; unused scratch in EXE builds, so it is not gated here).  TX_HDR_LEN
+; separates the header region (built in TX_BUF) from the caller's own
+; payload region so VERIFY_TX_PREFIX/DMA_WRITE_SG can treat them as
+; two independently-retryable descriptors instead of one copied buffer.
+RTL_TX_HDR_LEN	EQU LIBBSS_BASE + 0x176	; 2 bytes
+RTL_TX_PAY_PTR	EQU LIBBSS_BASE + 0x178	; 2 bytes
+RTL_TX_PAY_LEN	EQU LIBBSS_BASE + 0x17A	; 2 bytes
+
 ; Total span of the LIBBSS_BASE region (util + rtl + netenv + rtl tx).
-LIBBSS_SIZE		EQU 0x176
+LIBBSS_SIZE		EQU 0x17C
 
 ; netcfg_lib: parsed-field outputs + 1024-byte file read
 ; buffer.  Active only in NETCFG.EXE -- no other utility
@@ -275,10 +284,17 @@ UDPLIB_LAST_FAIL		EQU UDP_BSS_BASE + 0x16	; 1 byte
 UDPLIB_RX_FLAGS		EQU UDP_BSS_BASE + 0x17	; 1 byte (bit0 truncated)
 UDPLIB_BSS_SIZE		EQU 0x18
 
-; udp_lib max payload.  Bounded by @MAIN.TX_BUF: 14 + 20 + 8 + 1024
-; = 1066 bytes.  Callers that want more must enlarge TX_BUF too.
-UDPLIB_MAX_PAYLOAD		EQU 1024
-UDPLIB_MAX_FRAME		EQU 1066
+; udp_lib max payload: the standard IPv4/Ethernet UDP datagram ceiling
+; (14 + 20 + 8 + 1472 = 1514, the largest frame that still fits an
+; untagged Ethernet MTU).  Matches the frozen ABI's own stated limit
+; (unet.inc: length > 1472 -> NERR_PARAM).  Sending this size requires
+; zero-copy TX (SEND_FRAME_SG, IFDEF UNET_DLL in rtl8019.asm) so the
+; payload never has to be copied into @MAIN.TX_BUF; a non-DLL caller
+; that still assembles the whole frame in TX_BUF must size TX_BUF to
+; UDPLIB_MAX_FRAME itself (no EXE app pulls udp_lib today, so this
+; has no byte-identity impact on the shipped utilities).
+UDPLIB_MAX_PAYLOAD		EQU 1472
+UDPLIB_MAX_FRAME		EQU 1514
 
 ; icmp_lib: echo request/reply state.  Active only in code that
 ; pulls icmp_lib (currently the UNET DLL).
