@@ -98,8 +98,14 @@ which card it got.  None of them changes the calling convention.
 - **`SETOPT RXTRIG` returns `NERR_NOTSUP`.**  It selects a 16550
   UART FIFO threshold, and there is no UART here.
   `SETOPT CANCELKEYS` works normally.
-- **`NERR_BUSY` is never returned.**  There is no separate network
-  processor that can still be warming up.
+- **`NERR_BUSY` means "drain first", not "warming up".**  There is no
+  separate network processor here, so the ESP meaning never applies.
+  Instead a TCP `SEND` returns `NERR_BUSY` when the channel still
+  holds undelivered received data (see "Bounded TCP retransmission"
+  below): call `RECV` to drain it, then repeat the `SEND`.  This is
+  deliberately distinct from `NERR_PARAM`, which always indicates a
+  caller bug (bad channel, buffer out of range) where a retry cannot
+  help.
 - **`PING` round-trip time is coarse.**  This stack has no
   millisecond timer, so `DE` returns the number of poll-loop ticks
   consumed (roughly milliseconds).  A reply that arrives on the
@@ -136,8 +142,16 @@ bytes confirmed before the failing chunk.
 
 A payload-bearing ACK is not discarded while `SEND` waits.  Its payload
 is retained in that channel's 536-byte receive queue and returned by the
-next `RECV`.  The consumer must drain pending data before another `SEND` on
-the same channel.
+next `RECV`.  The consumer must drain pending data before another `SEND`
+on the same channel; a `SEND` attempted with the queue still occupied is
+refused with `NERR_BUSY` (`DE` = bytes sent by earlier chunks of the same
+call).  The safe recovery sequence is: `STATUS` (bit 1, `RXPEND`, reports
+whether the channel holds deliverable data), `RECV` until `RXPEND`
+clears, then repeat the `SEND`.  When the queue is occupied, `RECV`
+serves it directly from memory without touching the NIC.  All `RECV`
+waits are bounded by the caller's `IY` timeout: the millisecond pacing is
+a calibrated CPU loop, not the 50 Hz system tick, so the bound holds
+even while interrupts are disabled by the caller.
 
 This remains a deliberately small TCP client, not a general TCP engine:
 there is one outstanding segment, no congestion window or fast retransmit,

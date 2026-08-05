@@ -524,6 +524,14 @@ F_SEND
 	; ESP backend ("peer data arriving during a send may be dropped -
 	; drain RECV before sending").  DE reports bytes sent by EARLIER
 	; chunks in this same call, per the ABI's "valid on error paths".
+	;
+	; NERR_BUSY, deliberately NOT NERR_PARAM: PARAM already means "bad
+	; argument" (CHECK_BUF_RANGE above returns it for a rejected
+	; buffer), and a consumer keying "drain RECV, then retry" on a
+	; code that also covers permanent caller bugs will loop forever on
+	; those (real FTPC bug report, 2026-08-05).  BUSY is the frozen
+	; ABI's transient-refusal code; NERR_AGAIN is off-limits here
+	; because unet.inc reserves it for UNET_CAP_ASYNCSEND backends.
 	LD	A,(ARG_CH)
 	CALL	PEND_LEN_ADDR_A
 	LD	A,(HL)
@@ -532,7 +540,7 @@ F_SEND
 	JR	Z,.chunk_ready
 	CALL	@ISA.ISA_CLOSE
 	LD	DE,(SEND_DONE)
-	LD	A,NERR_PARAM
+	LD	A,NERR_BUSY
 	JP	RET_A
 .chunk_ready
 	LD	HL,(ARG_IX)
