@@ -28,12 +28,13 @@ def counter_block(start, size):
     return bytes((start + index) & 0xFF for index in range(size))
 
 
-def serve(host, control_port, data_port, count, chunk, rate):
+def serve(host, control_port, data_port, count, chunk, rate, reply):
     control_server = listener(host, control_port)
     data_server = listener(host, data_port)
     log(
         f"UNET dual server: control {host}:{control_port}, "
-        f"data {host}:{data_port}, {count} bytes"
+        f"data {host}:{data_port}, {count} bytes, "
+        f"reply {len(reply)} bytes"
     )
 
     while True:
@@ -61,17 +62,20 @@ def serve(host, control_port, data_port, count, chunk, rate):
                     pass
 
                 if pending and not replied and sent >= count // 2:
-                    control.sendall(b"CONTROL REPLY DURING TRANSFER\r\n")
+                    control.sendall(reply)
                     replied = True
-                    log(f"control reply sent after {sent} data bytes")
+                    log(
+                        f"control reply sent after {sent} data bytes "
+                        f"({len(reply)} bytes)"
+                    )
                 if rate:
                     time.sleep(size / rate)
 
             data.shutdown(socket.SHUT_WR)
             log(f"data channel closed after {sent} bytes")
             if not replied:
-                control.sendall(b"CONTROL REPLY AFTER TRANSFER\r\n")
-                log("control reply sent after transfer")
+                control.sendall(reply)
+                log(f"control reply sent after transfer ({len(reply)} bytes)")
             time.sleep(1)
         except (BrokenPipeError, ConnectionResetError, OSError) as error:
             log(f"client disconnected: {error}")
@@ -88,6 +92,12 @@ def main():
     parser.add_argument("--count", type=int, default=4096)
     parser.add_argument("--chunk", type=int, default=536)
     parser.add_argument("--rate", type=int, default=4000)
+    # The control reply's LENGTH is a diagnostic knob: if UNETTEST's data
+    # byte count exceeds --count by exactly this many bytes, the control
+    # channel's payload is leaking into the data channel's stream.  Vary
+    # it to tell that apart from a duplicate inside the data stream
+    # itself, whose size would not track this option.
+    parser.add_argument("--reply", default="CONTROL REPLY DURING TRANSFER")
     args = parser.parse_args()
     if min(args.control_port, args.data_port, args.count, args.chunk) <= 0:
         parser.error("ports, count and chunk must be positive")
@@ -101,6 +111,7 @@ def main():
             args.count,
             args.chunk,
             args.rate,
+            args.reply.encode("ascii", "replace") + b"\r\n",
         )
     except KeyboardInterrupt:
         log("stopped")

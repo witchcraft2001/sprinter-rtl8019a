@@ -118,7 +118,12 @@ UNET_CHANNELS	EQU 2
 MAX_HOST_LEN	EQU 128			; matches UNETESP; also bounds the
 MAX_PORT_LEN	EQU 15			; resolver's own scratch usage
 TCP_MSS		EQU 536			; SEND chunk size, hidden by the ABI
-LASTERR_SIZE	EQU 128
+; Measured worst case: "RTL hw=0/#0300 st=NETINIT nerr=09 tcp=00 res=00
+; tx=04/02/03/22 regs=22 00 C8 C4 E0 80 46 60 49 4A" + NUL is ~98 bytes
+; (NETINIT is the longest stage mnemonic; see ST_* below).  112 keeps
+; real headroom while returning the image-budget bytes the v0.2.41
+; foreign-channel fix needed (see HANDLE_FOREIGN_FRAME/TCP_ADV_WIN).
+LASTERR_SIZE	EQU 112
 
 	ORG 0x0000			; the ONLY ORG; mkdll rewrites it
 DLL_IMAGE_ORIGIN	EQU $
@@ -172,26 +177,37 @@ DLL_IMAGE_ORIGIN	EQU $
 ; the DNS query via resolve_lib, bounded by RESOLVE_MAX_FRAME (320).
 ; RX_BUF grows to the standard IPv4 MTU (14+20+8+1472=1514) now that
 ; TX_BUF's shrink pays for it inside the libman 0x38C7 image budget.
+; BSS_TCP grew 0x035->0x037 (TCP_ADV_WIN_HI/LO, see memmap.inc) --
+; every offset from BSS_UDP onward shifted +2 accordingly.  BSS_LASTERR
+; shrank 0x080->0x070 (LASTERR_SIZE 128->112, see its declaration) --
+; every offset from BSS_TX_BUF onward shifted a further -16.
+; BSS_CH_TCP is SELECT_CHANNEL's swap slot: TCP_STATE..+TCP_CTX_SIZE
+; plus TCP_ACK_WAIT_STATE..+TCP_SWAP_TAIL_SIZE = 38+13 = 51 (0x33).
+; It must track those two constants, NOT TCP_BSS_SIZE -- the tail of
+; the TCP BSS past TCP_RECV_TIMEOUT (TCP_ADV_WIN_HI/LO) is
+; session-global and stays out of the swap.  The ASSERT after
+; INCLUDE "memmap.inc" enforces the relationship; see the two
+; incidents it now covers in TCP_ADV_WIN_HI's memmap.inc comment.
 BSS_LIB		EQU 0x0000		; 0x17C util + rtl + netenv + rtl tx + SG desc
 BSS_RESOLVE	EQU 0x017C		; 0x029 resolve_lib
-BSS_TCP		EQU 0x01A5		; 0x035 tcp_lib
-BSS_UDP		EQU 0x01DA		; 0x018 udp_lib
-BSS_ICMP	EQU 0x01F2		; 0x010 icmp_lib
-BSS_OUR_IP	EQU 0x0202		; 4
-BSS_OUR_MAC	EQU 0x0206		; 6
-BSS_CANCELLED	EQU 0x020C		; 1
-BSS_LASTERR	EQU 0x020E		; 0x080 formatted diagnostic line
-BSS_TX_BUF	EQU 0x028E		; 0x140 320 = RESOLVE_MAX_FRAME (largest whole-built frame)
-BSS_RX_HDR	EQU 0x03CE		; 4     NE2000 RX ring header
-BSS_RX_BUF	EQU 0x03D2		; 0x5EA 1514 = 14+20+8+1472 (standard UDP MTU)
-BSS_CH_TCP	EQU 0x09BC		; 0x33 inactive TCP context (salt excluded)
-BSS_CH_UDP	EQU 0x09EF		; 0x18 inactive-channel UDP context
-BSS_PEND_LEN	EQU 0x0A07		; 2 words
-BSS_PEND_OFF	EQU 0x0A0B		; 2 words
-BSS_CLOSED	EQU 0x0A0F		; 2 bytes
-BSS_LOST	EQU 0x0A11		; 2 bytes
-BSS_PEND_BUF	EQU 0x0A13		; 2 * 536-byte TCP receive queues
-DLL_BSS_SIZE	EQU 0x0E43		; 3651 total
+BSS_TCP		EQU 0x01A5		; 0x037 tcp_lib
+BSS_UDP		EQU 0x01DC		; 0x018 udp_lib
+BSS_ICMP	EQU 0x01F4		; 0x010 icmp_lib
+BSS_OUR_IP	EQU 0x0204		; 4
+BSS_OUR_MAC	EQU 0x0208		; 6
+BSS_CANCELLED	EQU 0x020E		; 1
+BSS_LASTERR	EQU 0x0210		; 0x070 formatted diagnostic line
+BSS_TX_BUF	EQU 0x0280		; 0x140 320 = RESOLVE_MAX_FRAME (largest whole-built frame)
+BSS_RX_HDR	EQU 0x03C0		; 4     NE2000 RX ring header
+BSS_RX_BUF	EQU 0x03C4		; 0x5EA 1514 = 14+20+8+1472 (standard UDP MTU)
+BSS_CH_TCP	EQU 0x09AE		; 0x33 inactive TCP context (salt + adv-win excluded)
+BSS_CH_UDP	EQU 0x09E1		; 0x18 inactive-channel UDP context
+BSS_PEND_LEN	EQU 0x09F9		; 2 words
+BSS_PEND_OFF	EQU 0x09FD		; 2 words
+BSS_CLOSED	EQU 0x0A01		; 2 bytes
+BSS_LOST	EQU 0x0A03		; 2 bytes
+BSS_PEND_BUF	EQU 0x0A05		; 2 * 536-byte TCP receive queues
+DLL_BSS_SIZE	EQU 0x0E35		; 3637 total
 	ASSERT	BSS_TX_BUF + 0x140 <= BSS_RX_HDR
 
 DLL_BSS
@@ -211,6 +227,14 @@ ICMP_BSS_BASE		EQU DLL_BSS + BSS_ICMP
 	; routines assemble whole (only resolve_lib's DNS query does,
 	; under zero-copy TX -- see the layout comment above).
 	ASSERT	RESOLVE_MAX_FRAME <= 0x140
+	; CH_TCP_CTX must hold SELECT_CHANNEL's full two-slice swap or the
+	; second SWAP_BYTES call overruns into CH_UDP_CTX -- which the same
+	; call is swapping too, so both get corrupted on every channel
+	; switch.  Equality, not >=: a slot LARGER than the swap would mean
+	; TCP BSS was added to without deciding whether the new state is
+	; per-channel (extend TCP_SWAP_TAIL_SIZE) or global (leave it out,
+	; like TCP_ADV_WIN_HI/LO) -- both mistakes have now happened once.
+	ASSERT	BSS_CH_UDP - BSS_CH_TCP == TCP_CTX_SIZE + TCP_SWAP_TAIL_SIZE
 
 ; ======================================================
 ; The @MAIN contract the stack libraries compile against
@@ -488,6 +512,29 @@ F_SEND
 	LD	(SEND_DONE),HL
 	CALL	@ISA.ISA_OPEN
 .chunk
+	; The channel's own pend slot must be empty before this chunk's
+	; SEND runs.  TCP.SEND's internal wait can receive and ACK
+	; payload piggybacked on our peer's ACK; CAPTURE_SEND_PENDING
+	; below has nowhere to put it if an earlier RECV was never
+	; drained.  That used to silently drop the just-ACKed bytes --
+	; an ACK is a promise to the peer that the data is ours for good,
+	; so losing it after the fact is a protocol-level bug, not a
+	; buffering inconvenience.  Refuse instead: the caller drains via
+	; RECV and retries, exactly as the ABI already documents for the
+	; ESP backend ("peer data arriving during a send may be dropped -
+	; drain RECV before sending").  DE reports bytes sent by EARLIER
+	; chunks in this same call, per the ABI's "valid on error paths".
+	LD	A,(ARG_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	JR	Z,.chunk_ready
+	CALL	@ISA.ISA_CLOSE
+	LD	DE,(SEND_DONE)
+	LD	A,NERR_PARAM
+	JP	RET_A
+.chunk_ready
 	LD	HL,(ARG_IX)
 	LD	DE,(SEND_DONE)
 	OR	A
@@ -853,6 +900,11 @@ F_RECV
 
 ; Build IX flags for ARG_CH.  Loss is sticky until reported; the optional
 ; XCHAN bit is driven by queued data/close on the other channel.
+; Out: IX = RECV flag word.  Preserves DE -- four call sites set the
+; returned byte count in DE BEFORE calling this (see .report_closed,
+; .idle, .reset_by_peer, .queue_fail), so a clobber here silently
+; corrupts RECV's return value.  PEND_HAS_A below is the one helper
+; that used to break that; keep it DE-clean.
 BUILD_RECV_FLAGS
 	LD	HL,0
 	LD	(RECV_FLAGS),HL
@@ -1328,7 +1380,8 @@ SELECT_CHANNEL
 	; and receive scratch after the two-byte salt as a second slice.
 	LD	HL,TCP_ACK_WAIT_STATE
 	LD	DE,@MAIN.CH_TCP_CTX + TCP_CTX_SIZE
-	LD	B,TCP_BSS_SIZE - 0x28
+	LD	B,TCP_SWAP_TAIL_SIZE	; NOT TCP_BSS_SIZE-0x28: the tail past
+					; TCP_RECV_TIMEOUT is session-global
 	CALL	SWAP_BYTES
 	LD	HL,UDPLIB_REMOTE_IP
 	LD	DE,@MAIN.CH_UDP_CTX
@@ -1418,16 +1471,25 @@ PEND_CLEAR_A
 	RET
 
 ; Out: NZ if channel A has buffered bytes or a deferred peer close.
+; MUST preserve DE: both callers hold a return value there across the
+; call -- BUILD_RECV_FLAGS carries RECV's byte count, F_STATUS carries
+; the status word it is still assembling.  The pend length used to be
+; read into DE as scratch, which silently overwrote both: RECV reported
+; the OTHER channel's queued byte count as bytes received (a closing
+; channel returned NERR_CLOSED with DE = the peer channel's pending
+; length, so the app counted phantom bytes and read stale buffer), and
+; STATUS lost UNET_ST_CONN.  Test the two length bytes through A
+; instead; same size, no scratch register.
 PEND_HAS_A
 	LD	(QUEUE_CH),A
 	CALL	PEND_LEN_ADDR_A
-	LD	E,(HL)
+	LD	A,(HL)
 	INC	HL
-	LD	D,(HL)
+	OR	(HL)			; NZ if either length byte is set
+	PUSH	AF
 	LD	A,(QUEUE_CH)
 	CALL	CLOSED_ADDR_A
-	LD	A,D
-	OR	E
+	POP	AF
 	OR	(HL)
 	RET	NZ
 	LD	A,(FOREIGN_HINT)
@@ -1557,10 +1619,19 @@ HANDLE_FOREIGN_FRAME
 	CP	1
 	JR	NZ,.check_udp
 	CALL	@TCP.IS_TCP_FROM_PEER
-	JR	NC,.restore_not_ours
+	JP	NC,.restore_not_ours
+	; From here until .tcp_done, any ACK BUILD_ACK sends for this
+	; swapped-in owner context must tell the truth: the owner is not
+	; selected, so its only receive capacity is the single-MSS pend
+	; slot, not the normal window this channel advertises while
+	; active.  Restored to the default below before switching back.
+	LD	A,@TCP.TCP_FOREIGN_WIN_HI
+	LD	(TCP_ADV_WIN_HI),A
+	LD	A,@TCP.TCP_FOREIGN_WIN_LO
+	LD	(TCP_ADV_WIN_LO),A
 	LD	A,(FOREIGN_OWNER)
 	CALL	FOREIGN_TCP_FITS
-	JR	C,.restore_blocked
+	JP	C,.tcp_blocked_drain
 	LD	A,1
 	LD	(FOREIGN_BUSY),A
 	LD	HL,1
@@ -1591,6 +1662,10 @@ HANDLE_FOREIGN_FRAME
 	LD	(FOREIGN_BUSY),A
 	LD	A,0xFF
 	LD	(FOREIGN_HINT),A
+	LD	A,@TCP.TCP_RECV_WIN_HI
+	LD	(TCP_ADV_WIN_HI),A
+	LD	A,@TCP.TCP_RECV_WIN_LO
+	LD	(TCP_ADV_WIN_LO),A
 	LD	A,(FOREIGN_ORIG)
 	CALL	SELECT_CHANNEL
 	XOR	A
@@ -1617,6 +1692,39 @@ HANDLE_FOREIGN_FRAME
 	OR	A
 	RET
 
+.tcp_blocked_drain
+	; The owner's single-MSS pend slot cannot take this segment: it
+	; is still occupied by an earlier undrained one, or (rarely) this
+	; segment alone exceeds CH_PEND_SIZE even with an empty slot.
+	; Previously this frame was left at the ring head (CF=1/A=1
+	; below), which stalls the WHOLE ring -- the DP8390 is a strict
+	; FIFO -- until the app happens to read exactly this channel.  If
+	; the app is busy on the OTHER channel instead (the common case:
+	; e.g. checking a control reply while a data transfer is still
+	; landing), every later frame for every channel becomes
+	; unreachable forever.  Consume it instead.  Nothing is queued --
+	; there is no room -- but re-ACKing the owner's CURRENT RCV_NXT
+	; with an honest window (0 while the slot stays occupied,
+	; TCP_FOREIGN_WIN once it was just this one oversized segment)
+	; tells the peer to slow down instead of silently inviting more
+	; data we cannot hold.  RCV_NXT does not advance, so the peer's
+	; own retransmit timer resends the segment once the app drains
+	; the queue and the window reopens.
+	LD	A,(FOREIGN_OWNER)
+	CALL	PEND_LEN_ADDR_A
+	LD	A,(HL)
+	INC	HL
+	OR	(HL)
+	JR	Z,.drain_ack		; pend empty: only this one segment was too big
+	XOR	A
+	LD	(TCP_ADV_WIN_HI),A
+	LD	(TCP_ADV_WIN_LO),A
+.drain_ack
+	CALL	@TCP.SEND_DUP_ACK
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	JR	.tcp_done
+
 ; Forget both contexts and their receive queues.  Used after NETINIT has
 ; closed the old links and reinitialised the card.
 RESET_CHANNEL_STATE
@@ -1629,10 +1737,18 @@ RESET_CHANNEL_STATE
 	; = DLL_BSS_SIZE - BSS_TCP - 1.  Literal, NOT a computed
 	; difference (relocation rule); recompute by hand and update
 	; this comment's numbers whenever DLL_BSS_SIZE or BSS_TCP moves.
-	; 0x0E43 - 0x01A5 - 1 = 0x0C9D.
-	LD	BC,0x0C9D		; TCP BSS .. end of DLL BSS, minus first byte
+	; 0x0E35 - 0x01A5 - 1 = 0x0C8F.
+	LD	BC,0x0C8F		; TCP BSS .. end of DLL BSS, minus first byte
 	LDIR
-	DEC	A			; 0xFF = no live context selected
+	; The bulk zero above also cleared TCP_ADV_WIN_HI/LO (it sits
+	; inside the zeroed span); restore it to the normal window --
+	; HANDLE_FOREIGN_FRAME only ever overrides it for the duration of
+	; one nested call and always restores this same default after.
+	LD	A,@TCP.TCP_RECV_WIN_HI
+	LD	(TCP_ADV_WIN_HI),A
+	LD	A,@TCP.TCP_RECV_WIN_LO
+	LD	(TCP_ADV_WIN_LO),A
+	LD	A,0xFF			; 0xFF = no live context selected
 	LD	(ACTIVE_CH),A
 	LD	(FOREIGN_HINT),A
 	RET

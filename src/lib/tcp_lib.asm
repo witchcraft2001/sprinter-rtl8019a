@@ -115,6 +115,15 @@ ACK_WAIT_RX_PENDING	EQU 2
 TCP_RECV_WIN_HI		EQU 0x0A		; 2680 = 0x0A78 (5 * MSS 536)
 TCP_RECV_WIN_LO		EQU 0x78
 
+; Multichannel only: the honest window while an ACK is built for a
+; FOREIGN channel's segment (see TCP_ADV_WIN_HI/LO in memmap.inc and
+; HANDLE_FOREIGN_FRAME in unetrtl.asm).  That channel is not selected,
+; so its only receive capacity is the single CH_PEND_SIZE slot -- one
+; MSS -- not the normal TCP_RECV_WIN_HI/LO this connection would
+; advertise while actively selected.
+TCP_FOREIGN_WIN_HI	EQU 0x02		; 536 = 0x0218 (one MSS, one pend slot)
+TCP_FOREIGN_WIN_LO	EQU 0x18
+
 ; Delayed-ACK threshold (RFC 1122 allows up to 2 segments unacked).
 ; We are slightly more aggressive (4) because the chip RX ring is
 ; large and the link is local; we still flush an ACK immediately
@@ -501,13 +510,25 @@ BUILD_ACK
 	LD	A,TF_ACK
 	LD	(DE),A
 	INC	DE
-	; advertised window (BE)
+	; advertised window (BE).  Multichannel: runtime TCP_ADV_WIN_HI/LO
+	; (see its declaration in memmap.inc) instead of the fixed
+	; constant, so an ACK built while processing a foreign channel's
+	; segment can advertise that channel's true one-MSS pend capacity.
+	IFDEF USE_TCP_MULTICHAN
+	LD	A,(TCP_ADV_WIN_HI)
+	LD	(DE),A
+	INC	DE
+	LD	A,(TCP_ADV_WIN_LO)
+	LD	(DE),A
+	INC	DE
+	ELSE
 	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
 	LD	A,TCP_RECV_WIN_LO
 	LD	(DE),A
 	INC	DE
+	ENDIF
 	; csum placeholder
 	XOR	A
 	LD	(DE),A
@@ -866,7 +887,7 @@ WAIT_SYN_ACK
 	CALL	@UNET.HANDLE_FOREIGN_FRAME
 	JR	NC,.COMMIT_OTHER
 	OR	A
-	JP	Z,.LP
+	JP	Z,.TICK			; consumed: charge the budget, see RECV
 	LD	A,F_OTHER
 	LD	(TCP_LAST_FAIL),A
 	SCF
@@ -1295,8 +1316,16 @@ RECV
 	LD	A,1			; caller protocol = TCP
 	CALL	@UNET.HANDLE_FOREIGN_FRAME
 	JR	NC,.COMMIT_OTHER
+	; Foreign frame consumed (queued, or dropped+dup-ACKed by
+	; HANDLE_FOREIGN_FRAME's blocked-drain path).  Go to .TICK, NOT
+	; .LP: .LP skips the timeout decrement, and the blocked-drain
+	; path's dup-ACK provokes an immediate peer retransmit, so a
+	; blocked channel can refill the ring as fast as we empty it --
+	; looping on .LP then never expires and never returns to the app
+	; (only Esc breaks out).  A tick per foreign frame is the price
+	; of a bounded wait.
 	OR	A
-	JP	Z,.LP			; foreign frame consumed and queued
+	JP	Z,.TICK
 	LD	A,F_OTHER		; foreign queue full: leave head in NIC ring
 	LD	(TCP_LAST_FAIL),A
 	SCF

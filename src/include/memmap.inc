@@ -253,6 +253,32 @@ TCP_SEND_SEQ		EQU TCP_BSS_BASE + 0x2D	; 4 bytes (BE sequence used by retries)
 TCP_SEND_RETRY_LEFT	EQU TCP_BSS_BASE + 0x31	; 1 byte
 TCP_RECV_UNACKED	EQU TCP_BSS_BASE + 0x32	; 1 byte (full-context DLL build)
 TCP_RECV_TIMEOUT	EQU TCP_BSS_BASE + 0x33	; 2 bytes (one-shot override)
+; Multichannel (USE_TCP_MULTICHAN): BUILD_ACK's advertised window
+; becomes runtime state here instead of the fixed TCP_RECV_WIN_HI/LO
+; constant, so an ACK built while processing a FOREIGN channel's
+; segment (HANDLE_FOREIGN_FRAME in unetrtl.asm) can tell the truth
+; about that channel's real one-segment pend-queue capacity instead
+; of claiming the full normal window and inviting an overrun the ring
+; then cannot drain (see HANDLE_FOREIGN_FRAME for the full story).
+; Session-GLOBAL scratch around one nested call, never part of a
+; channel's saved context.  Defaults to TCP_RECV_WIN_HI/LO; reset in
+; RESET_CHANNEL_STATE and restored there after every foreign ACK.
+; Being outside TCP_CTX_SIZE is NOT sufficient to keep it out of a
+; context swap: SELECT_CHANNEL swaps a SECOND slice starting at
+; TCP_ACK_WAIT_STATE, and these two bytes sit at the far end of the
+; BSS, inside it.  TCP_SWAP_TAIL_SIZE below stops that slice short of
+; them -- do not size it from TCP_BSS_SIZE.  (Swapping them made every
+; channel opened second inherit the zeroed slot's window 0, so its
+; very first ACK advertised a closed window and the peer stalled after
+; the in-flight bytes.)
+TCP_ADV_WIN_HI		EQU TCP_BSS_BASE + 0x35	; 1 byte
+TCP_ADV_WIN_LO		EQU TCP_BSS_BASE + 0x36	; 1 byte
+
+; Length of SELECT_CHANNEL's second swap slice: TCP_ACK_WAIT_STATE
+; (0x28) .. TCP_RECV_TIMEOUT+1 (0x34) inclusive.  Deliberately NOT
+; TCP_BSS_SIZE-0x28: everything appended after TCP_RECV_TIMEOUT is
+; session-global and must stay out of the per-channel swap.
+TCP_SWAP_TAIL_SIZE	EQU 13		; 0x28..0x34
 
 ; Total per-session TCP state size; copied wholesale by
 ; TCP.SAVE_CTX / TCP.RESTORE_CTX so apps can multiplex
@@ -263,7 +289,7 @@ TCP_CTX_SIZE		EQU 38		; 0x26: TCP_STATE .. TCP_RX_DATA_LEN+1
 
 ; Entire tcp_lib BSS span including non-context scratch above.
 ; Literal for relocatable DLL builds; never derive this from addresses.
-TCP_BSS_SIZE		EQU 53		; 0x35 bytes
+TCP_BSS_SIZE		EQU 55		; 0x37 bytes
 
 ; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + MSS(536)
 ; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF
