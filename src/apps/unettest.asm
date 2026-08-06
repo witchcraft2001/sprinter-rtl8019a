@@ -933,6 +933,16 @@ DUAL_PHASE
 	LD	HL,MSG_DUAL_CLOSED
 	CALL	PUTS_LN
 .data_done
+	; An empty stream is not "continuous" in any useful sense.  Keep the
+	; configurable host byte count manual, but make the zero-data failure
+	; unambiguous instead of printing a vacuous success.
+	LD	HL,(DUAL_TOTAL)
+	LD	A,H
+	OR	L
+	JR	NZ,.have_data
+	LD	A,1
+	LD	(DUAL_BAD),A
+.have_data
 	LD	HL,MSG_DUAL_BYTES
 	CALL	PUTS
 	LD	HL,(DUAL_TOTAL)

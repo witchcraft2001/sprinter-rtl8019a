@@ -48,25 +48,23 @@ def serve(host, control_port, data_port, count, chunk, rate, reply, lockstep):
         pending = bytearray()
         sent = 0
         replied = False
-        if lockstep:
-            # Answer the control command BEFORE streaming any data, the way
-            # a real FTP server answers USER/PASS.  The reply then rides in
-            # on the ACK of the client's own command segment, which is what
-            # makes UNETRTL's CAPTURE_SEND_PENDING fill that channel's pend
-            # slot while SEND is still running.  A backend whose SEND pend
-            # guard is ordered wrong reports the completed command as
-            # refused; UNETTEST shows that as a send error at "request
-            # sent" instead of proceeding.
-            control.settimeout(5.0)
-            try:
-                block = control.recv(4096)
-                if block:
-                    pending.extend(block)
+        # A real FTP data transfer starts after a control command.  Waiting
+        # here also prevents an unlimited-rate data sender from filling the
+        # NIC FIFO before the client's control SEND can reach its own ACK.
+        # The two modes differ only in reply timing: lockstep answers now;
+        # the default answers halfway through the ensuing data stream.
+        control.settimeout(5.0)
+        try:
+            block = control.recv(4096)
+            if block:
+                pending.extend(block)
+                log(f"control command received ({len(block)} bytes)")
+                if lockstep:
                     control.sendall(reply)
                     replied = True
                     log(f"lockstep: replied immediately ({len(reply)} bytes)")
-            except socket.timeout:
-                log("lockstep: no control command arrived within 5 s")
+        except socket.timeout:
+            log("no control command arrived within 5 s")
         control.setblocking(False)
         try:
             while sent < count:

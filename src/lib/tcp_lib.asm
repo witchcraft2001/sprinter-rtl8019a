@@ -1443,9 +1443,9 @@ RECV
 		; The multichannel build's normal threshold is one: only the
 		; scoped bit-7 path needs the counter-aware branch here.
 		LD	A,(RECV_UNACKED)
-		BIT	7,A
-		JR	NZ,.DEFER_ACK
-		JR	.SEND_ACK
+		RLCA
+		JR	NC,.SEND_ACK
+		RRCA
 	ELSE
 		LD	A,(RECV_UNACKED)
 		BIT	7,A
@@ -1481,6 +1481,11 @@ RECV
 		LD	(RECV_UNACKED),A
 		JR	.AOK
 .ACK_SEND_FAIL
+		; Count the ACK that just failed as debt.  In the scoped drain this
+		; turns a lone defer bit (for example FIN+data as the first segment)
+		; into a flushable 0x81 instead of silently losing the retry.
+		LD	HL,RECV_UNACKED
+		INC	(HL)
 		LD	A,F_SEND
 		LD	(TCP_LAST_FAIL),A
 		SCF
@@ -1602,6 +1607,7 @@ RECV
 		LD	HL,@MAIN.TX_BUF
 		LD	BC,(TCP_TX_LEN)
 		CALL	@RTL.SEND_FRAME		; best-effort; the next copy re-triggers
+		JP	C,.TICK			; retain the complete scoped ACK debt
 		LD	A,(RECV_UNACKED)
 		AND	0x80
 		LD	(RECV_UNACKED),A

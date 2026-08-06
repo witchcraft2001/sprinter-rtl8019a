@@ -36,6 +36,7 @@ HEXB
 ; Print byte in A as 2 hex digits via DSS_PCHARS.
 ; Preserves A,BC,DE,HL.
 ; ------------------------------------------------------
+	IFNDEF LIB_NO_CONSOLE
 PRINT_HEX_A
 	PUSH	AF,BC,DE,HL
 	LD	C,A
@@ -84,6 +85,7 @@ PRINT_MAC
 .DONE
 	POP	HL,DE,BC,AF
 	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; Approximate delay loops. Calibrated for Sprinter Z80
@@ -108,6 +110,7 @@ DELAY_2MS
 ; ------------------------------------------------------
 ; Delay HL milliseconds (HL > 0). For HL=0 returns immediately.
 ; ------------------------------------------------------
+	IFNDEF UTIL_NO_DELAY_MS
 DELAY_MS
 	PUSH	AF,HL
 	LD	A,H
@@ -122,6 +125,7 @@ DELAY_MS
 .DONE
 	POP	HL,AF
 	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; STARTSWITH: ZF=1 if string at HL starts with the ASCIIZ

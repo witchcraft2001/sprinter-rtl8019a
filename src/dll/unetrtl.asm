@@ -71,6 +71,7 @@
 
 	DEFINE	UNET_DLL
 	DEFINE	LIB_NO_CONSOLE		; no DSS_PCHARS / DSS_EXIT from libraries
+	DEFINE	UTIL_NO_DELAY_MS	; DLL uses only the 1 ms and 2 ms primitives
 
 ; Library slices this DLL needs.  Deliberately NOT: USE_CMDL (the argv
 ; machinery and DIE_USAGE's print-and-exit -- we take only the
@@ -391,16 +392,14 @@ F_NETINIT
 	LD	HL,@MAIN.OUR_MAC
 	LD	A,RCR_AB
 	CALL	@RTL.INIT_NORMAL
-	CALL	CAPTURE_DIAG			; snapshot while the window is open
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE		; snapshot, then close the window
 	LD	A,1
 	LD	(INITED),A
 	XOR	A
 	LD	(LAST_NERR),A
 	RET
 .hw_fail
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	JP	RET_HW
 
 ; ------------------------------------------------------
@@ -472,16 +471,14 @@ F_CONNECT
 	CALL	@ISA.ISA_OPEN
 	CALL	@TCP.OPEN
 	JR	C,.fail
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	LD	A,1
 	CALL	SET_CH_STATE			; 1 = TCP
 	XOR	A
 	LD	(LAST_NERR),A
 	RET
 .fail
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	JP	MAP_TCP_FAIL
 
 ; ------------------------------------------------------
@@ -600,10 +597,11 @@ F_SEND
 	LD	(LAST_NERR),A
 	RET
 .fail
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	LD	HL,(SEND_DONE)
+	PUSH	HL
+	CALL	CAPTURE_AND_CLOSE
 	CALL	MAP_TCP_SEND_FAIL		; A = NERR_*, CF=0
-	LD	DE,(SEND_DONE)
+	POP	DE
 	RET
 .udp
 	; One datagram; the cap is set by TX_BUF, not by the protocol.
@@ -627,8 +625,7 @@ F_SEND
 	LD	(LAST_NERR),A
 	RET
 .udp_fail
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	LD	DE,0
 	LD	A,NERR_SEND
 	JP	RET_A
@@ -636,10 +633,10 @@ F_SEND
 ; ------------------------------------------------------
 ; Function 7 - RECV.
 ;
-; TCP payload is copied into a private 536-byte queue for the selected
-; channel before the shared frame buffer can be reused.  A foreign TCP frame
-; may therefore be ACKed and queued while the other channel is waiting; UDP
-; frames can remain protected at the NIC ring head until their owner is read.
+; Selected-channel TCP payload goes straight from RX_BUF to the caller and
+; only a final non-fitting tail uses its 536-byte queue.  Foreign TCP payload
+; is still queued while the other channel waits; UDP can remain protected at
+; the NIC ring head until its owner is read.
 ; ------------------------------------------------------
 F_RECV
 	CALL	CHECK_CHANNEL
@@ -651,17 +648,7 @@ F_RECV
 	LD	(STAGE),A
 	CALL	GET_CH_STATE
 	AND	A
-	JR	NZ,.have_state
-	; Keep a closed marker observable after the TCP state itself has
-	; been released.  This makes the call after a FIN/RST return the
-	; frozen NERR_CLOSED result instead of the generic NERR_STATE.
-	LD	A,(ARG_CH)
-	CALL	CLOSED_ADDR_A
-	LD	A,(HL)
-	OR	A
-	JP	NZ,.closed_no_state
-	JP	RET_STATE
-.have_state
+	JP	Z,RET_STATE
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
@@ -677,25 +664,30 @@ F_RECV
 	; RECV_UNACKED is part of the swapped TCP context.
 	CALL	FLUSH_RECV_ACK
 	JP	C,.hw
-	XOR	A
-	LD	(COPY_LEN),A
-	LD	(COPY_LEN+1),A
+	; FLUSH_RECV_ACK returns A=0 on either successful path.
+	LD	H,A
+	LD	L,A
+	LD	(COPY_LEN),HL
 	; Serve the existing remainder first, directly into the caller buffer.
 	CALL	COPY_PENDING_ARG
 	LD	HL,(ARG_IX)
 	LD	A,H
 	OR	L
 	JP	Z,.return_drain
+	; Preserve the legacy low-latency contract: data already buffered in
+	; pend is the first available block, so return it immediately instead
+	; of waiting up to the caller's IY for another segment.  Fresh NIC data
+	; still uses the multi-segment nonblocking drain below.
+	LD	HL,(COPY_LEN)
+	LD	A,H
+	OR	L
+	JP	NZ,.return_drain
 	; A FIN seen last time with trailing data already delivered.
 	LD	A,(ARG_CH)
 	CALL	CLOSED_ADDR_A
 	LD	A,(HL)
 	OR	A
 	JR	Z,.no_closed_pending
-	LD	HL,(COPY_LEN)
-	LD	A,H
-	OR	L
-	JP	NZ,.return_drain
 	JP	.report_closed
 .no_closed_pending
 	LD	A,0xFF
@@ -742,51 +734,50 @@ F_RECV
 	LD	(HL),1
 	JP	.return_drain
 .rx_err_open
-	; TCP.RECV has already captured the relevant chip state in its normal
-	; open window.  Formatting is deferred until after ISA_CLOSE.
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	LD	A,(TCP_STATE)
+	CP	@TCP.ST_CLOSE_WAIT
+	JR	Z,.peer_fin_open
+	; Unexpected receive failures retain a chip snapshot for LASTERR.
+	CALL	CAPTURE_AND_CLOSE
 	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_SEND
 	JP	Z,.return_drain
-	LD	A,(TCP_STATE)
-	CP	@TCP.ST_CLOSE_WAIT
-	JP	Z,.peer_fin
 	; Timeout is not an error at this layer: idle, link still alive.
 	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_TIMEOUT
-	JP	Z,.idle
+	JP	Z,.return_drain
 	CP	@TCP.F_OTHER
-	JP	Z,.idle
+	JP	Z,.return_drain
 	CP	@TCP.F_CANCEL
-	JP	Z,.cancelled
+	JR	Z,.cancelled
 	CP	@TCP.F_RST
-	JP	Z,.reset_by_peer
+	JR	Z,.reset_by_peer
+	CALL	FLUSH_RECV_ACK
+	JR	C,.hw
+	LD	A,NERR_PROTO
+	; Common no-data error return below also normalises the ABI outputs.
+.zero_return
 	LD	DE,0
 	LD	IX,0
-	LD	A,NERR_PROTO
 	JP	RET_A
 .reset_by_peer
 	LD	A,(ARG_CH)
 	CALL	CLOSED_ADDR_A
 	LD	(HL),1
-	XOR	A
-	CALL	SET_CH_STATE
 	LD	HL,(COPY_LEN)
 	LD	A,H
 	OR	L
-	JP	NZ,.return_drain
-	JP	.report_closed
-.idle
-	JP	.return_drain
+	JR	NZ,.return_drain
+	JR	.report_closed
 .cancelled
 	XOR	A
 	LD	(@MAIN.CANCELLED),A
 	CALL	FLUSH_RECV_ACK
-	LD	DE,0
-	LD	IX,0
+	JR	C,.hw
 	LD	A,NERR_CANCEL
-	JP	RET_A
+	JR	.zero_return
+.peer_fin_open
+	CALL	@ISA.ISA_CLOSE
 .peer_fin
 	; FIN, possibly carrying a last data segment.
 	LD	A,(ARG_CH)
@@ -795,34 +786,42 @@ F_RECV
 	LD	BC,(TCP_RX_DATA_LEN)
 	LD	A,B
 	OR	C
-	JP	Z,.report_closed
-	LD	HL,(TCP_RX_DATA_PTR)
-	CALL	COPY_RX_ARG
-	JP	C,.queue_fail
-	JP	.return_drain
+	JR	NZ,.peer_fin_data
+	; Pending bytes copied at entry remain observable even when the peer's
+	; separate FIN follows immediately.  Report CLOSED on the next call.
+	LD	HL,(COPY_LEN)
+	LD	A,H
+	OR	L
+	JR	NZ,.return_drain
 .report_closed
 	CALL	FLUSH_RECV_ACK
-	JP	C,.hw
+	JR	C,.hw
+	LD	A,(ARG_CH)
+	CALL	CLOSED_ADDR_A
+	LD	(HL),0
 	XOR	A
 	CALL	SET_CH_STATE
 	LD	DE,0
 	CALL	BUILD_RECV_FLAGS
 	LD	A,NERR_CLOSED
 	JP	RET_A
+.peer_fin_data
+	LD	HL,(TCP_RX_DATA_PTR)
+	CALL	COPY_RX_ARG
+	JR	C,.queue_fail
+	JR	.return_drain
 .queue_fail
 	CALL	FLUSH_RECV_ACK
-	JP	C,.hw
+	JR	C,.hw
 	LD	DE,(COPY_LEN)
 	LD	A,D
 	OR	E
-	JP	NZ,.return_drain_ok
+	JR	NZ,.return_drain_ok
 	LD	A,NERR_PROTO
-	JP	RET_A
+	JR	.zero_return
 .hw
-	LD	DE,0
-	LD	IX,0
 	LD	A,NERR_HW
-	JP	RET_A
+	JR	.zero_return
 
 .return_drain
 	CALL	FLUSH_RECV_ACK
@@ -837,13 +836,8 @@ F_RECV
 	LD	DE,(COPY_LEN)
 	LD	A,D
 	OR	E
-	JP	NZ,.return_drain_ok
-	JP	.hw
-.closed_no_state
-	LD	DE,0
-	LD	IX,0
-	LD	A,NERR_CLOSED
-	JP	RET_A
+	JR	NZ,.return_drain_ok
+	JR	.hw
 .udp
 	; -- UDP: one datagram per call --
 	LD	A,0xFF
@@ -881,8 +875,7 @@ F_RECV
 	LD	(LAST_NERR),A
 	RET
 .udp_err
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	LD	IX,0
 	LD	DE,0
 	LD	A,(UDPLIB_LAST_FAIL)
@@ -926,7 +919,6 @@ FLUSH_RECV_ACK
 	CALL	@ISA.ISA_CLOSE
 	XOR	A
 	LD	(@TCP.RECV_UNACKED),A
-	OR	A
 	RET
 .flush_fail
 	CALL	@ISA.ISA_CLOSE
@@ -953,6 +945,7 @@ COPY_ARG_BC
 	PUSH	BC
 	LD	DE,(ARG_DE)
 	LDIR
+	LD	(QUEUE_SRC),HL
 	POP	BC
 	JP	ADVANCE_COPY_BC
 
@@ -972,23 +965,26 @@ COPY_PENDING_ARG
 	LD	H,B
 	LD	L,C
 	LD	DE,(ARG_IX)
-	OR	A
 	SBC	HL,DE
 	JR	C,.take
 	LD	BC,(ARG_IX)
-	JR	.take
 .take
+	LD	A,B
+	OR	C
+	RET	Z
 	LD	A,(ARG_CH)
 	CALL	PEND_BUF_ADDR_A
 	EX	DE,HL
 	LD	A,(ARG_CH)
 	CALL	PEND_OFF_ADDR_A
+	PUSH	BC
 	LD	C,(HL)
 	INC	HL
 	LD	B,(HL)
 	LD	H,B
 	LD	L,C
 	ADD	HL,DE
+	POP	BC
 	CALL	COPY_ARG_BC
 	; Subtract the copied amount from the pending length.
 	LD	HL,(QUEUE_LEN)
@@ -998,7 +994,6 @@ COPY_PENDING_ARG
 	EX	DE,HL
 	LD	E,C
 	LD	D,B
-	OR	A
 	SBC	HL,DE
 	PUSH	HL
 	LD	HL,(QUEUE_LEN)
@@ -1047,28 +1042,21 @@ COPY_RX_ARG
 	JR	C,.partial
 	POP	HL
 	CALL	COPY_ARG_BC
-	OR	A
 	RET
 .partial
-	; The caller's remaining capacity is the prefix copied; the original
-	; segment length is retained in QUEUE_LEN for deriving the tail.
+	; Copy the caller-sized prefix first.  COPY_ARG_BC leaves the advanced
+	; source in QUEUE_SRC, which is exactly the tail that must be deferred.
 	POP	HL
 	LD	(QUEUE_LEN),BC
-	LD	DE,(ARG_IX)
-	ADD	HL,DE
-	LD	(QUEUE_SRC),HL
+	LD	BC,(ARG_IX)
+	CALL	COPY_ARG_BC
 	LD	HL,(QUEUE_LEN)
-	OR	A
-	SBC	HL,DE
-	LD	(QUEUE_LEN),HL
-	LD	B,D
-	LD	C,E
-	CALL	ADVANCE_COPY_BC
+	SBC	HL,BC
+	LD	B,H
+	LD	C,L
 	LD	HL,(QUEUE_SRC)
-	LD	BC,(QUEUE_LEN)
 	LD	A,(ARG_CH)
-	CALL	QUEUE_TCP_DATA
-	RET
+	JP	QUEUE_TCP_DATA
 
 ; Build IX flags for ARG_CH.  Loss is sticky until reported; the optional
 ; XCHAN bit is driven by queued data/close on the other channel.
@@ -1078,16 +1066,14 @@ COPY_RX_ARG
 ; corrupts RECV's return value.  PEND_HAS_A below is the one helper
 ; that used to break that; keep it DE-clean.
 BUILD_RECV_FLAGS
-	LD	HL,0
-	LD	(RECV_FLAGS),HL
+	LD	C,0
 	LD	A,(ARG_CH)
 	CALL	PEND_LEN_ADDR_A
 	LD	A,(HL)
 	INC	HL
 	OR	(HL)
 	JR	Z,.no_more
-	LD	HL,RECV_FLAGS
-	SET	1,(HL)
+	SET	1,C
 .no_more
 	LD	A,(ARG_CH)
 	CALL	LOST_ADDR_A
@@ -1095,17 +1081,19 @@ BUILD_RECV_FLAGS
 	OR	A
 	JR	Z,.no_lost
 	LD	(HL),0
-	LD	HL,RECV_FLAGS
-	SET	2,(HL)
+	SET	2,C
 .no_lost
 	LD	A,(ARG_CH)
 	XOR	1
+	PUSH	BC
 	CALL	PEND_HAS_A
+	POP	BC
 	JR	Z,.no_xchan
-	LD	HL,RECV_FLAGS
-	SET	3,(HL)
+	SET	3,C
 .no_xchan
-	LD	IX,(RECV_FLAGS)
+	LD	B,0
+	PUSH	BC
+	POP	IX
 	RET
 
 ; ------------------------------------------------------
@@ -1258,8 +1246,7 @@ F_RESOLVE
 	LD	(LAST_NERR),A
 	RET
 .fail
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	JP	MAP_RESOLVE_FAIL
 
 ; ------------------------------------------------------
@@ -1299,15 +1286,13 @@ F_PING
 	CALL	@ICMP.ECHO			; -> DE = tick-count RTT
 	JR	C,.fail
 	PUSH	DE
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	POP	DE
 	XOR	A
 	LD	(LAST_NERR),A
 	RET
 .fail
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	LD	DE,0
 	LD	A,(ICMPLIB_LAST_FAIL)
 	CP	@ICMP.F_CANCEL
@@ -1620,22 +1605,19 @@ PEND_CLEAR_A
 	LD	(HL),A
 	INC	HL
 	LD	(HL),A
-	POP	AF
-	PUSH	AF
-	CALL	PEND_OFF_ADDR_A
-	XOR	A
+	INC	HL
+	INC	HL
+	INC	HL
 	LD	(HL),A
 	INC	HL
 	LD	(HL),A
 	POP	AF
 	LD	E,A
-	LD	D,0
-	LD	HL,@MAIN.CH_CLOSED
-	ADD	HL,DE
+	CALL	CLOSED_ADDR_A
 	XOR	A
 	LD	(HL),A
-	LD	HL,@MAIN.CH_LOST
-	ADD	HL,DE
+	INC	HL
+	INC	HL
 	LD	(HL),A
 	LD	A,(FOREIGN_HINT)
 	CP	E
@@ -1655,20 +1637,19 @@ PEND_CLEAR_A
 ; STATUS lost UNET_ST_CONN.  Test the two length bytes through A
 ; instead; same size, no scratch register.
 PEND_HAS_A
-	LD	(QUEUE_CH),A
+	LD	C,A
 	CALL	PEND_LEN_ADDR_A
 	LD	A,(HL)
 	INC	HL
 	OR	(HL)			; NZ if either length byte is set
 	PUSH	AF
-	LD	A,(QUEUE_CH)
+	LD	A,C
 	CALL	CLOSED_ADDR_A
 	POP	AF
 	OR	(HL)
 	RET	NZ
 	LD	A,(FOREIGN_HINT)
-	LD	HL,QUEUE_CH
-	SUB	(HL)
+	CP	C
 	JR	NZ,.no_hint
 	INC	A			; NZ: the queued ring head belongs to A
 	RET
@@ -2027,8 +2008,7 @@ RESOLVE_AND_ARP
 	OR	A				; CF=0
 	RET
 .fail
-	CALL	CAPTURE_DIAG
-	CALL	@ISA.ISA_CLOSE
+	CALL	CAPTURE_AND_CLOSE
 	SCF
 	RET
 
@@ -2135,6 +2115,11 @@ CAPTURE_DIAG
 	LD	BC,4
 	LDIR
 	RET
+
+; Common failure/success diagnostic tail.  All callers enter with ISA open.
+CAPTURE_AND_CLOSE
+	CALL	CAPTURE_DIAG
+	JP	@ISA.ISA_CLOSE
 
 ; ------------------------------------------------------
 ; BUILD_LASTERR: format the captured diagnostic into LASTERR_BUF.
@@ -2490,8 +2475,6 @@ ARG_LPORT	DW 0
 SEND_DONE	DW 0
 CHUNK_LEN	DW 0
 COPY_LEN	DW 0
-	; SEND scratch and RECV flag assembly are never live together.
-RECV_FLAGS	EQU CHUNK_LEN
 FOREIGN_BUSY	DB 0
 FOREIGN_ORIG	DB 0
 FOREIGN_OWNER	DB 0
@@ -2503,10 +2486,16 @@ FOREIGN_HINT	DB 0xFF			; channel owning the current NIC ring head
 TARGET_IP	EQU SEND_DONE
 TARGET_MAC	EQU SEND_DONE + 4
 QUEUE_CH	EQU ARG_A
-QUEUE_SRC	EQU SEND_DONE
-QUEUE_LEN	EQU SEND_DONE + 2
-DIAG_REGS	EQU TARGET_IP
-DIAG_TX		EQU FOREIGN_OWNER
+	; Queueing can run inside F_SEND while SEND_DONE/CHUNK_LEN are live.
+	; ARG_IY/ARG_PORT are unused by SEND and are no longer needed by RECV
+	; once a fresh segment is being queued, so they are safe shared scratch.
+QUEUE_SRC	EQU ARG_IY
+QUEUE_LEN	EQU ARG_PORT
+	; Diagnostic storage must never overlap persistent dispatcher state.
+	; FIN bypasses capture until its data has been copied, while F_SEND
+	; protects SEND_DONE on the stack around its failure snapshot.
+DIAG_REGS	EQU ARG_DE
+DIAG_TX		EQU SEND_DONE
 
 LASTERR_BUF	EQU DLL_BSS + BSS_LASTERR
 
