@@ -1430,7 +1430,7 @@ RECV
 	LD	A,ST_CLOSE_WAIT
 	LD	(TCP_STATE),A
 .NO_FIN
-	; Decide whether to ACK this segment now.  Force ACK on FIN
+		; Decide whether to ACK this segment now.  Force ACK on FIN
 	; (state == CLOSE_WAIT here).  Otherwise apply delayed-ACK:
 	; bump the unacked counter and skip the ACK so long as more
 	; packets remain in the chip's RX ring AND the counter is
@@ -1439,26 +1439,51 @@ RECV
 	LD	A,(TCP_STATE)
 	CP	ST_CLOSE_WAIT
 	JR	Z,.SEND_ACK
-	LD	A,(RECV_UNACKED)
-	INC	A
-	LD	(RECV_UNACKED),A
-	CP	TCP_ACK_THRESH
-	JR	NC,.SEND_ACK
-	CALL	@RTL.RING_HAS_PACKET
-	JR	Z,.SEND_ACK		; ring empty -> flush ACK now
-	; Skip ACK on this packet; keep counter for next iteration.
-	JR	.AOK
+	IFDEF USE_TCP_MULTICHAN
+		; The multichannel build's normal threshold is one: only the
+		; scoped bit-7 path needs the counter-aware branch here.
+		LD	A,(RECV_UNACKED)
+		BIT	7,A
+		JR	NZ,.DEFER_ACK
+		JR	.SEND_ACK
+	ELSE
+		LD	A,(RECV_UNACKED)
+		BIT	7,A
+		JR	NZ,.DEFER_ACK
+		INC	A
+		LD	(RECV_UNACKED),A
+		CP	TCP_ACK_THRESH
+		JR	NC,.SEND_ACK
+		CALL	@RTL.RING_HAS_PACKET
+		JR	Z,.SEND_ACK		; ring empty -> flush ACK now
+		; Skip ACK on this packet; keep counter for next iteration.
+		JR	.AOK
+	ENDIF
+.DEFER_ACK
+		; Public UNETRTL RECV sets bit 7 while it drains several
+		; segments into the caller's buffer.  Keep the low seven bits
+		; as the debt counter, but never let the ordinary threshold path
+		; emit an ACK in the middle of that scoped drain.
+		INC	A
+		LD	(RECV_UNACKED),A
+		JR	.AOK
 .SEND_ACK
-	XOR	A
-	LD	(RECV_UNACKED),A
-	CALL	BUILD_ACK
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	CALL	@RTL.SEND_FRAME
-	JR	NC,.AOK
-	LD	A,F_SEND
-	LD	(TCP_LAST_FAIL),A
-	SCF
+		; Preserve the scoped-defer bit on a forced FIN ACK.  On a
+		; transmit failure preserve the complete debt byte so the DLL
+		; can retry its cumulative ACK on the next public RECV.
+		CALL	BUILD_ACK
+		LD	HL,@MAIN.TX_BUF
+		LD	BC,(TCP_TX_LEN)
+		CALL	@RTL.SEND_FRAME
+		JR	C,.ACK_SEND_FAIL
+		LD	A,(RECV_UNACKED)
+		AND	0x80
+		LD	(RECV_UNACKED),A
+		JR	.AOK
+.ACK_SEND_FAIL
+		LD	A,F_SEND
+		LD	(TCP_LAST_FAIL),A
+		SCF
 	RET
 .AOK
 	; Decide return.
@@ -1570,13 +1595,17 @@ RECV
 	; backoff and we would ignore every copy until RECV times out.
 	; The dup-ACK also fires the peer's fast retransmit on a lost
 	; data segment instead of waiting out its RTO.
-	XOR	A
-	LD	(RECV_UNACKED),A	; cumulative ACK pays the delayed-ACK debt
-	CALL	BUILD_ACK
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	CALL	@RTL.SEND_FRAME		; best-effort; the next copy re-triggers
-	JP	.TICK
+		; A duplicate/out-of-order segment still gets an immediate ACK,
+		; even inside a scoped drain.  Restore bit 7 afterwards so the
+		; public caller can flush the remaining cumulative debt at exit.
+		CALL	BUILD_ACK
+		LD	HL,@MAIN.TX_BUF
+		LD	BC,(TCP_TX_LEN)
+		CALL	@RTL.SEND_FRAME		; best-effort; the next copy re-triggers
+		LD	A,(RECV_UNACKED)
+		AND	0x80
+		LD	(RECV_UNACKED),A
+		JP	.TICK
 .CANCEL
 	LD	A,F_CANCEL
 	LD	(TCP_LAST_FAIL),A

@@ -165,7 +165,17 @@ the reliable path is enabled for `UNETRTL.DLL`.
 
 `RECV` also treats `IY=0` consistently for TCP and UDP: it polls the NIC
 once and returns idle instead of letting the UDP timeout counter wrap to
-approximately 65 seconds.
+approximately 65 seconds.  On TCP, one call first waits for a segment using
+the caller's `IY`, then drains already available segments with one-tick polls
+until the caller buffer is full or the ring is empty.  Data is copied directly
+to the caller buffer; only a final partial segment is retained in the existing
+per-channel pending slot.  Thus a single TCP `RECV` may return more than the
+536-byte MSS while preserving the same ABI and queue limits.  The drain
+coalesces its cumulative ACK into one scoped flush; ordinary receive, `SEND`
+and foreign-channel processing keep their immediate-ACK behavior.  If that
+flush fails after bytes were delivered, those bytes are still returned and
+the ACK debt is retried by the next `RECV`; with no bytes to return the call
+reports `NERR_HW`.
 
 ## Two channels
 
@@ -207,4 +217,4 @@ the release archive and the floppy image, so a consumer can take the
 ready-built file without installing the assembler or libman.  Its L1
 header records the ABI line in the numeric version field and the full
 package revision in the 15-byte text tag, for example
-`UNETRTL v0.2.39`.
+`UNETRTL v0.2.47`.
