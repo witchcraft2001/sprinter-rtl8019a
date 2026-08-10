@@ -33,6 +33,9 @@ BUILD_APPS=(
   wget
   ftp
   telnet
+  dlspeed
+  dldirect
+  dldircp
   unettest
 )
 
@@ -55,6 +58,9 @@ ZIP_EXCLUDE_APPS=(
   arp
   pingalt
   udptest
+  dlspeed
+  dldirect
+  dldircp
   unettest
 )
 ZIP_EXCLUDE_DLLS=()
@@ -62,6 +68,7 @@ ZIP_EXCLUDE_DOC_FILES=(
   docs/ARP.md
   docs/UDPTEST.md
   docs/NICMODE.md
+  docs/DLSPEED.md
 )
 
 # Text/documentation files copied to the distribution root.
@@ -85,6 +92,7 @@ DIST_DOC_FILES=(
   docs/TFTP.md
   docs/ISAPROBE.md
   docs/NICMODE.md
+  docs/DLSPEED.md
   docs/UNETRTL.md
   LICENSE
 )

@@ -727,7 +727,14 @@ F_RECV
 	LD	A,H
 	OR	L
 	JP	Z,.return_drain
-	JR	.drain_loop
+	; Three MSS segments are the measured optimum on RTL8019AS.  End this
+	; public call at that boundary even when the caller offered more room;
+	; FLUSH_RECV_ACK emits the cumulative ACK and the next call resumes at
+	; the following segment still queued in the NIC ring.
+	LD	A,(@TCP.RECV_UNACKED)
+	CP	0x83
+	JR	C,.drain_loop
+	JP	.return_drain
 .mark_fin
 	LD	A,(ARG_CH)
 	CALL	CLOSED_ADDR_A
@@ -743,7 +750,6 @@ F_RECV
 	CP	@TCP.F_SEND
 	JP	Z,.return_drain
 	; Timeout is not an error at this layer: idle, link still alive.
-	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_TIMEOUT
 	JP	Z,.return_drain
 	CP	@TCP.F_OTHER
@@ -1430,23 +1436,18 @@ F_SETOPT
 .cancelkeys
 	LD	A,D
 	OR	E
-	JR	Z,.off
+	JR	Z,.store_cancel
 	LD	A,1
+.store_cancel
 	LD	(CANCEL_MODE),A
 	XOR	A
-	RET
-.off
-	XOR	A
-	LD	(CANCEL_MODE),A
 	RET
 
 ; ------------------------------------------------------
 ; Reserved slots 18..23.
 ; ------------------------------------------------------
 F_NOTSUP
-	LD	A,NERR_NOTSUP
-	OR	A
-	RET
+	JP	RET_NOTSUP
 
 ; ======================================================
 ; Shared exits.  Reached via JP C / JP Z, so CF is cleared
