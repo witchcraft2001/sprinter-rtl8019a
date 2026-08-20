@@ -108,6 +108,9 @@ The kit relies on DSS environment variables populated by
 |                 | (e.g. `1/#300`); set by `NETCFG -i` from         |
 |                 | `RTL_HW=` or by the auto-scan in `INIT_BASE`     |
 |                 | when net.cfg doesn't pin it down                 |
+| `NET_RTL_RESET` | `SOFT` -> the driver skips the NE2000 board      |
+|                 | reset port at `BASE+0x1F`; absent -> standard    |
+|                 | hard reset.  Set by `NETCFG -i` from `RTL_RESET=`|
 | `NET_DHCP_SRV`  | DHCP server that issued the lease (DHCP only)    |
 | `NET_LEASE_SEC` | Remaining lease seconds (DHCP only)              |
 
@@ -134,6 +137,9 @@ RTL_MAC=02:80:19:11:22:33 optional MAC override (empty -> use PROM)
 RTL_HW=1/#300             ISA slot + I/O base ("S/HHH"); accept
                           optional "#" or "0x" prefix on HHH;
                           omit to auto-scan
+RTL_RESET=SOFT            skip the board reset port at BASE+0x1F
+                          (some NE2000 clones stall the ISA cycle
+                          there); omit for the standard hard reset
 DNS1=1.1.1.1              ignored when IP=DHCP
 DNS2=8.8.8.8              ignored when IP=DHCP
 NTP=pool.ntp.org          for NTP.EXE
@@ -141,6 +147,30 @@ TZ=+3                     signed integer hours
 ```
 
 Lines starting with `#` are comments; unknown keys are ignored.
+
+### `RTL_RESET=SOFT`
+
+The standard NE2000 bring-up pulses the board reset port at
+`BASE+0x1F` before programming the controller.  Some NE2000-compatible
+clones stall the ISA bus cycle on that port instead of completing it.
+A bus cycle that never finishes cannot be timed out in software, so
+the symptom is a dead machine right after a utility prints
+`[N1] RESET` -- not an error message.
+
+`RTL_RESET=SOFT` makes the driver skip `BASE+0x1F` entirely.  It stops
+the controller through `CR`, waits the same 2 ms, clears `ISR`, and
+lets `INIT_NORMAL` program every remaining register from scratch --
+which it does unconditionally anyway, so no state is lost beyond the
+cleaner starting point a real reset pulse guarantees.  Utilities print
+`[W02] soft reset: port 1F skipped.` while it is active.
+
+Use it only for a card that actually hangs; the hard reset stays the
+default because it recovers a controller left in a bad state.
+
+`TELNET.EXE` does not support `RTL_RESET=SOFT`: its image already sits
+a few bytes under the ceiling imposed by its load address, and the
+driver code for the soft path does not fit.  It is compiled out there
+via `RTL_NO_SOFT_RESET` and TELNET keeps doing the hard reset.
 
 `NETCFG -i` sets `NET_IP_SRC` to `STATIC` or `DHCP` based on the
 `IP=` line.  In DHCP mode it deletes any stale `NET_IP / NET_MASK

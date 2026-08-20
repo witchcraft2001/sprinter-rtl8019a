@@ -174,6 +174,18 @@ START
 .LY_DONE
 	PRINT LINE_END
 
+	; Raw 32-byte PROM image.  Mandatory on a non-Realtek clone: the
+	; NE2000 signature sits at 0E/0F only in the DIRECT layout (1C/1E
+	; when doubled), and a wrong layout guess silently yields a wrong
+	; MAC with no other symptom than a network that never answers.
+	; Two rows of 16 bytes.
+	LD	HL,PROM_BUF
+	XOR	A
+	CALL	PRINT_PROM_ROW
+	LD	HL,PROM_BUF + 0x10
+	LD	A,0x10
+	CALL	PRINT_PROM_ROW
+
 	; [N5] register snapshot captured before ISA_CLOSE.
 	CALL	PRINT_REG_DUMP
 
@@ -192,11 +204,22 @@ START
 	CP	RTL_ID1_VAL
 	JR	NZ,ID_BAD
 
-	; ID OK -- check signature
-	LD	A,(PROM_BUF + 0x0E)
+	; ID OK -- check signature.  Its position depends on the layout:
+	; adjacent bytes 0E/0F when direct, every other byte 1C/1E when
+	; the PROM image comes back doubled.
+	LD	HL,PROM_BUF + 0x0E
+	LD	DE,1
+	LD	A,(LAYOUT)
+	CP	1
+	JR	NZ,.SIG_AT
+	LD	HL,PROM_BUF + 0x1C
+	LD	E,2
+.SIG_AT
+	LD	A,(HL)
 	CP	0x57
 	JR	NZ,SIG_WARN
-	LD	A,(PROM_BUF + 0x0F)
+	ADD	HL,DE
+	LD	A,(HL)
 	CP	0x57
 	JR	NZ,SIG_WARN
 
@@ -444,6 +467,35 @@ PUTCHAR
 	LD	C,DSS_PUTCHAR
 	RST	DSS
 	POP	BC,AF
+	RET
+
+; ------------------------------------------------------
+; PRINT_PROM_ROW: one 16-byte row of the raw PROM image as
+; "PROM oo: xx xx ...".
+; In: HL = source bytes, A = offset printed in the label.
+; Trashes AF, BC, DE, HL (the PRINT macro clobbers HL, so the
+; caller reloads it for the second row).
+; ------------------------------------------------------
+PRINT_PROM_ROW
+	PUSH	HL
+	PUSH	AF
+	PRINT MSG_PROM_ROW
+	POP	AF
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,':'
+	CALL	PUTCHAR
+	POP	HL
+	LD	B,16
+.LP
+	LD	A,' '
+	PUSH	HL
+	CALL	PUTCHAR			; preserves AF/BC but not HL
+	POP	HL
+	LD	A,(HL)
+	INC	HL
+	CALL	@UTIL.PRINT_HEX_A	; preserves everything
+	DJNZ	.LP
+	PRINT LINE_END
 	RET
 
 ; ------------------------------------------------------
@@ -771,6 +823,7 @@ MSG_PAREN_CLOSE	DB ")",0
 MSG_N4		DB "[N4] PROM MAC=",0
 MSG_PROM_SIG	DB "PROM[0E..0F]=",0
 MSG_LAYOUT	DB "PROM_LAYOUT=",0
+MSG_PROM_ROW	DB "PROM ",0
 MSG_DIRECT	DB "direct",0
 MSG_DOUBLED	DB "doubled",0
 MSG_UNKNOWN	DB "unknown",0
@@ -810,7 +863,7 @@ MSG_RESULT_FAIL	DB "RESULT FAIL",0
 MSG_E_ID	DB "[E02] RTL ID mismatch",0
 MSG_E_RESET	DB "[E01] RESET timeout",0
 MSG_E_PROM	DB "[E03] PROM read failed",0
-MSG_W_SIG	DB "[W01] PROM[0E..0F] != 57 57 (NE2000 signature mismatch)",0
+MSG_W_SIG	DB "[W01] PROM signature != 57 57 (NE2000 mismatch)",0
 MSG_W_NO_ID	DB "[W02] ID mismatch but MAC plausible -- continuing",0
 MSG_W_FUDUP	DB "[W03] FUDUP=1: peer switch port must be forced 10M/full",0
 MSG_W_MEDIA	DB "[W04] selected medium is not UTP; check PL/link/cable",0

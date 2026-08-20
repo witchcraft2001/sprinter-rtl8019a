@@ -356,6 +356,17 @@ DO_INIT
 	LD	HL,N_NET_RTL_HW
 	LD	IX,@NETCFG.OUR_RTL_HW
 	CALL	SETENV_STR
+	; RTL_RESET: publish NET_RTL_RESET=SOFT only when NET.CFG asked
+	; for it; otherwise push the empty string so SETENV_STR deletes
+	; any stale variable and the driver reverts to the hard reset.
+	LD	IX,V_RESET_NONE
+	LD	A,(@NETCFG.OUR_RTL_RESET)
+	OR	A
+	JR	Z,.RESET_ENV
+	LD	IX,V_RESET_SOFT
+.RESET_ENV
+	LD	HL,N_NET_RTL_RESET
+	CALL	SETENV_STR
 	; NET=RTL is the backend marker a launcher reads to decide which
 	; UNET DLL to load (the Wi-Fi kit publishes NET=WIFI).  UNETRTL.DLL
 	; also accepts the legacy state -- no NET at all, but NET_IP and
@@ -461,6 +472,14 @@ FILL_MAC_FROM_PROM
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@RTL.INIT_BASE
 	RET	C			; no chip; silently leave MAC zero
+	; NET.CFG's RTL_RESET= has NOT reached the environment yet --
+	; SETENV_STR for NET_RTL_RESET runs after this routine returns --
+	; so INIT_BASE's READ_RESET_MODE could not have seen it and has
+	; just cleared the flag.  Apply the freshly parsed value directly,
+	; otherwise a card that needs RTL_RESET=SOFT stalls the ISA cycle
+	; inside RESET on the very first `NETCFG -i` and hangs the machine.
+	LD	A,(@NETCFG.OUR_RTL_RESET)
+	LD	(RTL_SOFT_RESET),A
 	CALL	@RTL.RESET
 	JR	C,.CLOSE
 	; Set DCR=0x48 directly via the new IX-relative base.
@@ -844,6 +863,9 @@ N_NET_DNS2	DB "NET_DNS2",0
 N_NET_NTP	DB "NET_NTP",0
 N_NET_TZ	DB "NET_TZ",0
 N_NET_RTL_HW	DB "NET_RTL_HW",0
+N_NET_RTL_RESET	DB "NET_RTL_RESET",0
+V_RESET_SOFT	DB "SOFT",0
+V_RESET_NONE	DB 0
 N_NET		DB "NET",0
 		DB 0			; table terminator
 

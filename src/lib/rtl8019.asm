@@ -65,6 +65,19 @@ RTL_HDR_RETRIES	EQU 4			; RX header re-read attempts before drop
 ; open for longer than a 50 Hz system tick on real Sprinter hardware.
 RTL_DMA_SETTLE		EQU 0
 
+; Soft-reset support (skip the NE2000 board reset port at BASE+0x1F,
+; see RTL_SOFT_RESET in memmap.inc).  Costs ~116 bytes per image, so
+; it is compiled out of two builds:
+;   UNET_DLL            -- the libman image has no room and its BSS
+;                          offsets are literals (src/dll/unetrtl.asm).
+;   RTL_NO_SOFT_RESET   -- opt-out for an app already at its image
+;                          ceiling; TELNET.EXE is the only one today.
+	IFNDEF	UNET_DLL
+	IFNDEF	RTL_NO_SOFT_RESET
+	DEFINE	RTL_SOFT_RESET_SUPPORTED
+	ENDIF
+	ENDIF
+
 	MODULE RTL
 
 ; ------------------------------------------------------
@@ -102,6 +115,11 @@ INIT_BASE
 	LD	(RTL_TX_FAIL_COUNT),A
 	LD	A,RCR_AB		; sane default until INIT_NORMAL runs
 	LD	(RTL_RCR_SHADOW),A
+	IFDEF	RTL_SOFT_RESET_SUPPORTED
+	; Must happen here: DSS_ENVIRON is a DSS call and ISA is still
+	; CLOSED at this point.
+	CALL	READ_RESET_MODE
+	ENDIF
 
 	; Stage 1: env override.
 	CALL	TRY_ENV_OVERRIDE
@@ -155,6 +173,34 @@ INIT_BASE
 	CALL	PROBE_AT_IX
 	POP	HL			; restore table cursor
 	JR	C,.SLP
+	; A floating or mirrored ISA window can pass the register R/W test
+	; above, so the AUTO-SCAN additionally demands the Realtek 8019 ID
+	; before claiming a hit.  An explicitly pinned base
+	; (TRY_ENV_OVERRIDE) deliberately skips this check: the user has
+	; already said WHERE the card is, so there is no address to guess
+	; wrong, and requiring the Realtek signature there would lock out
+	; every other NE2000-compatible clone -- a UMC UM9003AF, say, can
+	; never produce 0x50/0x70.  It also matches this kit's own stated
+	; policy that the signature is a sanity check, not a hard gate
+	; (NICINFO downgrades a mismatch to a warning).
+	;
+	; Page 0 is still selected: .ONE_PASS wrote CR_PAGE0_STOP and only
+	; touched BNRY/TPSR after that, so no CR write (and no write
+	; recovery delay) is needed here -- these are two plain reads.
+	PUSH	HL			; table cursor
+	PUSH	IX
+	POP	HL
+	LD	DE,RTL_ID0_OFF
+	ADD	HL,DE
+	LD	A,(HL)
+	CP	RTL_ID0_VAL
+	JR	NZ,.ID_DONE
+	INC	HL
+	LD	A,(HL)
+	CP	RTL_ID1_VAL
+.ID_DONE
+	POP	HL			; POP does not disturb Z
+	JR	NZ,.SLP
 	; Hit: IX still = window addr.
 	PUSH	IX
 	POP	HL
@@ -222,6 +268,8 @@ TRY_ENV_OVERRIDE
 	PUSH	HL
 	POP	IX
 	CALL	@ISA.ISA_OPEN
+	; Explicit pin: accept any responding NE2000 core, Realtek ID or
+	; not.  Only .SCAN_BASES adds CHECK_RTL_ID (rationale there).
 	CALL	PROBE_AT_IX
 	JR	C,.PROBE_NO
 	OR	A
@@ -413,6 +461,44 @@ WRITE_ENV_HW
 
 N_RTL_HW	DB "NET_RTL_HW",0
 
+	IFDEF	RTL_SOFT_RESET_SUPPORTED
+; ------------------------------------------------------
+; READ_RESET_MODE: set RTL_SOFT_RESET from env NET_RTL_RESET
+; (written by NETCFG from net.cfg's RTL_RESET= line).  Any value
+; starting with 'S'/'s' selects the soft path; anything else --
+; including an absent variable -- keeps the standard NE2000 board
+; reset.  ISA must be CLOSED (this issues a DSS call).
+; Trashes A, BC, DE, HL.
+; ------------------------------------------------------
+READ_RESET_MODE
+	XOR	A
+	LD	(RTL_SOFT_RESET),A
+	LD	HL,N_RTL_RESET
+	LD	DE,NETENV_VAL_BUF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A			; A=0xFF found, 0 not
+	RET	Z
+	LD	A,(NETENV_VAL_BUF)
+	AND	0xDF			; crude upcase; 0 stays 0
+	CP	'S'
+	RET	NZ
+	LD	A,1
+	LD	(RTL_SOFT_RESET),A
+	IFNDEF	LIB_NO_CONSOLE
+	LD	HL,MSG_SOFT_RESET
+	LD	C,DSS_PCHARS
+	RST	DSS
+	ENDIF
+	RET
+
+N_RTL_RESET	DB "NET_RTL_RESET",0
+	IFNDEF	LIB_NO_CONSOLE
+MSG_SOFT_RESET	DB "[W02] soft reset: port 1F skipped.",13,10,0
+	ENDIF
+	ENDIF
+
 
 ; ------------------------------------------------------
 ; PROBE_AT_IX: presence test at chip window address in IX.
@@ -451,9 +537,15 @@ PROBE_AT_IX
 	PUSH	HL
 	LD	DE,RTL_BNRY_OFF
 	ADD	HL,DE
+	IFNDEF	UNET_DLL
+	CALL	.SETTLE			; write-to-write recovery, see below
+	ENDIF
 	LD	(HL),0xAA
 	; TPSR (offset 0x04).
 	INC	HL
+	IFNDEF	UNET_DLL
+	CALL	.SETTLE
+	ENDIF
 	LD	(HL),0x55
 	; Read BNRY back (after a settling delay).
 	DEC	HL
@@ -464,29 +556,15 @@ PROBE_AT_IX
 	; Round 2: invert.
 	LD	(HL),0x55
 	INC	HL
+	IFNDEF	UNET_DLL
+	CALL	.SETTLE
+	ENDIF
 	LD	(HL),0xAA
 	DEC	HL
 	CALL	.SETTLE
 	LD	A,(HL)
 	POP	HL
 	CP	0x55
-	JR	NZ,.MISS_NOPOP
-	; A floating or mirrored ISA window can pass the simple R/W
-	; test above.  The real target is RTL8019AS, so require the
-	; page-0 ID bytes as well before accepting an auto-scan hit.
-	PUSH	IX
-	POP	HL
-	LD	(HL),CR_PAGE0_STOP
-	LD	DE,RTL_ID0_OFF
-	ADD	HL,DE
-	CALL	.SETTLE
-	LD	A,(HL)
-	CP	RTL_ID0_VAL
-	JR	NZ,.MISS_NOPOP
-	INC	HL
-	CALL	.SETTLE
-	LD	A,(HL)
-	CP	RTL_ID1_VAL
 	JR	NZ,.MISS_NOPOP
 	OR	A
 	RET
@@ -498,6 +576,15 @@ PROBE_AT_IX
 
 ; Short ISA-settling busy-wait.  No DSS calls -- safe with the ISA
 ; window open.  Preserves every register the probe relies on.
+;
+; Also inserted BETWEEN consecutive writes above (non-DLL builds).  The
+; vendor DOS driver for the UMC UM9003AF puts three `in al,61h` bus
+; cycles between every pair of register writes, and LANSET.EXE carries a
+; /T=rate knob "on un-stable machines" whose history records the I/O
+; timing being tripled "for some critical machines".  A clone that needs
+; that recovery time swallows the second of two back-to-back writes,
+; which reads exactly like a dead write path.  Costs a few microseconds
+; on a probe that runs once.
 .SETTLE
 	PUSH	BC
 	LD	B,RTL_PROBE_SETTLE
@@ -532,6 +619,11 @@ PROBE_PRESENT
 ; isa_r()).  See followup #25.
 ; ------------------------------------------------------
 RESET
+	IFDEF	RTL_SOFT_RESET_SUPPORTED
+	LD	A,(RTL_SOFT_RESET)
+	OR	A
+	JR	NZ,.SOFT
+	ENDIF
 	LD	HL,(RTL_BASE_PTR)
 	LD	DE,RTL_RESET_OFF
 	ADD	HL,DE			; HL = RESET port addr
@@ -567,6 +659,27 @@ RESET
 	LD	(HL),A
 	OR	A
 	RET
+
+	IFDEF	RTL_SOFT_RESET_SUPPORTED
+; Soft reset: never touch BASE+0x1F.  Stop the core through CR,
+; give it the same 2 ms to retire whatever it was doing, then
+; clear ISR.  INIT_NORMAL / INIT_LOOPBACK program every remaining
+; register from scratch, so the board-level reset pulse is not
+; needed to reach a defined state -- it only guarantees a cleaner
+; starting point.  Cannot fail, hence the unconditional CF=0.
+.SOFT
+	LD	HL,(RTL_BASE_PTR)
+	LD	(HL),CR_PAGE0_STOP
+	CALL	@ISA.ISA_CLOSE
+	CALL	UTIL.DELAY_2MS
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(RTL_BASE_PTR)
+	LD	DE,RTL_ISR_OFF
+	ADD	HL,DE
+	LD	(HL),0xFF
+	OR	A
+	RET
+	ENDIF
 
 
 ; ------------------------------------------------------

@@ -118,15 +118,72 @@ The real UM9003AF test returned:
 [E] CR page select mismatch P0/P1=F1/F1
 ```
 
-Thus reads are stable but writes of standard CR values do not reach an
-active DP8390 core.  The card cannot be used by the current driver in this
-state.  The original UMC LANSET documentation calls the UM9003x a 16-bit
-jumperless adapter and explicitly mentions repairing an EEPROM "16/8-bit
-mark" after slot-width autodetection errors.  Plausible causes are a stale
-16-bit EEPROM mode/IO16 setting, an inactive configuration-only decode, or a
-failed IOW path on the card.  Do not guess the 93C46 protocol from Sprinter:
-use the original LANSET on a real x86 DOS machine with the card in an 8-bit
-slot, or read and back up the EEPROM with a programmer before changing it.
+At the time that looked like a dead write path.  It was not: a later run of
+the same card, after reseating it, returned
+
+```
+[N0] RAW CR=E1
+[N*] recovery-delay sweep (wait = DJNZ count)
+  w=00 P0=21 P1=61 ok
+[N1] PAGE0 21 FF FF FF 0F 00 00 E7 EF FF 20 01 FE 7F 7F 7F
+[N2] PAGE1 61 9E 4E 34 23 02 9C F7 DC 04 00 38 1F A6 51 02
+[N3] CR page select OK at wait=00
+```
+
+Writes reach the core, and at *zero* recovery delay -- so I/O timing was
+not the cause either.  Two things follow.  First, a single `P0/P1` mismatch
+is a property of one power-up, not of the card; repeat it before concluding
+anything.  Second, page-0 `8019ID0/ID1 = 20 01` confirms the chip is not a
+Realtek, so the auto-scan will never accept it and the base must be pinned
+(see below).  Page-1 `PAR0..5` is uninitialised garbage at this stage, not
+the card's MAC -- the driver loads PAR from PROM during init.
+
+**Since v0.2.48 `-n` no longer draws that conclusion from a single
+try.**  Analysis of the card's own vendor software found that the UMC DOS
+driver inserts three `in al,61h` bus cycles (~3 us) between *every* pair of
+register writes, and that `LANSET.EXE` carries a `/T=rate` knob "on
+un-stable machines" whose version history records the I/O timing being
+tripled "for some critical machines".  The two `NOP`s the old `-n` used are
+roughly 0.4 us, so a clone that genuinely needs recovery time is
+indistinguishable from a dead write path.  `-n` now sweeps a delay ladder
+(0, 1, 2, 4, 8, 16, 32, 64, 128, 255 `DJNZ` iterations) and prints one line
+per step:
+
+```
+[N0] RAW CR=F1
+[N*] recovery-delay sweep (wait = DJNZ count)
+  w=00 P0=F1 P1=F1 --
+  w=01 P0=F1 P1=F1 --
+  w=02 P0=21 P1=61 ok
+[N1] PAGE0 21 ...
+[N2] PAGE1 61 ...
+[N3] CR page select OK at wait=02
+```
+
+The first delay that works is the answer.  If every step fails, the full
+last capture is still printed with `at max wait=FF`, which rules recovery
+time out as the cause rather than leaving it untested.  ### When the hang is the reset port
+
+Register access proven by `-n` does not mean the whole 32-byte block is
+safe.  On the UM9003AF, `NICINFO` hangs the machine immediately after
+printing `[N1] RESET` -- the point at which the driver reads and writes the
+NE2000 board reset port at `BASE+0x1F`.  Every loop in `RTL.RESET` is
+bounded and its timeout path prints an error, so a freeze there means the
+Z80 is stopped inside the ISA bus cycle itself, which no software timeout
+can break.
+
+The workaround is `RTL_RESET=SOFT` in `NET.CFG` (see `HOWTO.md`): the
+driver then never touches `BASE+0x1F` and brings the controller up through
+its normal register file.  `NICINFO` prints `[W02] soft reset: port 1F
+skipped.` when it is active.
+
+With `RTL_HW=0/#300` and `RTL_RESET=SOFT` the UM9003AF passes the whole
+stage sequence on real hardware: `NICINFO`, `NICRAM` (remote DMA round
+trips at 16/64/256/1536 bytes across four packet-RAM addresses), `NICLB`
+(`PTX OK` plus the diagnostic FIFO, the expected physical-card result),
+`NICTX`, `NICRX`, and both `FTP` and `WGET` transfer files.  So neither
+the "16-bit card" nor the EEPROM `16/8-bit mark` theory was the problem:
+byte-wide remote DMA works, and the only real blocker was the reset port.
 
 If both slots are entirely `.`: the ISA bus is reading floating;
 no card or wrong slot mapping in DSS / Sprinter setup.  Try
@@ -139,6 +196,31 @@ location in `NET.CFG` (`RTL_HW=1/#320`, `NETCFG -i` to apply)
 or just let the auto-scan in `INIT_BASE` find and cache it on
 the next utility run -- subsequent utilities then skip the
 scan, reading `NET_RTL_HW` from env.
+
+### Non-Realtek NE2000 clones: pin the base
+
+The auto-scan requires the Realtek 8019 ID (`0x50 0x70`, "Pp") on page 0
+before it accepts a base, because a floating or mirrored ISA window can
+otherwise pass the plain register read/write test.  A non-Realtek
+NE2000-compatible controller -- a UMC UM9003AF, a Myson MTD90x, a National
+DP8390 -- cannot produce that signature and will therefore never be found
+by the scan, however healthy it is.
+
+Since v0.2.48 an **explicitly pinned base skips the ID requirement**:
+there is no address to guess wrong when the user has already said where
+the card is, so the register read/write test alone is enough.  For such a
+card, set the location in `NET.CFG` and apply it:
+
+```
+RTL_HW=1/#300      (slot / I/O base)
+NETCFG -i
+```
+
+`NICINFO` then reports the ID mismatch as a warning rather than refusing
+to run, per this kit's standing policy that the signature is a sanity
+check and not a hard gate.  Whether the card then works is a separate
+question -- `NICRAM` is the real test, since it exercises byte-wide remote
+DMA against packet RAM.
 
 ## Hex dump
 

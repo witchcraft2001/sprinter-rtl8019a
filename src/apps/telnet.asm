@@ -72,6 +72,12 @@ DSS_WRCHAR		EQU 0x58
 
 	DEVICE NOSLOT64K
 
+	; TELNET.EXE sits ~13 bytes under its 0x7F80 image ceiling, so it
+	; opts out of the driver's soft-reset path (see rtl8019.asm).  A
+	; card that needs RTL_RESET=SOFT therefore cannot run TELNET until
+	; the image is slimmed down; every other utility supports it.
+	DEFINE	RTL_NO_SOFT_RESET
+
 	INCLUDE "macro.inc"
 	INCLUDE "dss.inc"
 	DEFINE LIBBSS_CUSTOM

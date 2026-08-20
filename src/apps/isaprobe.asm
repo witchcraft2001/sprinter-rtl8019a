@@ -357,15 +357,46 @@ MODE_NECORE
 	ADD	HL,BC
 	LD	(SRC_PTR),HL
 
-	; Capture everything first; DSS is called only after ISA_CLOSE.
+	; Raw CR before anything is written.
 	CALL	@ISA.ISA_OPEN
 	LD	HL,(SRC_PTR)
 	LD	A,(HL)
 	LD	(NE_RAW_CR),A
+	CALL	@ISA.ISA_CLOSE
+	PRINT	MSG_NE_RAW
+	LD	A,(NE_RAW_CR)
+	CALL	PRINT_HEX_BYTE
+	PRINT	LINE_END
 
+	; Recovery-delay sweep.  The vendor's own DOS driver for the UMC
+	; UM9003AF puts THREE `in al,61h` bus cycles (~3 us) between every
+	; pair of register writes, and LANSET.EXE exposes a /T=rate knob
+	; "on un-stable machines" whose history notes the I/O timing was
+	; tripled "for some critical machines".  The old fixed two NOPs
+	; here are ~0.4 us, so a clone that needs real recovery time looks
+	; identical to a dead write path: reads return plausible values and
+	; the page-select write appears to be ignored.  Sweep instead of
+	; guessing -- the first delay that works is the answer, and "none
+	; of them works" is an equally useful result that rules timing out.
+	PRINTLN	MSG_NE_SWEEP
+	XOR	A
+	LD	(SWEEP_IDX),A
+.SWEEP
+	LD	A,(SWEEP_IDX)
+	CP	NE_WAIT_COUNT
+	JP	NC,.SWEEP_DONE
+	LD	E,A
+	LD	D,0
+	LD	HL,NE_WAIT_TABLE
+	ADD	HL,DE
+	LD	A,(HL)
+	LD	(NE_WAIT),A
+
+	; Capture everything first; DSS is called only after ISA_CLOSE.
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(SRC_PTR)
 	LD	(HL),NE_CR_PAGE0_STOP
-	NOP
-	NOP
+	CALL	NE_SETTLE
 	LD	HL,(SRC_PTR)
 	LD	DE,NE_PAGE0
 	LD	BC,16
@@ -373,8 +404,7 @@ MODE_NECORE
 
 	LD	HL,(SRC_PTR)
 	LD	(HL),NE_CR_PAGE1_STOP
-	NOP
-	NOP
+	CALL	NE_SETTLE
 	LD	HL,(SRC_PTR)
 	LD	DE,NE_PAGE1
 	LD	BC,16
@@ -385,30 +415,40 @@ MODE_NECORE
 	LD	(HL),NE_CR_PAGE0_STOP
 	CALL	@ISA.ISA_CLOSE
 
-	PRINT	MSG_NE_RAW
-	LD	A,(NE_RAW_CR)
+	; One line per delay: "  w=NNN P0=HH P1=HH ok|--"
+	PRINT	MSG_NE_W
+	LD	A,(NE_WAIT)
+	CALL	PRINT_HEX_BYTE
+	PRINT	MSG_NE_WP0
+	LD	A,(NE_PAGE0)
+	CALL	PRINT_HEX_BYTE
+	PRINT	MSG_NE_WP1
+	LD	A,(NE_PAGE1)
+	CALL	PRINT_HEX_BYTE
+	CALL	NE_CHECK_PAGES		; CF=0 when page select took effect
+	JR	C,.SWEEP_BAD
+	PRINTLN	MSG_NE_WOK
+	JP	.SWEEP_HIT
+.SWEEP_BAD
+	PRINTLN	MSG_NE_WNO
+	LD	A,(SWEEP_IDX)
+	INC	A
+	LD	(SWEEP_IDX),A
+	JP	.SWEEP
+
+.SWEEP_HIT
+	CALL	NE_PRINT_PAGES
+	PRINT	MSG_NE_OK
+	LD	A,(NE_WAIT)
 	CALL	PRINT_HEX_BYTE
 	PRINT	LINE_END
-	PRINT	MSG_NE_P0
-	LD	HL,NE_PAGE0
-	CALL	PRINT_16_BYTES
-	PRINT	MSG_NE_P1
-	LD	HL,NE_PAGE1
-	CALL	PRINT_16_BYTES
-
-	; Validate only page-select and STOP bits.  Remote-DMA command bits
-	; are implementation-dependent on readback.
-	LD	A,(NE_PAGE0)
-	AND	0xC3
-	CP	0x01
-	JR	NZ,.FAIL
-	LD	A,(NE_PAGE1)
-	AND	0xC3
-	CP	0x41
-	JR	NZ,.FAIL
-	PRINTLN MSG_NE_OK
 	JP	@UTIL.EXIT_OK
-.FAIL
+
+.SWEEP_DONE
+	; Nothing in the table worked.  Show the last capture in full so a
+	; screenshot still carries the register contents, and report the
+	; largest delay tried -- that is what rules the timing theory out.
+	CALL	NE_PRINT_PAGES
 	PRINT	MSG_NE_FAIL
 	LD	A,(NE_PAGE0)
 	CALL	PRINT_HEX_BYTE
@@ -416,9 +456,62 @@ MODE_NECORE
 	CALL	PUTCHAR
 	LD	A,(NE_PAGE1)
 	CALL	PRINT_HEX_BYTE
+	PRINT	MSG_NE_MAXW
+	LD	A,(NE_WAIT)
+	CALL	PRINT_HEX_BYTE
 	PRINT	LINE_END
 	LD	B,EX_NIC_ERR
 	JP	@UTIL.EXIT_FAIL
+
+; NE_CHECK_PAGES: validate only page-select and STOP bits.  Remote-DMA
+; command bits are implementation-dependent on readback.
+;   Out: CF=0 page select took effect; CF=1 mismatch.
+NE_CHECK_PAGES
+	LD	A,(NE_PAGE0)
+	AND	0xC3
+	CP	0x01
+	JR	NZ,.NO
+	LD	A,(NE_PAGE1)
+	AND	0xC3
+	CP	0x41
+	JR	NZ,.NO
+	OR	A
+	RET
+.NO
+	SCF
+	RET
+
+; NE_PRINT_PAGES: dump both captured register pages.  ISA must be closed.
+NE_PRINT_PAGES
+	PRINT	MSG_NE_P0
+	LD	HL,NE_PAGE0
+	CALL	PRINT_16_BYTES
+	PRINT	MSG_NE_P1
+	LD	HL,NE_PAGE1
+	CALL	PRINT_16_BYTES
+	RET
+
+; NE_SETTLE: NE_WAIT DJNZ iterations of pure CPU delay.  Calls nothing,
+; so it is safe with the ISA window open (no DSS, no page-3 remap).
+; NE_WAIT = 0 reproduces the historical "no delay" behaviour.
+NE_SETTLE
+	PUSH	BC
+	LD	A,(NE_WAIT)
+	OR	A
+	JR	Z,.DONE
+	LD	B,A
+.SD
+	DJNZ	.SD
+.DONE
+	POP	BC
+	RET
+
+; Delay ladder in DJNZ iterations.  At the Sprinter's clock one
+; iteration is well under a microsecond, so 0xFF still lands far above
+; the ~3 us the vendor driver uses -- if even that fails, the write path
+; is not a recovery-time problem.
+NE_WAIT_TABLE	DB 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0xFF
+NE_WAIT_COUNT	EQU 10
 
 
 ; DUMP_ROW: print one captured row "AAAA: HH HH ... | ASCII".
@@ -782,8 +875,15 @@ MSG_NE_PRE	DB "NE core @ I/O 0x",0
 MSG_NE_RAW	DB "[N0] RAW CR=",0
 MSG_NE_P0	DB "[N1] PAGE0 ",0
 MSG_NE_P1	DB "[N2] PAGE1 ",0
-MSG_NE_OK	DB "[N3] CR page select OK",0
+MSG_NE_OK	DB "[N3] CR page select OK at wait=",0
 MSG_NE_FAIL	DB "[E] CR page select mismatch P0/P1=",0
+MSG_NE_SWEEP	DB "[N*] recovery-delay sweep (wait = DJNZ count)",0
+MSG_NE_W	DB "  w=",0
+MSG_NE_WP0	DB " P0=",0
+MSG_NE_WP1	DB " P1=",0
+MSG_NE_WOK	DB " ok",0
+MSG_NE_WNO	DB " --",0
+MSG_NE_MAXW	DB " at max wait=",0
 MSG_FILE_PRE	DB "Writing 16 KB ISA window to ",0
 MSG_FILE_DONE	DB "Done.",0
 MSG_USAGE_ERR	DB "[E] usage error -- see help below.",0
@@ -827,3 +927,5 @@ CHUNK_BUF	EQU APP_BSS_BASE + 16		; CHUNK_SIZE
 NE_RAW_CR	EQU CHUNK_BUF			; 1
 NE_PAGE0	EQU CHUNK_BUF + 1		; 16
 NE_PAGE1	EQU CHUNK_BUF + 17		; 16
+NE_WAIT		EQU CHUNK_BUF + 33		; 1  current sweep delay
+SWEEP_IDX	EQU CHUNK_BUF + 34		; 1  index into NE_WAIT_TABLE

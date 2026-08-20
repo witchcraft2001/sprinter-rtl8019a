@@ -84,6 +84,7 @@ DHCP_MODE	EQU NETCFG_DHCP_MODE
 LOAD_FH		EQU NETCFG_LOAD_FH
 LOAD_BUF	EQU NETCFG_LOAD_BUF
 OUR_RTL_HW	EQU NETCFG_OUR_RTL_HW
+OUR_RTL_RESET	EQU NETCFG_OUR_RTL_RESET
 PATH_BUF	EQU NETCFG_PATH_BUF
 
 
@@ -228,6 +229,8 @@ APPLY_DEFAULTS
 	LD	(DHCP_MODE),A
 	; RTL_HW also defaults empty -- driver will auto-scan.
 	LD	(OUR_RTL_HW),A
+	; RTL_RESET defaults to the standard NE2000 board reset.
+	LD	(OUR_RTL_RESET),A
 	RET
 
 ; Hardcoded defaults applied BEFORE NET.CFG parsing.  If NET.CFG
@@ -330,9 +333,12 @@ PARSE
 	LD	DE,.K_HW
 	CALL	@UTIL.STARTSWITH
 	JP	Z,.HW
+	LD	DE,.K_RESET
+	CALL	@UTIL.STARTSWITH
+	JP	Z,.RESET
 	LD	DE,.K_TZ
 	CALL	@UTIL.STARTSWITH
-	JR	Z,.TZ
+	JP	Z,.TZ
 	LD	DE,.K_NTP
 	CALL	@UTIL.STARTSWITH
 	JP	Z,.NTPLINE
@@ -398,6 +404,26 @@ PARSE
 	ADD	HL,BC
 	CALL	PARSE_HW_LINE
 	JP	.LINE
+.RESET
+	; RTL_RESET=SOFT -> skip the board reset port at BASE+0x1F.
+	; Any other value (or an absent key) keeps the hard reset.
+	LD	BC,10			; len("RTL_RESET=")
+	ADD	HL,BC
+	CALL	SKIP_WS
+	LD	A,(HL)
+	AND	0xDF			; crude upcase; 0 stays 0
+	CP	'S'
+	LD	A,0
+	JR	NZ,.RESET_STORE
+	INC	A
+.RESET_STORE
+	LD	(OUR_RTL_RESET),A
+	; Every key handler must leave HL on the next line before
+	; re-entering .LINE (PARSE_HW_LINE ends in SKIP_TO_NEXT_LINE for
+	; the same reason).  CALL + JP, never JP SKIP_TO_NEXT_LINE: its
+	; RET would return out of PARSE entirely -- see the note in .IP.
+	CALL	SKIP_TO_NEXT_LINE
+	JP	.LINE
 .TZ
 	LD	BC,3			; len("TZ=")
 	ADD	HL,BC
@@ -418,6 +444,7 @@ PARSE
 .K_DNS2		DB "DNS2=",0
 .K_MAC		DB "RTL_MAC=",0
 .K_HW		DB "RTL_HW=",0
+.K_RESET	DB "RTL_RESET=",0
 .K_TZ		DB "TZ=",0
 .K_NTP		DB "NTP=",0
 

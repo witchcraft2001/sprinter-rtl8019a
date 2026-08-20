@@ -116,6 +116,14 @@ CMDL_SOURCE_PTR		EQU CMDL_BSS_BASE + 0x31	; 2 bytes
 RTL_TX_SOURCE_PTR	EQU LIBBSS_BASE + 0x134	; 2 bytes, caller's frame buffer
 RTL_TX_LENGTH		EQU LIBBSS_BASE + 0x136	; 2 bytes
 RTL_TX_RETRY_LEFT	EQU LIBBSS_BASE + 0x138	; 1 byte
+; RTL_SOFT_RESET: nonzero -> RTL.RESET must NOT touch the NE2000
+; board reset port at BASE+0x1F.  Some NE2000 clones stall the ISA
+; cycle on that port and a bus cycle that never completes cannot be
+; timed out in software, so this is a configuration choice (NET.CFG
+; RTL_RESET=SOFT -> env NET_RTL_RESET), never a runtime probe.
+; Placed in the 0x139..0x13F gap so LIBBSS_SIZE -- and with it every
+; literal BSS offset in src/dll/unetrtl.asm -- stays unchanged.
+RTL_SOFT_RESET	EQU LIBBSS_BASE + 0x139	; 1 byte
 RTL_TX_VERIFY_BUF	EQU LIBBSS_BASE + 0x140	; 42 bytes read back from NIC packet RAM
 RTL_TX_VERIFY_SIZE	EQU 42
 RTL_TX_LAST_CLDA	EQU LIBBSS_BASE + 0x16A	; 2 bytes, page-0 CLDA0/1 after TX
@@ -171,6 +179,7 @@ NETCFG_LOAD_FH		EQU 0xA23B	; 1 byte
 NETCFG_TMP_IP		EQU 0xA240	; 4 bytes (parser scratch)
 NETCFG_TMP_MAC		EQU 0xA244	; 6 bytes (parser scratch)
 NETCFG_OUR_RTL_HW	EQU 0xA24A	; 8 bytes ASCIIZ "S/#HHH" or empty
+NETCFG_OUR_RTL_RESET	EQU 0xA252	; 1 byte flag: 1 = RTL_RESET=SOFT
 NETCFG_PATH_BUF		EQU 0xA254	; 280 bytes: "<appdir>\NET.CFG",0 (APPINFO)
 ; File read buffer: 2 KB so a fully-commented NET.CFG template
 ; (the shipped sample is ~1.2 KB) is read whole, not truncated.

@@ -111,7 +111,7 @@ RTL8019AS_VERBOSE=1 ./run_sprinter_rtl8019as.sh -networkprovider pcap
 +----------------------------+        +-------------------------------+
 | MAME (rtl8019as ISA card)  |  feth0 |  host stack                   |
 | MAC: 02:80:19:11:22:33     | <----> |  feth1 inet 192.168.7.1/24    |
-| IP : 192.168.7.2 (NET.CFG) |        |  tcpdump / scapy / tftpd / ... |
+| IP : 192.168.7.2 (NET.CFG) |        |  tcpdump / tftpd / ...        |
 +----------------------------+        +-------------------------------+
 ```
 
@@ -352,13 +352,23 @@ rtl8019as: start io=0300 irq=3 prom=direct mac=02:80:19:xx:xx:xx
 
 Цель: принять frame, отправленный с хоста.
 
-Готовый host-side генератор: `tools/dev/send_frame.py` (требует `scapy`,
-`pip install --user scapy`). По умолчанию шлёт unicast `0x88B5`-frame на
-`02:80:19:11:22:33` с payload `"SPRINTER NICRX TEST"`:
+Готовый host-side генератор: `tools/dev/send_frame.py`. Внешних модулей не
+требует -- пишет кадр напрямую в link layer (`/dev/bpf` на macOS,
+`AF_PACKET` на Linux). По умолчанию шлёт unicast `0x88B5`-frame на
+`02:80:19:11:22:33` с payload `"SPRINTER NICRX TEST"`, дополняя его нулями
+до минимальных 60 байт (`--no-pad` отключает):
 
 ```sh
 sudo python3 tools/dev/send_frame.py --iface en0
 ```
+
+`sudo` не нужен, если стоит ChmodBPF от Wireshark (проверить: `id -Gn |
+grep access_bpf`) или если выдан доступ вручную: `sudo chmod g+rw /dev/bpf*`.
+
+MAC-источник по умолчанию берётся у самого интерфейса и печатается в
+строке `Sending ...`; `--src` его переопределяет. Кадр всегда уходит
+header-complete: на Darwin запись в BPF с расчётом на то, что источник
+подставит ядро, падает с `ENXIO`.
 
 В DSS:
 
@@ -490,7 +500,7 @@ host-генераторы, а против обычных хостовых се�
 - команду запуска MAME (с `-networkprovider`, выбранным интерфейсом, путём
   к binary);
 - фрагмент MAME log вокруг строк `rtl8019as: ...`;
-- параллельный вывод `tcpdump`/`scapy` с хоста;
+- параллельный вывод `tcpdump` с хоста;
 - скриншот DSS с stage-кодами и регистрами NIC;
 - содержимое `NET.CFG` (без чувствительных данных);
 - `mame -listnetwork` и имя выбранного интерфейса;

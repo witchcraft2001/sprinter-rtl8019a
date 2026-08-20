@@ -26,6 +26,26 @@ either card.  The ready-built DLL is committed at the repository root
 and ships in both release formats; its L1 header includes the full
 human-readable package tag. See `docs/UNETRTL.md`.
 
+## Supported cards
+
+Developed against Realtek RTL8019AS, but the driver is plain
+NE2000/DP8390 and other clones work.  A **UMC UM9003AF** is verified end
+to end on real hardware (NICINFO / NICRAM / NICLB / NICTX / NICRX all
+pass, and FTP and WGET download files).  Two settings are needed for it,
+both in `NET.CFG`:
+
+```
+RTL_HW=0/#300      pin slot + I/O base: the card has no Realtek 8019 ID
+                   (its page-0 ID reads 20 01), so the auto-scan will
+                   not accept it
+RTL_RESET=SOFT     skip the NE2000 board reset port at BASE+0x1F, which
+                   on this card stalls the ISA bus cycle and freezes the
+                   machine -- see HOWTO.md
+```
+
+`TELNET.EXE` is the one utility that does not support `RTL_RESET=SOFT`
+(image size limit); everything else does.
+
 ## Installing on Sprinter DSS
 
 The `distr/sprinter-rtl8019a.zip` archive and the FAT12 floppy image both
