@@ -171,6 +171,9 @@ F_OTHER			EQU 6	; head packet belongs to another UNET channel
 ;   In:  DE = destination buffer (>= TCP_CTX_SIZE bytes).
 ;   Out: DE advanced past the saved state.
 ; ------------------------------------------------------
+; Excluded from UNETRTL.DLL (libman image budget): only FTP.EXE swaps
+; whole TCP contexts this way; the DLL uses SELECT_CHANNEL instead.
+	IFNDEF	UNET_DLL
 SAVE_CTX
 	LD	HL,TCP_STATE
 	LD	BC,TCP_CTX_SIZE
@@ -188,6 +191,8 @@ RESTORE_CTX
 	LD	BC,TCP_CTX_SIZE
 	LDIR
 	RET
+	ENDIF
+
 
 
 ; ------------------------------------------------------

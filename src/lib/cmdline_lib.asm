@@ -479,6 +479,10 @@ PARSE_IPV4
 ; PARSE_U16: HL = ASCIIZ. Out: HL = u16; CF=0 ok / CF=1 bad.
 ;   Trashes A,BC,DE. Overflow wraps (no saturation).
 ; ------------------------------------------------------
+; Excluded from UNETRTL.DLL (libman image budget): the DLL reads its
+; configuration through its own accessors and never calls this.  It
+; stays available to .EXE consumers of the kit.
+	IFNDEF	UNET_DLL
 PARSE_U16
 	LD	D,H
 	LD	E,L			; DE = src
@@ -518,6 +522,8 @@ PARSE_U16
 .BAD
 	SCF
 	RET
+	ENDIF
+
 
 
 	ENDIF					; end of USE_CMDL_PARSE

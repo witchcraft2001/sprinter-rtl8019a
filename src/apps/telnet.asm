@@ -72,12 +72,6 @@ DSS_WRCHAR		EQU 0x58
 
 	DEVICE NOSLOT64K
 
-	; TELNET.EXE sits ~13 bytes under its 0x7F80 image ceiling, so it
-	; opts out of the driver's soft-reset path (see rtl8019.asm).  A
-	; card that needs RTL_RESET=SOFT therefore cannot run TELNET until
-	; the image is slimmed down; every other utility supports it.
-	DEFINE	RTL_NO_SOFT_RESET
-
 	INCLUDE "macro.inc"
 	INCLUDE "dss.inc"
 	DEFINE LIBBSS_CUSTOM
@@ -105,7 +99,16 @@ ICMP_BSS_BASE		EQU 0xAEA0
 
 	MODULE MAIN
 
-	ORG 0x4100
+	; DSS does not load the header into memory: it reads the first
+	; hdr_size bytes of the file (the DW at offset 0x004 below) and
+	; loads what follows at the code ORG.  The header's own ORG only
+	; fixes its position in the FILE, ahead of the code.  So the code
+	; sits at 0x4100, not 0x4200 -- one page lower than the historical
+	; layout here, which bought the ~256 bytes RTL_RESET=SOFT needs and
+	; matches LOAD_ADDR in sibling sprinter_wifi/network (whose header
+	; ORG is 0x3F00, below WIN1 entirely -- proof the header address is
+	; file bookkeeping and nothing more).
+	ORG 0x4000
 
 EXE_HEADER
 	DB "EXE"
@@ -121,7 +124,7 @@ EXE_HEADER
 	DW STACK_TOP
 	DS 234,0
 
-	ORG 0x4200
+	ORG 0x4100
 
 START
 	; Save the DSS PSP pointer before the allocation syscall can clobber IX.

@@ -66,16 +66,19 @@ RTL_HDR_RETRIES	EQU 4			; RX header re-read attempts before drop
 RTL_DMA_SETTLE		EQU 0
 
 ; Soft-reset support (skip the NE2000 board reset port at BASE+0x1F,
-; see RTL_SOFT_RESET in memmap.inc).  Costs ~116 bytes per image, so
-; it is compiled out of two builds:
-;   UNET_DLL            -- the libman image has no room and its BSS
-;                          offsets are literals (src/dll/unetrtl.asm).
-;   RTL_NO_SOFT_RESET   -- opt-out for an app already at its image
-;                          ceiling; TELNET.EXE is the only one today.
-	IFNDEF	UNET_DLL
+; see RTL_SOFT_RESET in memmap.inc).  Present in EVERY build, including
+; UNETRTL.DLL -- a card whose reset port stalls the ISA cycle hangs the
+; machine, so no consumer of this driver may be left without the escape.
+; Room for it in the libman image was found by excluding driver entry
+; points the DLL never calls (PROBE_ID, READ_PROM, PROBE_PRESENT and
+; friends, all gated IFNDEF UNET_DLL), not by dropping the feature.
+;
+; RTL_NO_SOFT_RESET is an escape hatch for an image that genuinely runs
+; out of room.  No build defines it: TELNET, the only one that ever did,
+; moved its image one page down instead (see its header comment), which
+; is the better fix whenever it is available.
 	IFNDEF	RTL_NO_SOFT_RESET
 	DEFINE	RTL_SOFT_RESET_SUPPORTED
-	ENDIF
 	ENDIF
 
 	MODULE RTL
@@ -599,11 +602,17 @@ PROBE_AT_IX
 ; pre-date INIT_BASE may still call this.
 ; Out: CF=0 chip responds; CF=1 absent.
 ; ------------------------------------------------------
+; Excluded from UNETRTL.DLL: the libman image has no room to spare
+; and the DLL never calls it.  Still part of the kit's public driver
+; surface for .EXE consumers.
+	IFNDEF	UNET_DLL
 PROBE_PRESENT
 	LD	HL,(RTL_BASE_PTR)
 	PUSH	HL
 	POP	IX
 	JP	PROBE_AT_IX
+	ENDIF
+
 
 
 ; ------------------------------------------------------
@@ -687,6 +696,9 @@ RESET
 ; bytes in ID0_RAW / ID1_RAW.  Out: CF=0 if both 'P','p',
 ; A=0 on match; otherwise CF=1, A != 0.
 ; ------------------------------------------------------
+; Excluded from UNETRTL.DLL (image budget): the DLL takes its MAC
+; from the environment and never inspects the chip ID.
+	IFNDEF	UNET_DLL
 PROBE_ID
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
@@ -709,6 +721,8 @@ PROBE_ID
 
 ID0_RAW		DB 0
 ID1_RAW		DB 0
+	ENDIF
+
 
 
 ; ------------------------------------------------------
@@ -865,10 +879,14 @@ DMA_READ
 ; ------------------------------------------------------
 ; READ_PROM: 32 bytes from PROM (RSAR=0x0000, RBCR=32) into (HL).
 ; ------------------------------------------------------
+; Excluded from UNETRTL.DLL (image budget): no PROM read there.
+	IFNDEF	UNET_DLL
 READ_PROM
 	LD	BC,32
 	LD	DE,0x0000
 	JP	DMA_READ
+	ENDIF
+
 
 
 ; ------------------------------------------------------

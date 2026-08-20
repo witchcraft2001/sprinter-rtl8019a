@@ -43,9 +43,6 @@ RTL_RESET=SOFT     skip the NE2000 board reset port at BASE+0x1F, which
                    machine -- see HOWTO.md
 ```
 
-`TELNET.EXE` is the one utility that does not support `RTL_RESET=SOFT`
-(image size limit); everything else does.
-
 ## Installing on Sprinter DSS
 
 The `distr/sprinter-rtl8019a.zip` archive and the FAT12 floppy image both
@@ -61,8 +58,11 @@ Then edit `NET.CFG` for your local network (`RTL_IOBASE`, `IP`, `NETMASK`,
 `GATEWAY`, ...).
 
 Run `NETCFG -i`, then `IFUP`, and use `PING` to verify connectivity.
-For hardware troubleshooting, `NICINFO` and `ISAPROBE` are included in the
-archive; detailed probe procedures are in `ISAPROBE.TXT`.
+For hardware troubleshooting, `NICINFO`, `ISAPROBE` and `NICEEP` are
+included in the archive; detailed probe procedures are in `ISAPROBE.TXT`.
+`NICEEP` dumps the 93C46 configuration EEPROM of a jumperless card
+(read-only) so its I/O base, IRQ and media settings can be inspected
+without a DOS machine and the vendor's setup utility.
 
 ## Build
 

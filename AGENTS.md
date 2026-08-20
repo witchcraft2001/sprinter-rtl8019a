@@ -294,6 +294,28 @@ DSS EXE header conventions used in this project (locked, taken from the
   `WGET`, `TFTP`, `FTP` and any future utility that pulls in large library
   code.
 
+  **The header is not loaded into memory.** DSS reads the first `hdr_size`
+  bytes of the file (the `DW` at header offset `0x004`) and loads what
+  follows at the code `ORG`; the header's own `ORG` only fixes its position
+  in the FILE, immediately ahead of the code. Sibling
+  `sprinter_wifi/network` proves it -- its large apps put the header at
+  `0x3F00`, below WIN1 entirely, with code at `0x4100`. So a large utility
+  that runs out of room below the `0x7F80` ceiling can move its whole image
+  one page down (`ORG 0x4000` for the header, `ORG 0x4100` for the code,
+  `hdr_size` unchanged at `0x0100`) and gain 256 bytes. `TELNET.EXE` uses
+  that layout; the others keep `0x4100`/`0x4200` until they need it.
+
+  **The header is not loaded into memory.** DSS reads the first `hdr_size`
+  bytes of the file (the `DW` at header offset `0x004`) and loads what
+  follows at the code `ORG`; the header's own `ORG` only fixes its position
+  in the FILE, immediately ahead of the code. Sibling
+  `sprinter_wifi/network` proves it -- its large apps put the header at
+  `0x3F00`, below WIN1 entirely, with code at `0x4100`. So a large utility
+  that runs out of room below the `0x7F80` ceiling can move its whole image
+  one page down (`ORG 0x4000` for the header, `ORG 0x4100` for the code,
+  `hdr_size` unchanged at `0x0100`) and gain 256 bytes. `TELNET.EXE` uses
+  that layout; the others keep `0x4100`/`0x4200` until they need it.
+
   **Such a utility MUST claim WIN2 before it touches any BSS**, because
   DSS `EXEC` maps only the windows the image itself occupies, starting at
   the window of the load address: an image of one page loaded at `0x4200`

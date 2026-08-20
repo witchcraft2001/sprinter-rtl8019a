@@ -177,6 +177,10 @@ GET_MAC
 ;        terminator). B must be > 0.
 ;   Out: dest = ASCIIZ. CF=0 found; CF=1 missing.
 ; ------------------------------------------------------
+; Excluded from UNETRTL.DLL (libman image budget): the DLL reads its
+; configuration through its own accessors and never calls this.  It
+; stays available to .EXE consumers of the kit.
+	IFNDEF	UNET_DLL
 GET_STR
 	PUSH	DE
 	PUSH	BC
@@ -208,6 +212,8 @@ GET_STR
 	LD	(DE),A
 	SCF
 	RET
+	ENDIF
+
 
 
 ; ------------------------------------------------------
@@ -216,6 +222,10 @@ GET_STR
 ;   Out: HL = value (LE pair); CF=0 ok.
 ;        CF=1 missing or no digit consumed.
 ; ------------------------------------------------------
+; Excluded from UNETRTL.DLL (libman image budget): the DLL reads its
+; configuration through its own accessors and never calls this.  It
+; stays available to .EXE consumers of the kit.
+	IFNDEF	UNET_DLL
 GET_U16
 	CALL	GET_RAW
 	RET	C
@@ -256,6 +266,8 @@ GET_U16
 .NODIG
 	SCF
 	RET
+	ENDIF
+
 
 
 ; ------------------------------------------------------

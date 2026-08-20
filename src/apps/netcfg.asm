@@ -55,6 +55,11 @@ START
 	; DSS supplies [length,text...] through IX.  Capture it before
 	; PRINTLN (RST DSS) or any CALL can clobber IX.
 	LD	(CMDL_SOURCE_PTR),IX
+	; DO_SHOW is the common exit for both `-i` and the bare show, and it
+	; reads this byte to choose the exit code.  Only DO_INIT ever sets
+	; it, so clear it here for every other path.
+	XOR	A
+	LD	(INIT_FAIL_CODE),A
 	PRINTLN MSG_BANNER
 
 	CALL	PARSE_FLAG
@@ -174,6 +179,19 @@ PARSE_FLAG
 
 
 ; ------------------------------------------------------
+; FINISH: common exit for DO_SHOW.  Fails with the code DO_INIT
+; recorded, so `NETCFG -i` that could not produce NET_MAC stops the
+; batch flow instead of reporting success.
+; ------------------------------------------------------
+FINISH
+	LD	A,(INIT_FAIL_CODE)
+	OR	A
+	JP	Z,@UTIL.EXIT_OK
+	LD	B,A
+	JP	@UTIL.EXIT_FAIL
+
+
+; ------------------------------------------------------
 ; DO_SHOW: GETENV each NET_* var; print "NAME : value".
 ; Missing values printed as <not set>.
 ; ------------------------------------------------------
@@ -183,7 +201,7 @@ DO_SHOW
 .LP
 	LD	A,(HL)			; first byte of name = 0 -> table end
 	OR	A
-	JP	Z,@UTIL.EXIT_OK
+	JP	Z,FINISH
 	PUSH	HL			; -- save var name ptr (PRINT macro trashes HL) --
 	; Print "  "
 	LD	HL,MSG_INDENT
@@ -334,22 +352,17 @@ DO_INIT
 	CALL	PRINT_CFG_PATH
 	CALL	@NETCFG.LOAD
 	JP	C,.MISS
-	; If NET.CFG had no RTL_MAC= line (or it was empty), the MAC
-	; field is all-zero -- read the PROM and use that.  Failure
-	; is non-fatal: we leave MAC zero and SETENV_MAC will delete
-	; the env var, so apps that need a MAC will fail with a clear
-	; "[E4] N_NET_MAC not set" diagnostic.
-	CALL	FILL_MAC_FROM_PROM
-	; Always push MAC, NTP, TZ.
-	LD	HL,N_NET_MAC
-	LD	IX,@NETCFG.OUR_MAC
-	CALL	SETENV_MAC
-	LD	HL,N_NET_NTP
-	LD	IX,@NETCFG.NTP
-	CALL	SETENV_STR
-	LD	HL,N_NET_TZ
-	LD	A,(@NETCFG.TZ)
-	CALL	SETENV_TZ
+	; The two variables that tell the driver WHERE the card is and HOW
+	; to reset it must reach the environment BEFORE anything touches the
+	; hardware -- FILL_MAC_FROM_PROM below calls INIT_BASE, whose
+	; TRY_ENV_OVERRIDE reads NET_RTL_HW, and whose READ_RESET_MODE reads
+	; NET_RTL_RESET.  With these SETENVs after the probe (as they were
+	; through v0.2.50) the FIRST `NETCFG -i` of a session fell back to the
+	; auto-scan, which rejects any card without the Realtek 8019 ID; the
+	; MAC then came out unset and every later utility died with
+	; "run NETCFG -i first", while a second `NETCFG -i` worked because by
+	; then the variables were in the environment.
+	;
 	; RTL_HW: ASCIIZ "S/#HHH" if NET.CFG specified it; SETENV_STR
 	; deletes the env var when the buffer is empty, so the driver
 	; falls back to its auto-scan.
@@ -367,6 +380,41 @@ DO_INIT
 .RESET_ENV
 	LD	HL,N_NET_RTL_RESET
 	CALL	SETENV_STR
+
+	; If NET.CFG had no RTL_MAC= line (or it was empty), the MAC
+	; field is all-zero -- read the PROM and use that.
+	CALL	FILL_MAC_FROM_PROM
+	; A = 0, or the exit code for why no MAC could be obtained.  Without
+	; NET_MAC nothing downstream can run, so this is fatal: NETCFG's job
+	; is to leave a usable environment behind, and it did not.  Report
+	; the reason now and remember the code -- the remaining variables are
+	; still published (so `NETCFG` show afterwards reflects NET.CFG), but
+	; the exit at the end of DO_SHOW carries this code instead of 0.
+	LD	(INIT_FAIL_CODE),A
+	OR	A
+	JR	Z,.MAC_OK
+	CP	EX_NO_HW
+	JR	NZ,.MAC_E3
+	PRINTLN MSG_E_NO_CARD
+	JR	.MAC_OK
+.MAC_E3
+	CP	EX_NIC_ERR
+	JR	NZ,.MAC_E4
+	PRINTLN MSG_E_PROM
+	JR	.MAC_OK
+.MAC_E4
+	PRINTLN MSG_E_NO_MAC
+.MAC_OK
+	; Always push MAC, NTP, TZ.
+	LD	HL,N_NET_MAC
+	LD	IX,@NETCFG.OUR_MAC
+	CALL	SETENV_MAC
+	LD	HL,N_NET_NTP
+	LD	IX,@NETCFG.NTP
+	CALL	SETENV_STR
+	LD	HL,N_NET_TZ
+	LD	A,(@NETCFG.TZ)
+	CALL	SETENV_TZ
 	; NET=RTL is the backend marker a launcher reads to decide which
 	; UNET DLL to load (the Wi-Fi kit publishes NET=WIFI).  UNETRTL.DLL
 	; also accepts the legacy state -- no NET at all, but NET_IP and
@@ -451,8 +499,11 @@ PRINT_CFG_PATH
 ; and copy bytes 0..5 of the resulting MAC into NETCFG's
 ; OUR_MAC field.  Failure is silent.
 ; ------------------------------------------------------
-FILL_MAC_FROM_PROM
-	; Already configured?  Skip.
+; ------------------------------------------------------
+; MAC_IS_ZERO: Z if NETCFG's MAC field is all zero.
+; Trashes A, HL.
+; ------------------------------------------------------
+MAC_IS_ZERO
 	LD	HL,@NETCFG.OUR_MAC
 	LD	A,(HL)
 	INC	HL
@@ -465,23 +516,33 @@ FILL_MAC_FROM_PROM
 	OR	(HL)
 	INC	HL
 	OR	(HL)
+	RET
+
+
+FILL_MAC_FROM_PROM
+	; Already configured (RTL_MAC= in NET.CFG)?  Skip.
+	CALL	MAC_IS_ZERO
+	LD	A,EX_OK			; LD does not disturb Z
 	RET	NZ
 	; INIT_BASE handles ISA slot 1 then 0 and base auto-scan;
 	; on success ISA stays open with the right slot/base set.
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@RTL.INIT_BASE
-	RET	C			; no chip; silently leave MAC zero
-	; NET.CFG's RTL_RESET= has NOT reached the environment yet --
-	; SETENV_STR for NET_RTL_RESET runs after this routine returns --
-	; so INIT_BASE's READ_RESET_MODE could not have seen it and has
-	; just cleared the flag.  Apply the freshly parsed value directly,
-	; otherwise a card that needs RTL_RESET=SOFT stalls the ISA cycle
-	; inside RESET on the very first `NETCFG -i` and hangs the machine.
+	JR	NC,.FOUND
+	LD	A,EX_NO_HW
+	RET
+.FOUND
+	; Belt and braces.  The caller now publishes NET_RTL_RESET before
+	; calling us, so INIT_BASE's READ_RESET_MODE has already set this
+	; flag from the environment.  Re-apply the parsed value anyway: if
+	; that ordering is ever broken again, the failure mode here is not a
+	; missing MAC but a stalled ISA cycle inside RESET -- a hung machine
+	; with no diagnostic, which is far too harsh a price for 6 bytes.
 	LD	A,(@NETCFG.OUR_RTL_RESET)
 	LD	(RTL_SOFT_RESET),A
 	CALL	@RTL.RESET
-	JR	C,.CLOSE
+	JR	C,.NIC_ERR
 	; Set DCR=0x48 directly via the new IX-relative base.
 	; (RTL_BASE_PTR is already populated by INIT_BASE.)
 	LD	IX,(RTL_BASE_PTR)
@@ -491,7 +552,7 @@ FILL_MAC_FROM_PROM
 	; is no longer needed.
 	LD	HL,NETCFG_LOAD_BUF
 	CALL	@RTL.READ_PROM
-	JR	C,.CLOSE
+	JR	C,.NIC_ERR
 	; Detect doubled layout: PROM[0]==PROM[1].
 	LD	HL,NETCFG_LOAD_BUF
 	LD	A,(HL)
@@ -509,15 +570,26 @@ FILL_MAC_FROM_PROM
 	INC	HL
 	INC	DE
 	DJNZ	.DBL_LP
-	JR	.CLOSE
+	JR	.DONE
 .DIRECT
 	; Direct: PROM[0..5] -> OUR_MAC.
 	LD	HL,NETCFG_LOAD_BUF
 	LD	DE,@NETCFG.OUR_MAC
 	LD	BC,6
 	LDIR
-.CLOSE
+.DONE
 	CALL	@ISA.ISA_CLOSE
+	; The card answered and its PROM was read, but a PROM full of zeros
+	; still yields no usable address.  That one is the user's to fix
+	; with RTL_MAC=, hence a config error rather than a NIC error.
+	CALL	MAC_IS_ZERO
+	LD	A,EX_OK			; LD does not disturb Z
+	RET	NZ
+	LD	A,EX_CFG_ERR
+	RET
+.NIC_ERR
+	CALL	@ISA.ISA_CLOSE
+	LD	A,EX_NIC_ERR
 	RET
 
 
@@ -841,6 +913,9 @@ MSG_INIT_MISS	DB "[E] NET.CFG read failed (file missing or unreadable)",0
 MSG_CHECK_OK	DB "NET.CFG syntax OK",0
 MSG_CHECK_MISS	DB "[E] NET.CFG read failed",0
 MSG_USAGE_ERR	DB "[E] usage: unknown or malformed flag",0
+MSG_E_NO_CARD	DB "[E2] card not found; check RTL_HW in NET.CFG",0
+MSG_E_PROM	DB "[E3] card found but PROM read failed",0
+MSG_E_NO_MAC	DB "[E4] no MAC in card PROM; add RTL_MAC= to NET.CFG",0
 MSG_HELP
 	DB "Usage:",13,10
 	DB "  NETCFG          show current NET_* env values",13,10
@@ -848,7 +923,7 @@ MSG_HELP
 	DB "  NETCFG -c       check NET.CFG syntax",13,10
 	DB "  NETCFG -d       delete all NET_* env vars",13,10
 	DB "  NETCFG /?       this help (-? -h also accepted)",13,10
-	DB "Exit codes: 0 ok, 1 usage, 4 config",13,10,0
+	DB "Exit: 0 ok, 1 usage, 2 no card, 3 NIC, 4 config",13,10,0
 
 ; Variable name table (ASCIIZ entries; final entry = empty).
 ; Order matters only for SHOW output.
@@ -864,11 +939,15 @@ N_NET_NTP	DB "NET_NTP",0
 N_NET_TZ	DB "NET_TZ",0
 N_NET_RTL_HW	DB "NET_RTL_HW",0
 N_NET_RTL_RESET	DB "NET_RTL_RESET",0
-V_RESET_SOFT	DB "SOFT",0
-V_RESET_NONE	DB 0
 N_NET		DB "NET",0
 		DB 0			; table terminator
 
+; Values, NOT names -- these must stay OUTSIDE VAR_TABLE.  V_RESET_SOFT
+; once sat between N_NET_RTL_RESET and N_NET, which made DO_SHOW print a
+; bogus "SOFT : <not set>" row, and V_RESET_NONE (an empty string) read
+; as the table terminator, hiding NET from the listing entirely.
+V_RESET_SOFT	DB "SOFT",0
+V_RESET_NONE	DB 0
 V_STATIC	DB "STATIC",0
 V_DHCP		DB "DHCP",0
 V_RTL		DB "RTL",0
@@ -879,6 +958,7 @@ LINE_END	DB 13,10,0
 ; in the .EXE; always written before read) --
 SET_BUF		EQU APP_BSS_BASE		; "NAME=value\0", up to 290 bytes
 SHOW_VAL_BUF	EQU APP_BSS_BASE + 290		; GETENV destination, 256 bytes
+INIT_FAIL_CODE	EQU APP_BSS_BASE + 546		; 1 byte: exit code for FINISH
 
 	ENDMODULE
 

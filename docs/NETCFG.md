@@ -14,6 +14,37 @@ NETCFG -d       delete all NET_* env vars
 NETCFG /?       help (-? -h also accepted)
 ```
 
+## The MAC address
+
+With no `RTL_MAC=` line in `NET.CFG`, `NETCFG -i` reads the address out of
+the card's own PROM and publishes it as `NET_MAC`.  That probe needs to
+find the card, so `-i` publishes `NET_RTL_HW` and `NET_RTL_RESET` to the
+environment *before* touching the hardware -- the driver reads both while
+locating the chip.
+
+If the address cannot be obtained, `NETCFG -i` **fails**: without
+`NET_MAC` nothing downstream can run, so leaving the environment in that
+state and reporting success would only move the error somewhere less
+informative.  The reason decides the exit code:
+
+```
+[E2] card not found; check RTL_HW in NET.CFG
+[E3] card found but PROM read failed
+[E4] no MAC in card PROM; add RTL_MAC= to NET.CFG
+```
+
+The remaining variables are still published, so a plain `NETCFG`
+afterwards shows how far the configuration got.  The fix is either to
+make the card reachable (check `RTL_HW`, and `RTL_RESET=SOFT` for a clone
+whose board reset port stalls the bus) or to state the address by hand
+with `RTL_MAC=`.
+
+The status is returned through `DSS_EXIT`, so a batch flow that can test
+it should stop before `IFUP`.  Note that every `.BAT` shipped with this
+kit and with the sibling Wi-Fi kit is a flat command sequence -- whether
+the DSS batch interpreter supports `IF ERRORLEVEL` / `GOTO` has not been
+verified here.
+
 `NETCFG.EXE` is the only utility in the kit that opens `NET.CFG`.
 All other utilities read from environment variables only. The file is
 resolved beside the running `NETCFG.EXE` through DSS `APPINFO`, not
@@ -26,4 +57,6 @@ relative to the caller's current directory. `-i` and `-c` print
 |------|---------------------------------------------------|
 | 0    | OK                                                |
 | 1    | Usage                                             |
-| 4    | Config error (only with `-i` / `-c`)              |
+| 2    | Card not found (`-i`, no MAC obtainable)          |
+| 3    | Card found but its PROM could not be read (`-i`)  |
+| 4    | Config error: bad/missing NET.CFG, or no MAC in PROM |

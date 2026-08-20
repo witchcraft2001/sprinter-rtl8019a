@@ -30,6 +30,16 @@ removes them again.  A configuration made by an older build of the
 kit -- `NET_IP` and `NET_MAC` set but no `NET` at all -- is still
 accepted.
 
+The DLL locates the card the same way every utility does, through
+`NET_RTL_HW`, and **honours `NET_RTL_RESET=SOFT`** (from `RTL_RESET=SOFT`
+in `NET.CFG`, see `HOWTO.TXT`).  That matters: on a clone whose NE2000
+board reset port stalls the ISA bus cycle, a DLL doing the hard reset
+freezes the machine the moment a consumer initialises the network, with
+no diagnostic of any kind.  Builds up to 0.2.54 had the soft path
+compiled out of the DLL for image-budget reasons and did exactly that;
+0.2.55 fixed it by excluding driver entry points the DLL never calls
+instead.
+
 ## Loading
 
 ```

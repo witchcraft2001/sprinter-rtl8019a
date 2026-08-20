@@ -207,6 +207,12 @@ START
 	; ID OK -- check signature.  Its position depends on the layout:
 	; adjacent bytes 0E/0F when direct, every other byte 1C/1E when
 	; the PROM image comes back doubled.
+	;
+	; BOTH classic marks are accepted: 'WW' (NE2000, 16-bit) and 'BB'
+	; (NE1000, 8-bit).  A jumperless clone reports the bus width it
+	; detected, and this kit only ever drives an 8-bit bus, so 'BB' is
+	; the RIGHT answer here, not a defect -- the UM9003AF returns it
+	; while its EEPROM word 7 still holds 'WW' as the 16-bit mark.
 	LD	HL,PROM_BUF + 0x0E
 	LD	DE,1
 	LD	A,(LAYOUT)
@@ -216,11 +222,15 @@ START
 	LD	E,2
 .SIG_AT
 	LD	A,(HL)
+	LD	C,A
 	CP	0x57
+	JR	Z,.SIG_MARK
+	CP	0x42
 	JR	NZ,SIG_WARN
+.SIG_MARK
 	ADD	HL,DE
 	LD	A,(HL)
-	CP	0x57
+	CP	C			; both bytes must carry the same mark
 	JR	NZ,SIG_WARN
 
 	PRINTLN MSG_RESULT_OK
@@ -863,7 +873,7 @@ MSG_RESULT_FAIL	DB "RESULT FAIL",0
 MSG_E_ID	DB "[E02] RTL ID mismatch",0
 MSG_E_RESET	DB "[E01] RESET timeout",0
 MSG_E_PROM	DB "[E03] PROM read failed",0
-MSG_W_SIG	DB "[W01] PROM signature != 57 57 (NE2000 mismatch)",0
+MSG_W_SIG	DB "[W01] PROM signature is neither 'WW' nor 'BB'",0
 MSG_W_NO_ID	DB "[W02] ID mismatch but MAC plausible -- continuing",0
 MSG_W_FUDUP	DB "[W03] FUDUP=1: peer switch port must be forced 10M/full",0
 MSG_W_MEDIA	DB "[W04] selected medium is not UTP; check PL/link/cable",0

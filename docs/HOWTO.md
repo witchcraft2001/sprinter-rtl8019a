@@ -126,6 +126,11 @@ IF ERRORLEVEL 3 GOTO NOLINK
 Without `NETCFG -i` the network utilities exit `B=4` with a
 diagnostic.  IFUP picks STATIC vs DHCP from `NET_IP_SRC`.
 
+`NETCFG -i` itself fails (2 / 3 / 4) when it cannot obtain a MAC for
+`NET_MAC` -- see `NETCFG.TXT`.  Nothing downstream works without it, and
+it now says so at the point of failure instead of reporting success and
+letting `IFUP` surface the symptom.
+
 `NET.CFG` keys recognised by the parser:
 
 ```text
@@ -166,11 +171,6 @@ cleaner starting point a real reset pulse guarantees.  Utilities print
 
 Use it only for a card that actually hangs; the hard reset stays the
 default because it recovers a controller left in a bad state.
-
-`TELNET.EXE` does not support `RTL_RESET=SOFT`: its image already sits
-a few bytes under the ceiling imposed by its load address, and the
-driver code for the soft path does not fit.  It is compiled out there
-via `RTL_NO_SOFT_RESET` and TELNET keeps doing the hard reset.
 
 `NETCFG -i` sets `NET_IP_SRC` to `STATIC` or `DHCP` based on the
 `IP=` line.  In DHCP mode it deletes any stale `NET_IP / NET_MASK

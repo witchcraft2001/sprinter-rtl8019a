@@ -17,6 +17,7 @@ BUILD_APPS=(
   nicinfo
   nicmode
   isaprobe
+  niceep
   nicram
   niclb
   nictx
@@ -91,6 +92,7 @@ DIST_DOC_FILES=(
   docs/TELNET.md
   docs/TFTP.md
   docs/ISAPROBE.md
+  docs/NICEEP.md
   docs/NICMODE.md
   docs/DLSPEED.md
   docs/UNETRTL.md
