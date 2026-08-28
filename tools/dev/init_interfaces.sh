@@ -30,6 +30,25 @@ sudo ifconfig feth1 create
 sudo ifconfig feth0 peer feth1
 sudo ifconfig feth0 up
 sudo ifconfig feth1 inet 192.168.7.1/24 up
+
+# feth does not reliably install its connected IPv4 route on macOS.
+# Without this route, replies to the Sprinter can follow the default
+# route back out through the WAN (notably with iPhone Personal Hotspot).
+# The route is independent of the selected WAN and is required for the
+# feth topology on home networks too.
+MAME_ROUTE_IF=$(route -n get 192.168.7.254 2>/dev/null |
+    awk '/interface:/ {print $2; exit}')
+if [[ "$MAME_ROUTE_IF" != "feth1" ]]; then
+    sudo route -n add -net 192.168.7.0/24 -interface feth1
+    MAME_ROUTE_IF=$(route -n get 192.168.7.254 2>/dev/null |
+        awk '/interface:/ {print $2; exit}')
+fi
+if [[ "$MAME_ROUTE_IF" != "feth1" ]]; then
+    echo "Could not route 192.168.7.0/24 through feth1." >&2
+    echo "Check that the WAN does not also use 192.168.7.0/24." >&2
+    exit 1
+fi
+
 sudo chmod o+r /dev/bpf*
 
 # --- host-as-router -------------------------------------------
@@ -44,7 +63,9 @@ sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null
 sudo pfctl -ef - <<EOF
 nat on $WAN inet from 192.168.7.0/24 to any -> ($WAN)
 pass out quick keep state
-pass in quick on feth1 keep state
+# Keep replies for connections initiated by the Sprinter on feth1.
+# macOS PF can otherwise send reverse-NAT packets back through the WAN.
+pass in quick on feth1 reply-to feth1 all keep state
 EOF
 
 echo "feth0 / feth1 are up; $WAN is doing NAT for 192.168.7.0/24."
