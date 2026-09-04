@@ -81,15 +81,22 @@ make image      # create distr/sprinter-rtl8019a.img FAT12 test floppy image
 make clean      # remove generated outputs
 ```
 
-**Mandatory: every code-changing iteration must end with `make package image`,
-not just `make build`.** The MAME test stand boots from
-`distr/sprinter-rtl8019a.img`, so a fresh `.EXE` in `build/` is invisible to
-the next test run until the floppy image is rebuilt. Treat the image as the
-deliverable that proves the change actually reaches the target. Use
-`make build` alone only for quick "does it assemble?" checks; before asking
-the user to retest in MAME (or before announcing a fix as ready), run
-`make package image` and confirm both `distr/*.zip` and `distr/*.img` are
-regenerated.
+**Mandatory: every code-changing iteration must end with
+`make test-host package image`, not just `make build`.** The MAME test stand
+boots from `distr/sprinter-rtl8019a.img`, so a fresh `.EXE` in `build/` is
+invisible to the next test run until the floppy image is rebuilt. Treat the
+image as the deliverable that proves the change actually reaches the target.
+`make test-host` runs the host-side EXE harness (`tools/exe-harness/`,
+documented in `docs/HARNESS.md`) that executes real built `.EXE`s under a
+strict Z80/DSS/ISA/RTL8019AS model -- it catches driver, ISA-discipline and
+DSS-ABI regressions in seconds, without MAME. Use `make build` alone only for
+quick "does it assemble?" checks; before asking the user to retest in MAME
+(or before announcing a fix as ready), run `make test-host package image`
+and confirm the host suite is green and both `distr/*.zip` and `distr/*.img`
+are regenerated. `make test-host` is a fast, strong signal but not a
+replacement for the MAME acceptance criteria in this file -- a change is not
+considered verified until the relevant stage has also been exercised in
+MAME (or on real hardware, once available).
 
 The scripts must be tolerant while the project is being bootstrapped: apps
 listed in `tools/artifacts.sh` are skipped with a warning until their
@@ -631,12 +638,25 @@ minute-long hangs that ignored Esc, and spontaneous power-off):
 
 ## Testing Guidelines
 
-No automated test suite is present. For every touched DSS assembly source,
-assemble it and smoke-test the affected stage in MAME against the expected
-output from the spec. When the physical card is available, repeat the same
-stage on real hardware and record any divergence. For any change that
-touches the driver register sequence, re-run at minimum `NICINFO.EXE` and
-`NICRAM.EXE`, since they are the canonical regression checks.
+An automated host-side test suite lives under `tools/` and runs via
+`make test-host` (see `docs/HARNESS.md`). It executes real built `.EXE`
+files from `build/` against a strict Z80 interpreter with JS models of DSS,
+the Sprinter ISA window, and the RTL8019AS/DP8390 chip, including scenario
+injection (RX frame delivery, PROM layout/signature variants, chip-clone
+quirks, error injection) and hard invariants (ISA discipline, DSS-while-open,
+interrupts-while-open, DELAY-while-open). Run it after any change to the
+driver, stack, or an app's argument/diagnostic surface. It is fast (seconds,
+not MAME-boot-time) and catches whole classes of regressions this project
+has hit before (RX-ring off-by-ones, ISA discipline violations, register
+init bugs) without needing MAME. It is a strong signal, not a replacement
+for MAME/hardware acceptance testing below.
+
+For every touched DSS assembly source, assemble it and smoke-test the
+affected stage in MAME against the expected output from the spec. When the
+physical card is available, repeat the same stage on real hardware and
+record any divergence. For any change that touches the driver register
+sequence, re-run at minimum `NICINFO.EXE` and `NICRAM.EXE`, since they are
+the canonical regression checks.
 
 Host-side helpers are welcome and belong in `examples/` (batch files for
 DSS, plus shell or Python scripts for the host side, for example a UDP echo

@@ -371,14 +371,18 @@ RECV
 	LD	(RX_DRAIN_LEFT),A
 	JR	NZ,.DRAIN
 .TICK						; ring empty or budget spent
-	CALL	@MAIN.TICK_AND_CHECK_KEY
-	JR	C,.CANCEL
+	; Consume the budget BEFORE the 1 ms tick, mirroring tcp_lib.asm's
+	; RECV: the final pass then returns without a wasted delay.  A
+	; non-blocking poll (timeout<=1) against an empty ring costs nothing.
 	LD	HL,(UDPLIB_TIMEOUT_LEFT)
 	DEC	HL
 	LD	(UDPLIB_TIMEOUT_LEFT),HL
 	LD	A,H
 	OR	L
-	JR	NZ,.LP
+	JR	Z,.TO
+	CALL	@MAIN.TICK_AND_CHECK_KEY
+	JR	C,.CANCEL
+	JR	.LP
 .TO
 	LD	A,F_TIMEOUT
 	LD	(UDPLIB_LAST_FAIL),A

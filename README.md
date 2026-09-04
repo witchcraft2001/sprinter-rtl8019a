@@ -143,7 +143,26 @@ ifconfig feth1
 Launch MAME pointing at `feth0` (the wire-side end).  The
 launcher script
 `/Users/dmitry/dev/zx/sprinter/mame/run_sprinter_rtl8019as.sh`
-reads `MAME_RTL_NIC` from the environment (default `feth0`).
+only prints the requested NIC name; the actual pcap interface
+is selected once via MAME's own UI (Tab -> Network Devices)
+and persisted in `cfg/sprinter.cfg`.
+
+The script's built-in disks (`sp_hdd_sys.chd`/`sp_hdd_media.chd`)
+are a shared, persistent Sprinter DSS desktop used across
+projects -- it does NOT include this repo's build.  Attach the
+freshly built floppy image explicitly, appended after the
+script's own arguments (a later `-flop2` overrides the script's
+built-in one, which otherwise holds an unrelated utility disk on
+the same 3.5" HD drive):
+
+```sh
+run_sprinter_rtl8019as.sh -networkprovider pcap \
+  -flop2 /Users/dmitry/dev/zx/sprinter/sprinter-rtl8019a/distr/sprinter-rtl8019a.img
+```
+
+DSS then sees the build on drive `B:` -- work from there directly
+(it already carries every utility and `NETSMPL.CFG`).  See
+`docs/MAME_NETWORK.md` for the full setup.
 
 `/dev/bpf*` permissions are required for `pcap` to work.
 First run typically needs:

@@ -122,7 +122,13 @@ HOST
 	; First, try parsing as a literal IPv4.
 	PUSH	HL
 	PUSH	DE
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	A,CFN_PARSE_LITERAL_IP
+	CALL	@WIN0COLD.RUN
+	ELSE
 	CALL	@CMDL.PARSE_IPV4		; in: HL ASCIIZ, DE dest
+	ENDIF
 	JR	C,.NOT_LIT
 	POP	DE
 	POP	HL
@@ -186,7 +192,14 @@ HOST
 	LD	(RESOLVE_HAS_GW),A
 
 	; Pick next-hop.
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	HL,RESOLVE_DNS_IP
+	LD	A,CFN_NEXT_HOP
+	CALL	@WIN0COLD.RUN
+	ELSE
 	CALL	NEXT_HOP
+	ENDIF
 	JR	NC,.NHOK
 	POP	HL
 	LD	A,3
@@ -200,9 +213,16 @@ HOST
 	LD	A,ARP_RETRIES
 	LD	(RESOLVE_ARP_RETRY_LEFT),A
 .ARP_SEND
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	HL,RESOLVE_NEXT_HOP_IP
+	LD	A,CFN_BUILD_ARP_REQUEST
+	CALL	@WIN0COLD.RUN
+	ELSE
 	LD	DE,@MAIN.TX_BUF
 	LD	HL,RESOLVE_NEXT_HOP_IP
 	CALL	@ARP.BUILD_REQUEST
+	ENDIF
 	LD	HL,@MAIN.TX_BUF
 	LD	BC,ARP_FRAME_LEN
 	CALL	@RTL.SEND_FRAME
@@ -245,7 +265,15 @@ HOST
 	; Build full ETH+IP+UDP+DNS frame.  HL still on stack.
 	POP	HL				; HL = name
 	PUSH	HL
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	DE,RESOLVE_DNS_IP
+	LD	A,CFN_BUILD_DNS_QUERY
+	CALL	@WIN0COLD.RUN		; -> HL = frame length
+	LD	(RESOLVE_QFRAME_LEN),HL
+	ELSE
 	CALL	BUILD_FRAME
+	ENDIF
 	JR	NC,.BF_OK
 	POP	HL
 	LD	A,1				; invalid name (long label)
@@ -287,7 +315,13 @@ HOST
 	LD	HL,(RESOLVE_DNS_MSG_PTR)
 	LD	BC,(RESOLVE_DNS_MSG_LEN)
 	LD	DE,(RESOLVE_DEST_PTR)
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	A,CFN_PARSE_DNS_REPLY
+	CALL	@WIN0COLD.RUN
+	ELSE
 	CALL	@DNS.PARSE_REPLY
+	ENDIF
 	JR	NC,.PARSE_OK
 	POP	HL
 	LD	A,6
@@ -339,7 +373,14 @@ NEXT_HOP_FOR
 	LD	A,1
 .NG
 	LD	(RESOLVE_HAS_GW),A
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	HL,RESOLVE_DNS_IP
+	LD	A,CFN_NEXT_HOP
+	CALL	@WIN0COLD.RUN
+	ELSE
 	CALL	NEXT_HOP
+	ENDIF
 	JR	NC,.DOARP
 	; Off-subnet and NET_GW absent.
 	LD	A,3
@@ -350,9 +391,16 @@ NEXT_HOP_FOR
 	LD	A,ARP_RETRIES
 	LD	(RESOLVE_ARP_RETRY_LEFT),A
 .ARP_SEND
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	HL,RESOLVE_NEXT_HOP_IP
+	LD	A,CFN_BUILD_ARP_REQUEST
+	CALL	@WIN0COLD.RUN
+	ELSE
 	LD	DE,@MAIN.TX_BUF
 	LD	HL,RESOLVE_NEXT_HOP_IP
 	CALL	@ARP.BUILD_REQUEST
+	ENDIF
 	LD	HL,@MAIN.TX_BUF
 	LD	BC,ARP_FRAME_LEN
 	CALL	@RTL.SEND_FRAME
@@ -379,10 +427,15 @@ NEXT_HOP_FOR
 
 
 ; ------------------------------------------------------
-; NEXT_HOP: pick ARP target based on subnet match.
+; NEXT_HOP: pick ARP target based on subnet match.  Excluded from
+; UNET_DLL builds (image budget): HOST/NEXT_HOP_FOR redirect to the
+; WIN0 cold blob's FN_NEXT_HOP instead (see win0cold.asm /
+; unetrtl_cold.asm) -- pure register/buffer logic with no RST, safe
+; to run with DSS/BIOS unreachable.
 ;   Out: RESOLVE_NEXT_HOP_IP filled.
 ;        CF=0 ok; CF=1 off-subnet and no NET_GW.
 ; ------------------------------------------------------
+	IFNDEF	UNET_DLL
 NEXT_HOP
 	LD	A,(RESOLVE_HAS_MASK)
 	OR	A
@@ -421,14 +474,20 @@ NEXT_HOP
 	LDIR
 	OR	A
 	RET
+	ENDIF
 
 
 ; ------------------------------------------------------
-; BUILD_FRAME: ETH+IP+UDP+DNS query at @MAIN.TX_BUF.
+; BUILD_FRAME: ETH+IP+UDP+DNS query at @MAIN.TX_BUF.  Excluded from
+; UNET_DLL builds (image budget): the DLL's HOST redirects to the
+; WIN0 cold blob's FN_BUILD_DNS_QUERY instead (see win0cold.asm /
+; unetrtl_cold.asm) -- pure register/buffer logic with no RST, safe
+; to run with DSS/BIOS unreachable.
 ;   In:  HL = name ptr (preserved on stack by caller).
 ;   Out: CF=0 ok; CF=1 invalid name.  Frame length stored
 ;        at RESOLVE_QFRAME_LEN.
 ; ------------------------------------------------------
+	IFNDEF	UNET_DLL
 BUILD_FRAME
 	; DNS message at @MAIN.TX_BUF + 14 + IP_HDR_LEN + UDP_HDR_LEN.
 	LD	A,(RESOLVE_XID_HI)
@@ -548,6 +607,7 @@ BUILD_FRAME
 	LD	(@MAIN.TX_BUF + 14 + 11),A
 	OR	A
 	RET
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -564,18 +624,34 @@ WAIT_ARP
 	LD	A,RX_DRAIN_BUDGET
 	LD	(RX_DRAIN_LEFT),A
 .DRAIN
+	; RING_HAS_PACKET (never reachable from cold: it can call
+	; RECOVER_OVERFLOW, which toggles ISA_CLOSE/ISA_OPEN with a real
+	; EI -- unsafe while WIN0COLD.RUN still has PAGE0 mapped to the
+	; cold blob, see coldctx.inc) always runs hot, once per frame; only
+	; the per-frame read+match (FN_DRAIN_ARP) moves cold.
 	CALL	@RTL.RING_HAS_PACKET
 	JR	Z,.TICK
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	HL,RESOLVE_DNS_IP
+	LD	A,CFN_DRAIN_ARP
+	CALL	@WIN0COLD.RUN
+	CP	1
+	JR	Z,.A_MATCHED
+	CP	2
+	JR	Z,.TO
+	LD	A,(RX_DRAIN_LEFT)
+	DEC	A
+	LD	(RX_DRAIN_LEFT),A
+	JR	NZ,.DRAIN
+	JR	.TICK
+	ELSE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
-	IFDEF UNET_DLL
-	LD	BC,@MAIN.RX_BUF_SIZE
-	ELSE
 	LD	BC,1518			; @MAIN.RX_BUF_SIZE is documented but the
 					; apps define RX_BUF_SIZE outside MODULE MAIN,
 					; so it is not referenceable here.  All callers
 					; (apps and the UNET DLL) size RX_BUF at 1518.
-	ENDIF
 	CALL	@RTL.READ_PACKET
 	JR	C,.MISS
 	LD	A,(@MAIN.RX_BUF + 12)
@@ -619,6 +695,7 @@ WAIT_ARP
 	DEC	A
 	LD	(RX_DRAIN_LEFT),A
 	JR	NZ,.DRAIN
+	ENDIF
 .TICK					; ring empty or budget spent: tick + key poll
 	CALL	@MAIN.TICK_AND_CHECK_KEY
 	JR	C,.CANCEL
@@ -638,6 +715,11 @@ WAIT_ARP
 	LD	(LAST_FAIL),A
 	SCF
 	RET
+	IFDEF	UNET_DLL
+.A_MATCHED
+	OR	A
+	RET
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -653,18 +735,32 @@ WAIT_DNS
 	LD	A,RX_DRAIN_BUDGET
 	LD	(RX_DRAIN_LEFT),A
 .DRAIN
+	; RING_HAS_PACKET never runs cold -- see WAIT_ARP's comment and
+	; coldctx.inc's header (RECOVER_OVERFLOW's ISA_CLOSE/OPEN would EI
+	; while PAGE0 is still the cold blob).
 	CALL	@RTL.RING_HAS_PACKET
 	JP	Z,.TICK
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	HL,RESOLVE_DNS_IP
+	LD	A,CFN_DRAIN_DNS
+	CALL	@WIN0COLD.RUN
+	CP	1
+	JP	Z,.D_MATCHED
+	CP	2
+	JP	Z,.TO
+	LD	A,(RX_DRAIN_LEFT)
+	DEC	A
+	LD	(RX_DRAIN_LEFT),A
+	JP	NZ,.DRAIN
+	JP	.TICK
+	ELSE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
-	IFDEF UNET_DLL
-	LD	BC,@MAIN.RX_BUF_SIZE
-	ELSE
 	LD	BC,1518			; @MAIN.RX_BUF_SIZE is documented but the
 					; apps define RX_BUF_SIZE outside MODULE MAIN,
 					; so it is not referenceable here.  All callers
 					; (apps and the UNET DLL) size RX_BUF at 1518.
-	ENDIF
 	CALL	@RTL.READ_PACKET
 	JP	C,.MISS
 	LD	A,(@MAIN.RX_BUF + 12)
@@ -729,6 +825,7 @@ WAIT_DNS
 	DEC	A
 	LD	(RX_DRAIN_LEFT),A
 	JP	NZ,.DRAIN
+	ENDIF
 .TICK					; ring empty or budget spent: tick + key poll
 	CALL	@MAIN.TICK_AND_CHECK_KEY
 	JP	C,.CANCEL
@@ -748,6 +845,11 @@ WAIT_DNS
 	LD	(LAST_FAIL),A
 	SCF
 	RET
+	IFDEF	UNET_DLL
+.D_MATCHED
+	OR	A
+	RET
+	ENDIF
 
 
 ; -------- env var name strings --------

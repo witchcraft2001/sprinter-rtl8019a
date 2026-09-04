@@ -108,7 +108,14 @@ ECHO
 	INC	HL
 	LD	(ICMPLIB_SEQ),HL
 
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	HL,ICMPLIB_TARGET_IP
+	LD	A,CFN_BUILD_ICMP_ECHO
+	CALL	@WIN0COLD.RUN			; -> BC = frame length
+	ELSE
 	CALL	BUILD_ECHO			; -> BC = frame length
+	ENDIF
 	LD	HL,@MAIN.TX_BUF
 	CALL	@RTL.SEND_FRAME
 	JR	C,.SEND_FAIL
@@ -130,9 +137,14 @@ ECHO
 
 ; ------------------------------------------------------
 ; BUILD_ECHO: ETH + IPv4 + ICMP echo request in @MAIN.TX_BUF.
+; Excluded from UNET_DLL builds (image budget): ECHO redirects to the
+; WIN0 cold blob's FN_BUILD_ICMP_ECHO instead (see win0cold.asm /
+; unetrtl_cold.asm) -- pure register/buffer logic with no RST, safe
+; to run with DSS/BIOS unreachable.
 ;   Out: BC = total Ethernet frame length.
 ; Trashes A, DE, HL, IX.
 ; ------------------------------------------------------
+	IFNDEF	UNET_DLL
 BUILD_ECHO
 	; -- Ethernet header --
 	LD	DE,@MAIN.TX_BUF
@@ -272,6 +284,7 @@ BUILD_ECHO
 	LD	B,H
 	LD	C,L				; BC = Ethernet frame length
 	RET
+	ENDIF
 
 ; ------------------------------------------------------
 ; WAIT_REPLY: poll for the echo reply matching our id+seq.
@@ -287,15 +300,29 @@ WAIT_REPLY
 	LD	A,RX_DRAIN_BUDGET
 	LD	(RX_DRAIN_LEFT),A
 .DRAIN
+	; RING_HAS_PACKET never runs cold -- see coldctx.inc's header
+	; (RECOVER_OVERFLOW's ISA_CLOSE/OPEN would EI while PAGE0 is still
+	; the cold blob).
 	CALL	@RTL.RING_HAS_PACKET
 	JP	Z,.TICK
+	IFDEF	UNET_DLL
+	LD	IX,@UNET.COLD_CTX
+	LD	HL,ICMPLIB_TARGET_IP
+	LD	A,CFN_DRAIN_ICMP
+	CALL	@WIN0COLD.RUN
+	CP	1
+	JP	Z,.I_MATCHED
+	CP	2
+	JP	Z,.TO
+	LD	A,(RX_DRAIN_LEFT)
+	DEC	A
+	LD	(RX_DRAIN_LEFT),A
+	JP	NZ,.DRAIN
+	JP	.TICK
+	ELSE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
-	IFDEF UNET_DLL
-	LD	BC,@MAIN.RX_BUF_SIZE
-	ELSE
 	LD	BC,1518				; see resolve_lib: RX_BUF is 1518
-	ENDIF
 	CALL	@RTL.READ_PACKET
 	JP	C,.MISS
 	CALL	@ARP.ANSWER_REQUEST
@@ -351,6 +378,7 @@ WAIT_REPLY
 	DEC	A
 	LD	(RX_DRAIN_LEFT),A
 	JP	NZ,.DRAIN
+	ENDIF
 .TICK						; ring empty or budget spent
 	CALL	@MAIN.TICK_AND_CHECK_KEY
 	JR	C,.CANCEL
@@ -370,6 +398,11 @@ WAIT_REPLY
 	LD	(ICMPLIB_LAST_FAIL),A
 	SCF
 	RET
+	IFDEF	UNET_DLL
+.I_MATCHED
+	OR	A
+	RET
+	ENDIF
 
 TIMEOUT_START	DW 0
 

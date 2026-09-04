@@ -56,14 +56,17 @@
 ;
 ; --- ISA window discipline ----------------------------------------
 ;
-; @ISA.ISA_OPEN does DI and maps the card at 0xC000..0xFFFF;
-; @ISA.ISA_CLOSE restores MMU3 and does EI.  ISA.IS_OPEN is a flag,
+; @ISA.ISA_OPEN samples the caller's IFF2, then DIs and maps the
+; card at 0xC000..0xFFFF; @ISA.ISA_CLOSE restores MMU3 and restores
+; that sampled IFF2 (EI only if it was set).  ISA.IS_OPEN is a flag,
 ; not a nesting counter, so library-internal close/reopen pairs nest
 ; correctly inside our bracket.  EVERY UNET function returns with
-; the window CLOSED and interrupts ENABLED.  Functions that only
-; read the environment (GETCAPS, STATUS, GETINFO, LASTERR, SETOPT,
-; RXPAUSE, RXRESUME) never open it at all - DSS lives in page 3,
-; which the ISA window occupies.
+; the window CLOSED and the caller's IFF restored to what it was on
+; entry - a consumer that keeps interrupts enabled (e.g. for a music
+; player) never has them force-enabled or force-disabled by us.
+; Functions that only read the environment (GETCAPS, STATUS,
+; GETINFO, LASTERR, SETOPT, RXPAUSE, RXRESUME) never open it at all -
+; DSS lives in page 3, which the ISA window occupies.
 ;
 ; Window 3 is refused at load time for the same reason UNETESP
 ; refuses it: we would page ourselves out during every call.
@@ -90,8 +93,10 @@
 	DEFINE	USE_RESOLVE
 	DEFINE	USE_TCP
 	DEFINE	USE_TCP_RELIABLE_SEND	; bounded per-MSS ACK wait + retransmit
+	DEFINE	USE_TCP_ASYNCSEND	; UNET_OPT_SENDSLICE / NERR_AGAIN
 	DEFINE	USE_TCP_CONTEXT_FULL	; all live receive state follows its channel
 	DEFINE	USE_TCP_MULTICHAN
+	DEFINE	USE_TCP_LISTEN		; UNET_CAP_LISTEN passive open
 	DEFINE	USE_UDP
 	DEFINE	USE_UDP_MULTICHAN
 	DEFINE	USE_ICMP
@@ -105,26 +110,34 @@
 	INCLUDE "isa.inc"
 	INCLUDE "rtl8019.inc"
 	INCLUDE "unet.inc"
+	INCLUDE "coldctx.inc"
 
 ; Capability mask.  RXFLOW is CLEAR: the card buffers receive in its
 ; ~6.4 KB byte-mode ring, so RXPAUSE/RXRESUME are genuine no-ops here (unlike
 ; the ESP backend, where the consumer must honour them).
-; LISTEN/TRANSPARENT are v1 gaps.  RAWETH stays clear even
-; though the card can do it: slots 0..17 have no raw-frame entry
-; point, and advertising a capability with nothing to call would be
-; a lie.
-UNETRTL_CAPS	EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_MULTICHAN
+; TRANSPARENT is a v1 gap.  RAWETH stays clear even though the card
+; can do it: slots 0..17 have no raw-frame entry point, and
+; advertising a capability with nothing to call would be a lie.
+; ASYNCSEND is SET: TCP SEND can suspend with NERR_AGAIN instead of
+; blocking for up to SEND_ATTEMPTS*SEND_ACK_TIMEOUT_MS; see
+; UNET_OPT_SENDSLICE and F_SEND's resume path below.  LISTEN is SET:
+; passive TCP open via F_LISTEN/F_UNLISTEN and F_RECV's .listen path.
+UNETRTL_CAPS	EQU UNET_CAP_TCP | UNET_CAP_UDP | UNET_CAP_RESOLVE | UNET_CAP_PING | UNET_CAP_MULTICHAN | UNET_CAP_ASYNCSEND | UNET_CAP_LISTEN
 
 UNET_CHANNELS	EQU 2
 MAX_HOST_LEN	EQU 128			; matches UNETESP; also bounds the
 MAX_PORT_LEN	EQU 15			; resolver's own scratch usage
 TCP_MSS		EQU 536			; SEND chunk size, hidden by the ABI
-; Measured worst case: "RTL hw=0/#0300 st=NETINIT nerr=09 tcp=00 res=00
-; tx=04/02/03/22 regs=22 00 C8 C4 E0 80 46 60 49 4A" + NUL is ~98 bytes
-; (NETINIT is the longest stage mnemonic; see ST_* below).  112 keeps
-; real headroom while returning the image-budget bytes the v0.2.41
-; foreign-channel fix needed (see HANDLE_FOREIGN_FRAME/TCP_ADV_WIN).
-LASTERR_SIZE	EQU 112
+; Measured worst case: "RTL hw=0/#0300 st=NETINIT nerr=09 tcp=00
+; res=00 tx=04/02/03/22" + NUL is 63 bytes (NETINIT/CONNECT/UDPOPEN/
+; RESOLVE tie for the longest stage mnemonic at 7 chars; see ST_*
+; below).  72 keeps a real but tighter margin (image budget -- see
+; the BUILD_TCP_PORTS_SEQ dedup below for the same reason).  The
+; trailing " regs=..." CR/ISR/DCR/RCR/TCR/IMR/PSTART/PSTOP/BNRY/CURR
+; dump this string used to carry was dropped for LISTEN's image
+; budget (see CAPTURE_DIAG/BUILD_LASTERR); every EXE utility still
+; prints that dump directly via its own @RTL.SNAPSHOT_REGS call.
+LASTERR_SIZE	EQU 72
 
 	ORG 0x0000			; the ONLY ORG; mkdll rewrites it
 DLL_IMAGE_ORIGIN	EQU $
@@ -152,8 +165,8 @@ DLL_IMAGE_ORIGIN	EQU $
 	JP	F_GETINFO		; 15
 	JP	F_LASTERR		; 16
 	JP	F_SETOPT		; 17
-	JP	F_NOTSUP		; 18 reserved
-	JP	F_NOTSUP		; 19 reserved
+	JP	F_LISTEN		; 18
+	JP	F_UNLISTEN		; 19
 	JP	F_NOTSUP		; 20 reserved
 	JP	F_NOTSUP		; 21 reserved
 	JP	F_NOTSUP		; 22 reserved
@@ -181,34 +194,42 @@ DLL_IMAGE_ORIGIN	EQU $
 ; BSS_TCP grew 0x035->0x037 (TCP_ADV_WIN_HI/LO, see memmap.inc) --
 ; every offset from BSS_UDP onward shifted +2 accordingly.  BSS_LASTERR
 ; shrank 0x080->0x070 (LASTERR_SIZE 128->112, see its declaration) --
-; every offset from BSS_TX_BUF onward shifted a further -16.
+; every offset from BSS_TX_BUF onward shifted a further -16.  BSS_TCP
+; grew AGAIN 0x037->0x039 (TCP_ATTEMPT_MS_LEFT, ASYNCSEND) -- every
+; offset from BSS_UDP onward shifted a further +2.  BSS_COLD_CTX was
+; then added after BSS_PEND_BUF (WIN0COLD.RUN's parameter block,
+; CCTX_SIZE bytes) and BSS_LASTERR shrank AGAIN 0x070->0x048
+; (LASTERR_SIZE 112->72: dropped the " regs=..." NIC-register dump,
+; see BUILD_LASTERR) -- every offset from BSS_TX_BUF onward shifted a
+; further -40.
 ; BSS_CH_TCP is SELECT_CHANNEL's swap slot: TCP_STATE..+TCP_CTX_SIZE
-; plus TCP_ACK_WAIT_STATE..+TCP_SWAP_TAIL_SIZE = 38+13 = 51 (0x33).
+; plus TCP_ACK_WAIT_STATE..+TCP_SWAP_TAIL_SIZE = 38+15 = 53 (0x35).
 ; It must track those two constants, NOT TCP_BSS_SIZE -- the tail of
-; the TCP BSS past TCP_RECV_TIMEOUT (TCP_ADV_WIN_HI/LO) is
+; the TCP BSS past TCP_ATTEMPT_MS_LEFT (TCP_ADV_WIN_HI/LO) is
 ; session-global and stays out of the swap.  The ASSERT after
 ; INCLUDE "memmap.inc" enforces the relationship; see the two
 ; incidents it now covers in TCP_ADV_WIN_HI's memmap.inc comment.
 BSS_LIB		EQU 0x0000		; 0x17C util + rtl + netenv + rtl tx + SG desc
 BSS_RESOLVE	EQU 0x017C		; 0x029 resolve_lib
-BSS_TCP		EQU 0x01A5		; 0x037 tcp_lib
-BSS_UDP		EQU 0x01DC		; 0x018 udp_lib
-BSS_ICMP	EQU 0x01F4		; 0x010 icmp_lib
-BSS_OUR_IP	EQU 0x0204		; 4
-BSS_OUR_MAC	EQU 0x0208		; 6
-BSS_CANCELLED	EQU 0x020E		; 1
-BSS_LASTERR	EQU 0x0210		; 0x070 formatted diagnostic line
-BSS_TX_BUF	EQU 0x0280		; 0x140 320 = RESOLVE_MAX_FRAME (largest whole-built frame)
-BSS_RX_HDR	EQU 0x03C0		; 4     NE2000 RX ring header
-BSS_RX_BUF	EQU 0x03C4		; 0x5EA 1514 = 14+20+8+1472 (standard UDP MTU)
-BSS_CH_TCP	EQU 0x09AE		; 0x33 inactive TCP context (salt + adv-win excluded)
-BSS_CH_UDP	EQU 0x09E1		; 0x18 inactive-channel UDP context
-BSS_PEND_LEN	EQU 0x09F9		; 2 words
-BSS_PEND_OFF	EQU 0x09FD		; 2 words
-BSS_CLOSED	EQU 0x0A01		; 2 bytes
-BSS_LOST	EQU 0x0A03		; 2 bytes
-BSS_PEND_BUF	EQU 0x0A05		; 2 * 536-byte TCP receive queues
-DLL_BSS_SIZE	EQU 0x0E35		; 3637 total
+BSS_TCP		EQU 0x01A5		; 0x039 tcp_lib
+BSS_UDP		EQU 0x01DE		; 0x018 udp_lib
+BSS_ICMP	EQU 0x01F6		; 0x010 icmp_lib
+BSS_OUR_IP	EQU 0x0206		; 4
+BSS_OUR_MAC	EQU 0x020A		; 6
+BSS_CANCELLED	EQU 0x0210		; 1
+BSS_LASTERR	EQU 0x0212		; 0x048 formatted diagnostic line
+BSS_TX_BUF	EQU 0x025A		; 0x140 320 = RESOLVE_MAX_FRAME (largest whole-built frame)
+BSS_RX_HDR	EQU 0x039A		; 4     NE2000 RX ring header
+BSS_RX_BUF	EQU 0x039E		; 0x5EA 1514 = 14+20+8+1472 (standard UDP MTU)
+BSS_CH_TCP	EQU 0x0988		; 0x35 inactive TCP context (salt + adv-win excluded)
+BSS_CH_UDP	EQU 0x09BD		; 0x18 inactive-channel UDP context
+BSS_PEND_LEN	EQU 0x09D5		; 2 words
+BSS_PEND_OFF	EQU 0x09D9		; 2 words
+BSS_CLOSED	EQU 0x09DD		; 2 bytes
+BSS_LOST	EQU 0x09DF		; 2 bytes
+BSS_PEND_BUF	EQU 0x09E1		; 2 * 536-byte TCP receive queues
+BSS_COLD_CTX	EQU 0x0E11		; CCTX_SIZE (18): WIN0COLD.RUN parameter block
+DLL_BSS_SIZE	EQU 0x0E23		; 3619 total
 	ASSERT	BSS_TX_BUF + 0x140 <= BSS_RX_HDR
 
 DLL_BSS
@@ -267,7 +288,14 @@ CH_PEND_SIZE	EQU 536
 ;
 ; The ISA window MUST be closed across the delay so the 50 Hz system
 ; interrupt is serviced (it runs from the page the window covers),
-; and DSS_SCANKEY may remap page 3 outright.
+; and DSS_SCANKEY may remap page 3 outright.  Since ISA_CLOSE now
+; restores the caller's own IFF2 instead of forcing EI, a consumer
+; that called into UNET with interrupts already disabled runs this
+; delay -- and the DSS_SCANKEY poll below -- with IRQs off too: the
+; delay is a plain CPU busy loop so it still paces correctly, but
+; CANCELKEYS is inert for such a caller because the 50 Hz ISR never
+; fills the keyboard buffer without interrupts. This is expected: we
+; only ever restore what the caller had, never grant more than that.
 ;
 ; Unlike an EXE, a library never grabs the keyboard uninvited: the
 ; key poll happens only after the consumer asked for it with
@@ -341,6 +369,11 @@ INIT
 ; Function 1 - FINI (libman free hook).
 ; ------------------------------------------------------
 FINI
+	; Unarm any active listener before tearing down both channels --
+	; otherwise RELEASE_OR_REARM would re-arm an accepted connection's
+	; listener right as the DLL is being unloaded.
+	LD	A,0xFF
+	LD	(LISTEN_CH),A
 	CALL	CLOSE_LINK
 	XOR	A
 	RET
@@ -360,6 +393,12 @@ F_GETCAPS
 ; firmware that can still be warming up.
 ; ------------------------------------------------------
 F_NETINIT
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
+	; Unarm any active listener before tearing down both channels --
+	; the card is about to be reset, invalidating every peer tuple.
+	LD	A,0xFF
+	LD	(LISTEN_CH),A
 	XOR	A
 	LD	(@MAIN.CANCELLED),A
 	LD	A,ST_NETINIT
@@ -381,12 +420,28 @@ F_NETINIT
 	LD	(@ARP.OUR_MAC_PTR),HL
 	LD	HL,@MAIN.OUR_IP
 	LD	(@ARP.OUR_IP_PTR),HL
-	; Card.  INIT_BASE honours NET_RTL_HW, else auto-scans both ISA
-	; slots; it leaves the window OPEN on success, CLOSED on failure.
+	; Card.  UNETRTL.DLL compiles INIT_BASE as env-only (image budget
+	; -- see rtl8019.asm's IFDEF UNET_DLL in INIT_BASE): it honours
+	; NET_RTL_HW and does not auto-scan.  It leaves the window OPEN on
+	; success, CLOSED on failure.  Failure means the env is missing,
+	; malformed, or the chip did not answer at the pinned slot/base --
+	; all three are fixed the same way (run IFUP/NETCFG once), so this
+	; maps to NERR_NONET rather than NERR_HW.
+	; RESOLVE/PING's bulk protocol logic lives in a WIN0 overlay (image
+	; budget -- see src/lib/win0cold.asm); best-effort, one-time.  Its
+	; own idempotency check makes a repeated NETINIT safe.  A failure
+	; here does not fail NETINIT: LISTEN and already-open channels
+	; keep working in full.  F_RESOLVE/F_PING gate on WIN0COLD.READY
+	; and report NERR_NOTSUP; CONNECT/UDPOPEN resolve their host
+	; argument (literal IPs included) through the same overlay, so
+	; they fail too -- with the resolver's normal NERR_CONNECT
+	; mapping, no dedicated gate (image budget).
+	CALL	@WIN0COLD.INIT
+	CALL	NC,BUILD_COLD_CTX
 	LD	A,1				; default slot ISA1, as the apps do
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@RTL.INIT_BASE
-	JP	C,RET_HW
+	JP	C,RET_NONET
 	CALL	@RTL.RESET
 	JR	C,.hw_fail
 	LD	HL,@MAIN.OUR_MAC
@@ -406,12 +461,21 @@ F_NETINIT
 ; Function 8 - CLOSE / Function 4 - NETDONE (shared tail).
 ; ------------------------------------------------------
 F_CLOSE
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	CALL	CLOSE_CHANNEL
 	XOR	A
 	RET
 F_NETDONE
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
+	; Unarm any active listener before tearing down both channels --
+	; otherwise RELEASE_OR_REARM would re-arm an accepted connection's
+	; listener right as the network is being taken down.
+	LD	A,0xFF
+	LD	(LISTEN_CH),A
 	CALL	CLOSE_LINK
 	XOR	A
 	RET
@@ -420,6 +484,8 @@ F_NETDONE
 ; Function 5 - CONNECT (TCP).
 ; ------------------------------------------------------
 F_CONNECT
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
@@ -458,9 +524,6 @@ F_CONNECT
 	LD	DE,TCP_REMOTE_MAC
 	LD	BC,6
 	LDIR
-	; TARGET_MAC overlays the foreign-dispatch busy byte.
-	XOR	A
-	LD	(FOREIGN_BUSY),A
 	LD	HL,(ARG_PORT)
 	LD	A,H
 	LD	(TCP_REMOTE_PORT_HI),A
@@ -501,9 +564,50 @@ F_SEND
 	LD	A,(ARG_CH)
 	CALL	SELECT_CHANNEL
 	CALL	GET_CH_STATE
+	CP	3
+	JP	Z,RET_STATE			; listening, not yet accepted: nothing to send to
 	CP	2
 	JP	Z,.udp
 	; -- TCP --
+	LD	A,(APEND_CH)
+	CP	0xFF
+	JR	Z,.fresh_send
+	; A SEND is suspended.  Only the SAME channel, buffer and length
+	; may continue it (unet.inc / docs/UNETAPI.md): a different call
+	; would lose the pending byte-count result, and a fresh SEND on
+	; the pend channel would duplicate stream bytes already sent.
+	LD	HL,APEND_CH
+	LD	A,(ARG_CH)
+	CP	(HL)
+	JP	NZ,RET_STATE
+	LD	HL,(APEND_BUF)
+	LD	DE,(ARG_DE)
+	OR	A
+	SBC	HL,DE
+	JP	NZ,RET_STATE
+	LD	HL,(APEND_LEN)
+	LD	DE,(ARG_IX)
+	OR	A
+	SBC	HL,DE
+	JP	NZ,RET_STATE
+	; Valid resume: the buffer already passed CHECK_BUF_RANGE on the
+	; original call.  Restore the chunk loop's working state and
+	; re-enter the SAME outstanding segment's ACK wait directly.
+	LD	HL,(APEND_DONE)
+	LD	(SEND_DONE),HL
+	LD	HL,(APEND_CHUNK)
+	LD	(CHUNK_LEN),HL
+	LD	A,0xFF
+	LD	(APEND_CH),A		; consumed; a fresh AGAIN re-arms it
+	CALL	@ISA.ISA_OPEN
+	LD	HL,(ARG_DE)
+	LD	DE,(SEND_DONE)
+	ADD	HL,DE
+	LD	BC,(CHUNK_LEN)
+	CALL	@TCP.SEND_RESUME
+	JR	C,.fail
+	JR	.after_send
+.fresh_send
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
@@ -565,8 +669,9 @@ F_SEND
 	; buffer), and a consumer keying "drain RECV, then retry" on a
 	; code that also covers permanent caller bugs will loop forever on
 	; those (real FTPC bug report, 2026-08-05).  BUSY is the frozen
-	; ABI's transient-refusal code; NERR_AGAIN is off-limits here
-	; because unet.inc reserves it for UNET_CAP_ASYNCSEND backends.
+	; ABI's transient-refusal code for an occupied pend slot; a
+	; SILENT link instead suspends the whole SEND with NERR_AGAIN --
+	; see .fail's F_AGAIN branch below (UNET_CAP_ASYNCSEND).
 	LD	A,(ARG_CH)
 	CALL	PEND_LEN_ADDR_A
 	LD	A,(HL)
@@ -579,6 +684,7 @@ F_SEND
 	LD	BC,(CHUNK_LEN)
 	CALL	@TCP.SEND
 	JR	C,.fail
+.after_send
 	CALL	CAPTURE_SEND_PENDING
 	LD	HL,(SEND_DONE)
 	LD	BC,(CHUNK_LEN)
@@ -597,12 +703,35 @@ F_SEND
 	LD	(LAST_NERR),A
 	RET
 .fail
+	LD	A,(TCP_LAST_FAIL)
+	CP	@TCP.F_AGAIN
+	JR	Z,.suspend
 	LD	HL,(SEND_DONE)
 	PUSH	HL
 	CALL	CAPTURE_AND_CLOSE
 	CALL	MAP_TCP_SEND_FAIL		; A = NERR_*, CF=0
 	POP	DE
 	RET
+.suspend
+	; Silence for one UNET_OPT_SENDSLICE quantum; the overall
+	; SEND_ATTEMPTS budget is not exhausted.  Not an error: close the
+	; window WITHOUT a diagnostic capture (CAPTURE_DIAG would smash
+	; the DIAG_TX overlay of SEND_DONE) and park the resume-contract
+	; state for F_SEND's resume branch above.
+	CALL	@ISA.ISA_CLOSE
+	LD	A,(ARG_CH)
+	LD	(APEND_CH),A
+	LD	HL,(ARG_DE)
+	LD	(APEND_BUF),HL
+	LD	HL,(ARG_IX)
+	LD	(APEND_LEN),HL
+	LD	HL,(SEND_DONE)
+	LD	(APEND_DONE),HL
+	LD	HL,(CHUNK_LEN)
+	LD	(APEND_CHUNK),HL
+	LD	DE,(SEND_DONE)
+	LD	A,NERR_AGAIN
+	JP	RET_A
 .udp
 	; One datagram; the cap is set by TX_BUF, not by the protocol.
 	LD	HL,UDPLIB_MAX_PAYLOAD
@@ -653,9 +782,27 @@ F_RECV
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
 	JP	C,RET_PARAM
+	LD	A,(APEND_CH)
+	CP	0xFF
+	JR	Z,.not_suspended
+	; A SEND is suspended (on this channel or the other): the link
+	; belongs to it until it resumes.  Serve only already-buffered
+	; pending data, memory-only, and return immediately -- RECV must
+	; never touch the NIC while a send transaction is pending.
+	LD	HL,0
+	LD	(COPY_LEN),HL
+	CALL	COPY_PENDING_ARG
+	CALL	BUILD_RECV_FLAGS
+	LD	DE,(COPY_LEN)
+	XOR	A
+	LD	(LAST_NERR),A
+	RET
+.not_suspended
 	LD	A,(ARG_CH)
 	CALL	SELECT_CHANNEL
 	CALL	GET_CH_STATE
+	CP	3
+	JP	Z,.listen
 	CP	2
 	JP	Z,.udp
 	; -- TCP --
@@ -805,8 +952,7 @@ F_RECV
 	LD	A,(ARG_CH)
 	CALL	CLOSED_ADDR_A
 	LD	(HL),0
-	XOR	A
-	CALL	SET_CH_STATE
+	CALL	RELEASE_OR_REARM
 	LD	DE,0
 	CALL	BUILD_RECV_FLAGS
 	LD	A,NERR_CLOSED
@@ -844,6 +990,59 @@ F_RECV
 	OR	E
 	JR	NZ,.return_drain_ok
 	JR	.hw
+.listen
+	; -- Passive open: progress the accept, one bounded poll --
+	XOR	A
+	LD	(@MAIN.CANCELLED),A
+	LD	HL,(ARG_IY)
+	LD	A,H
+	OR	L
+	JR	NZ,.listen_have_to
+	LD	HL,1
+.listen_have_to
+	LD	(TCP_TIMEOUT_LEFT),HL
+	CALL	@ISA.ISA_OPEN
+	CALL	@TCP.LISTEN_POLL
+	JR	C,.listen_fail
+	CALL	@ISA.ISA_CLOSE
+	OR	A
+	JR	Z,.listen_idle
+	; Accepted: promote to a normal open TCP channel and re-enter the
+	; established-connection path above, non-blocking, so an
+	; uncommitted data-/FIN-bearing final ACK is delivered in this
+	; same call; a pure-ACK accept simply finds nothing new yet.
+	LD	A,1
+	CALL	SET_CH_STATE
+	LD	A,1
+	LD	(LISTEN_ACCEPTED),A
+	LD	HL,1
+	LD	(ARG_IY),HL
+	JP	.not_suspended
+.listen_idle
+	LD	DE,0
+	CALL	BUILD_RECV_FLAGS
+	XOR	A
+	LD	(LAST_NERR),A
+	RET
+.listen_fail
+	LD	A,(TCP_LAST_FAIL)
+	CP	@TCP.F_CANCEL
+	JR	Z,.listen_cancel
+	CP	@TCP.F_OTHER
+	JR	Z,.listen_other
+	; F_SEND: the SYN+ACK reply could not be transmitted.
+	CALL	CAPTURE_AND_CLOSE
+	JP	RET_HW
+.listen_cancel
+	XOR	A
+	LD	(@MAIN.CANCELLED),A
+	CALL	@ISA.ISA_CLOSE
+	LD	DE,0
+	LD	A,NERR_CANCEL
+	JP	RET_A
+.listen_other
+	CALL	@ISA.ISA_CLOSE
+	JR	.listen_idle
 .udp
 	; -- UDP: one datagram per call --
 	LD	A,0xFF
@@ -1113,10 +1312,27 @@ F_STATUS
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	CALL	GET_CH_STATE
+	CP	3
+	JR	Z,.listening
 	AND	A
 	LD	DE,0
 	JR	Z,.check_pending
 	LD	DE,UNET_ST_CONN
+	; This channel is the current listener's accepted peer: also
+	; report UNET_ST_ACCEPT.
+	LD	A,(LISTEN_CH)
+	LD	HL,ARG_CH
+	CP	(HL)
+	JR	NZ,.check_pending
+	LD	A,(LISTEN_ACCEPTED)
+	OR	A
+	JR	Z,.check_pending
+	LD	A,E
+	OR	UNET_ST_ACCEPT
+	LD	E,A
+	JR	.check_pending
+.listening
+	LD	DE,UNET_ST_LISTEN
 .check_pending
 	LD	A,(ARG_CH)
 	CALL	PEND_HAS_A
@@ -1147,6 +1363,8 @@ F_STATUS
 ; Function 10 - UDPOPEN.
 ; ------------------------------------------------------
 F_UDPOPEN
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
@@ -1206,8 +1424,6 @@ F_UDPOPEN
 	LD	DE,TARGET_MAC
 	LD	BC,(ARG_PORT)
 	LD	IY,(ARG_LPORT)
-	XOR	A
-	LD	(FOREIGN_BUSY),A
 	CALL	@UDP.OPEN
 	LD	A,2
 	CALL	SET_CH_STATE			; 2 = UDP
@@ -1218,10 +1434,17 @@ F_UDPOPEN
 ; ------------------------------------------------------
 ; Function 11 - RESOLVE.
 ; CAP_RESOLVE is set AND works on this backend: software DNS via
-; dns_lib / resolve_lib.  Never NERR_NOTSUP (unlike UNETESP on
-; firmware without AT+CIPDOMAIN).
+; dns_lib (in the WIN0 cold overlay) / resolve_lib.  NERR_NOTSUP
+; happens only when NETINIT could not load the overlay from the
+; DLL's own file (see F_NETINIT's WIN0COLD.INIT call) -- the honest
+; report for a resolver whose code is not in memory.
 ; ------------------------------------------------------
 F_RESOLVE
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
+	LD	A,(@WIN0COLD.READY)
+	OR	A
+	JP	Z,RET_NOTSUP
 	LD	(ARG_DE),DE
 	LD	(ARG_IX),IX
 	LD	A,ST_RESOLVE
@@ -1262,6 +1485,13 @@ F_RESOLVE
 ; A reply on the first drain pass reports 0.
 ; ------------------------------------------------------
 F_PING
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
+	; Like F_RESOLVE: the echo builder and reply matcher live in the
+	; WIN0 cold overlay; without it, honestly report NOTSUP.
+	LD	A,(@WIN0COLD.READY)
+	OR	A
+	JP	Z,RET_NOTSUP
 	LD	(ARG_DE),DE
 	LD	(ARG_IY),IY
 	LD	A,ST_PING
@@ -1398,9 +1628,10 @@ F_GETINFO
 ; Layout (head-truncated, unlike UNETESP which keeps the tail: this
 ; string is fixed-format, so the high-value fields come first and a
 ; short caller buffer still sees hw / st / nerr / tcp / res):
-;   RTL hw=1/#0300 st=CONNECT nerr=04 tcp=02 res=00
-;       tx=E4/42/01/22 regs=22 42 40 04 02 00 46 60 4A 4B
-; regs are CR ISR DCR RCR TCR IMR PSTART PSTOP BNRY CURR.
+;   RTL hw=1/#0300 st=CONNECT nerr=04 tcp=02 res=00 tx=E4/42/01/22
+; No raw NIC-register dump here (image budget); a DLL-based consumer
+; that needs CR/ISR/DCR/RCR/TCR/IMR/PSTART/PSTOP/BNRY/CURR reads them
+; the same way every EXE utility does, via its own diagnostic path.
 ; ------------------------------------------------------
 F_LASTERR
 	LD	(ARG_DE),DE
@@ -1432,6 +1663,8 @@ F_SETOPT
 	JR	Z,.cancelkeys
 	CP	UNET_OPT_RXTRIG
 	JP	Z,RET_NOTSUP
+	CP	UNET_OPT_SENDSLICE
+	JR	Z,.sendslice
 	JP	RET_PARAM
 .cancelkeys
 	LD	A,D
@@ -1442,9 +1675,92 @@ F_SETOPT
 	LD	(CANCEL_MODE),A
 	XOR	A
 	RET
+.sendslice
+	LD	A,D
+	OR	E
+	JR	Z,.store_slice			; 0 = blocking, the default: no clamp
+	LD	A,D
+	OR	A
+	JR	NZ,.store_slice			; DE >= 256 > 50: keep as-is
+	LD	A,E
+	CP	50
+	JR	NC,.store_slice			; E >= 50: keep as-is
+	LD	DE,50				; 1..49 -> clamp to the enforced minimum
+.store_slice
+	LD	(OPT_SLICE),DE
+	XOR	A
+	RET
 
 ; ------------------------------------------------------
-; Reserved slots 18..23.
+; Function 18 - LISTEN.  A=channel, DE=local TCP port (1..65535).
+; Arms the (closed) channel as the backend's one server socket; the
+; consumer polls RECV to progress the accept (see F_RECV's .listen).
+; ------------------------------------------------------
+F_LISTEN
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
+	LD	(ARG_PORT),DE
+	LD	A,(INITED)
+	AND	A
+	JP	Z,RET_STATE
+	CALL	GET_CH_STATE
+	AND	A
+	JP	NZ,RET_STATE			; channel must be closed
+	LD	A,(LISTEN_CH)
+	CP	0xFF
+	JP	NZ,RET_STATE			; only one listener at a time
+	LD	HL,(ARG_PORT)
+	LD	A,H
+	OR	L
+	JP	Z,RET_PARAM			; port 0 is not listenable
+	LD	A,(ARG_CH)
+	CALL	SELECT_CHANNEL
+	LD	A,(ARG_CH)
+	CALL	PEND_CLEAR_A
+	LD	HL,(ARG_PORT)
+	CALL	@TCP.LISTEN_INIT
+	LD	A,(ARG_CH)
+	LD	(LISTEN_CH),A
+	LD	HL,(ARG_PORT)
+	LD	(LISTEN_PORT),HL
+	XOR	A
+	LD	(LISTEN_ACCEPTED),A
+	LD	A,3
+	CALL	SET_CH_STATE
+	XOR	A
+	RET
+
+; ------------------------------------------------------
+; Function 19 - UNLISTEN.  A=channel (the currently listening one).
+; Stops the server.  An already-accepted connection stays open as a
+; normal channel; the consumer CLOSEs it separately when done.
+; ------------------------------------------------------
+F_UNLISTEN
+	CALL	CHECK_ASYNC_PEND
+	JP	C,RET_BUSY
+	CALL	CHECK_CHANNEL
+	JP	C,RET_PARAM
+	LD	A,(LISTEN_CH)
+	LD	HL,ARG_CH
+	CP	(HL)
+	JP	NZ,RET_STATE			; must be the currently-listening channel
+	LD	A,0xFF
+	LD	(LISTEN_CH),A
+	LD	A,(LISTEN_ACCEPTED)
+	OR	A
+	JR	NZ,.done			; an accepted connection stays open
+	XOR	A
+	CALL	SET_CH_STATE
+	LD	A,(ARG_CH)
+	CALL	PEND_CLEAR_A
+.done
+	XOR	A
+	RET
+
+; ------------------------------------------------------
+; Reserved slots 20..23.
 ; ------------------------------------------------------
 F_NOTSUP
 	JP	RET_NOTSUP
@@ -1474,6 +1790,9 @@ RET_NONET
 RET_HW
 	LD	A,NERR_HW
 	JR	RET_A
+RET_BUSY
+	LD	A,NERR_BUSY
+	JR	RET_A
 
 ; ======================================================
 ; Helpers
@@ -1489,6 +1808,27 @@ CHECK_CHANNEL
 	OR	A
 	RET
 .bad
+	SCF
+	RET
+
+; ------------------------------------------------------
+; CHECK_ASYNC_PEND: refuse every transmitting/state-changing call
+; except the resuming SEND itself while a SEND transaction is
+; suspended.  Completing the transaction from another call would
+; lose its byte-count result, and a later SEND retry would duplicate
+; stream bytes; see F_SEND's resume path.
+;   Out: CF=0 no pend; CF=1 pend (caller returns NERR_BUSY).
+;   A (the caller's channel argument) is preserved: every caller
+;   feeds it straight into CHECK_CHANNEL next.  Clobbers L only --
+;   safe, since every call site is the first thing in an ABI entry
+;   point and HL is already consumed by the libman dispatcher.
+; ------------------------------------------------------
+CHECK_ASYNC_PEND
+	LD	L,A
+	LD	A,(APEND_CH)
+	CP	0xFF
+	LD	A,L				; restore; CP's Z/C survive LD
+	RET	Z
 	SCF
 	RET
 
@@ -1893,8 +2233,8 @@ RESET_CHANNEL_STATE
 	; = DLL_BSS_SIZE - BSS_TCP - 1.  Literal, NOT a computed
 	; difference (relocation rule); recompute by hand and update
 	; this comment's numbers whenever DLL_BSS_SIZE or BSS_TCP moves.
-	; 0x0E35 - 0x01A5 - 1 = 0x0C8F.
-	LD	BC,0x0C8F		; TCP BSS .. end of DLL BSS, minus first byte
+	; 0x0E23 - 0x01A5 - 1 = 0x0C7D.
+	LD	BC,0x0C7D		; TCP BSS .. end of DLL BSS, minus first byte
 	LDIR
 	; The bulk zero above also cleared TCP_ADV_WIN_HI/LO (it sits
 	; inside the zeroed span); restore it to the normal window --
@@ -1909,6 +2249,37 @@ RESET_CHANNEL_STATE
 	LD	(FOREIGN_HINT),A
 	RET
 
+; ------------------------------------------------------
+; RELEASE_OR_REARM: close ARG_CH's channel slot, or -- if it is the
+; currently-listening channel's ACCEPTED connection -- re-arm LISTEN
+; on the same port instead (UNET_CAP_LISTEN's rendezvous contract:
+; closing an accepted peer returns the server to listening).  A
+; force-close of the listening channel while still unaccepted (state
+; 3, e.g. NETDONE tearing down both channels) unarms the listener
+; instead of leaving LISTEN_CH pointing at a now-closed channel.
+; Drop-in replacement for "XOR A / CALL SET_CH_STATE".
+; ------------------------------------------------------
+RELEASE_OR_REARM
+	LD	A,(LISTEN_CH)
+	LD	HL,ARG_CH
+	CP	(HL)
+	JR	NZ,.close
+	LD	A,(LISTEN_ACCEPTED)
+	OR	A
+	JR	Z,.unarm
+	XOR	A
+	LD	(LISTEN_ACCEPTED),A
+	LD	HL,(LISTEN_PORT)
+	CALL	@TCP.LISTEN_INIT
+	LD	A,3
+	JP	SET_CH_STATE
+.unarm
+	LD	A,0xFF
+	LD	(LISTEN_CH),A
+.close
+	XOR	A
+	JP	SET_CH_STATE
+
 ; Close one selected channel.  Idempotent; pending bytes are discarded.
 CLOSE_CHANNEL
 	CALL	GET_CH_STATE
@@ -1917,6 +2288,8 @@ CLOSE_CHANNEL
 	LD	A,(ARG_CH)
 	CALL	SELECT_CHANNEL
 	CALL	GET_CH_STATE
+	CP	3
+	JR	Z,.clear			; listening (or mid-handshake): nothing to FIN
 	CP	2
 	JR	Z,.udp
 	CALL	@ISA.ISA_OPEN
@@ -1926,8 +2299,7 @@ CLOSE_CHANNEL
 .udp
 	CALL	@UDP.CLOSE
 .clear
-	XOR	A
-	CALL	SET_CH_STATE
+	CALL	RELEASE_OR_REARM
 	LD	A,(ARG_CH)
 	CALL	PEND_CLEAR_A
 	RET
@@ -1944,6 +2316,33 @@ CLOSE_LINK
 	CALL	CLOSE_CHANNEL
 	POP	AF
 	LD	(ARG_CH),A
+	RET
+
+; ------------------------------------------------------
+; BUILD_COLD_CTX: fill COLD_CTX (src/include/coldctx.inc) once, right
+; after WIN0COLD.INIT succeeds.  Every field is a pointer into this
+; DLL instance's own (already-relocated) hot data, valid for the
+; DLL's whole lifetime.
+; ------------------------------------------------------
+BUILD_COLD_CTX
+	LD	HL,@MAIN.TX_BUF
+	LD	(COLD_CTX+CCTX_TX_BUF),HL
+	LD	HL,@MAIN.OUR_MAC
+	LD	(COLD_CTX+CCTX_OUR_MAC),HL
+	LD	HL,@MAIN.OUR_IP
+	LD	(COLD_CTX+CCTX_OUR_IP),HL
+	LD	HL,@UTIL.CHECKSUM
+	LD	(COLD_CTX+CCTX_CHECKSUM),HL
+	LD	HL,@MAIN.RX_HDR
+	LD	(COLD_CTX+CCTX_RX_HDR),HL
+	LD	HL,@MAIN.RX_BUF
+	LD	(COLD_CTX+CCTX_RX_BUF),HL
+	LD	HL,@RTL.READ_PACKET
+	LD	(COLD_CTX+CCTX_READ_PACKET),HL
+	LD	HL,@ARP.ANSWER_REQUEST
+	LD	(COLD_CTX+CCTX_ANSWER_REQUEST),HL
+	LD	HL,@UTIL.PARSE_DEC_BYTE
+	LD	(COLD_CTX+CCTX_PARSE_DEC_BYTE),HL
 	RET
 
 ; ------------------------------------------------------
@@ -2085,8 +2484,7 @@ MAP_TCP_SEND_FAIL
 	LD	A,NERR_SEND
 	JP	RET_A
 .closed
-	XOR	A
-	CALL	SET_CH_STATE
+	CALL	RELEASE_OR_REARM
 	LD	A,(ARG_CH)
 	CALL	PEND_CLEAR_A
 	LD	A,NERR_CLOSED
@@ -2101,16 +2499,19 @@ MAP_TCP_SEND_FAIL
 	JP	RET_A
 
 ; ------------------------------------------------------
-; CAPTURE_DIAG: snapshot chip + stack state for LASTERR.  MUST be
-; called with the ISA window OPEN (SNAPSHOT_REGS drives the chip);
-; the formatting happens later, with the window closed.
+; CAPTURE_DIAG: snapshot TX stage/ISR/NCR/TPSR state for LASTERR.
+; MUST be called with the ISA window OPEN; the formatting happens
+; later, with the window closed.  Image-budget note: this used to
+; also capture @RTL.SNAPSHOT_REGS's 10-byte CR/ISR/DCR/RCR/TCR/IMR/
+; PSTART/PSTOP/BNRY/CURR dump into LASTERR's " regs=..." field; that
+; field is gone (see BUILD_LASTERR) to make room for LISTEN.  Every
+; EXE utility still prints the full register dump directly via its
+; own @RTL.SNAPSHOT_REGS call on a real timeout (CLAUDE.md's
+; diagnostic-output requirement is about that per-utility printing,
+; not this DLL's optional LASTERR query API) -- this only shrinks
+; what a DLL-based consumer's LASTERR call reports.
 ; ------------------------------------------------------
 CAPTURE_DIAG
-	CALL	@RTL.SNAPSHOT_REGS
-	LD	HL,RTL_REG_SNAPSHOT
-	LD	DE,DIAG_REGS
-	LD	BC,10
-	LDIR
 	LD	HL,RTL_TX_LAST_STAGE
 	LD	DE,DIAG_TX
 	LD	BC,4
@@ -2182,30 +2583,11 @@ BUILD_LASTERR
 	POP	HL
 	POP	BC
 	DEC	B
-	JR	Z,.regs
+	JR	Z,.term
 	LD	A,'/'
 	LD	(DE),A
 	INC	DE
 	JR	.tx_loop
-.regs
-	LD	HL,S_REGS
-	CALL	APPEND
-	LD	B,10
-	LD	HL,DIAG_REGS
-.reg_loop
-	LD	A,(HL)
-	INC	HL
-	PUSH	BC
-	PUSH	HL
-	CALL	@UTIL.FORMAT_HEX_A
-	POP	HL
-	POP	BC
-	DEC	B
-	JR	Z,.term
-	LD	A,' '
-	LD	(DE),A
-	INC	DE
-	JR	.reg_loop
 .term
 	XOR	A
 	LD	(DE),A
@@ -2430,7 +2812,6 @@ S_NERR		DB " nerr=",0
 S_TCP		DB " tcp=",0
 S_RES		DB " res=",0
 S_TX		DB " tx=",0
-S_REGS		DB " regs=",0
 
 ; Stage mnemonics for LASTERR.
 ST_NONE		EQU 0
@@ -2476,11 +2857,45 @@ ARG_LPORT	DW 0
 SEND_DONE	DW 0
 CHUNK_LEN	DW 0
 COPY_LEN	DW 0
-FOREIGN_BUSY	DB 0
+	; TARGET_MAC (= SEND_DONE + 4) is a 6-byte overlay spanning COPY_LEN
+	; plus the four bytes below.  FOREIGN_ORIG/OWNER/PROTO are set fresh
+	; at the top of every HANDLE_FOREIGN_FRAME call, so a RESOLVE_AND_ARP
+	; that writes TARGET_MAC in between may safely clobber them.
+	; FOREIGN_BUSY is the ONE dispatcher byte that must persist between
+	; calls (the foreign-frame reentrancy guard); it therefore lives AFTER
+	; the overlay (see below), never aliased -- do not move it back here.
+	; FOREIGN_MACPAD keeps TARGET_MAC six bytes wide with a don't-care.
+FOREIGN_MACPAD	DB 0
 FOREIGN_ORIG	DB 0
 FOREIGN_OWNER	DB 0
 FOREIGN_PROTO	DB 0
 FOREIGN_HINT	DB 0xFF			; channel owning the current NIC ring head
+FOREIGN_BUSY	DB 0			; reentrancy guard; OUTSIDE the TARGET_MAC
+					; overlay so ping/connect/udpopen never leave
+					; it "busy" and stall the foreign dispatcher
+	; UNET_CAP_ASYNCSEND: OPT_SLICE is the SETOPT SENDSLICE value (0 =
+	; blocking, the default).  APEND_CH is 0xFF when no SEND is
+	; suspended, else the channel a resume must match; APEND_BUF/LEN
+	; are the resume-contract reference (the caller's original DE/IX);
+	; APEND_DONE/CHUNK are SEND_DONE/CHUNK_LEN snapshots so the resumed
+	; chunk loop does not depend on the TARGET_IP/MAC/DIAG_TX overlay
+	; of that same memory surviving untouched across other calls.
+OPT_SLICE	DW 0
+APEND_CH	DB 0xFF
+APEND_BUF	DW 0
+APEND_LEN	DW 0
+APEND_DONE	DW 0
+APEND_CHUNK	DW 0
+	; UNET_CAP_LISTEN: LISTEN_CH is 0xFF when no channel is listening,
+	; else the channel armed by F_LISTEN (CH_STATE 3).  LISTEN_PORT is
+	; that channel's port, kept so CLOSE can re-arm the same TCB after
+	; an accepted connection ends.  LISTEN_ACCEPTED distinguishes the
+	; listening channel's two live CH_STATE==1 meanings: a peer was
+	; accepted from it (STATUS must OR in UNET_ST_ACCEPT) vs an
+	; ordinary CONNECTed channel that happens to be channel LISTEN_CH.
+LISTEN_CH	DB 0xFF
+LISTEN_PORT	DW 0
+LISTEN_ACCEPTED	DB 0
 	; TARGET_IP/MAC are setup scratch: by the time an operation can
 	; capture diagnostics, the tuple has already been copied into the
 	; protocol context.  Overlay them on the existing call scratch.
@@ -2495,10 +2910,17 @@ QUEUE_LEN	EQU ARG_PORT
 	; Diagnostic storage must never overlap persistent dispatcher state.
 	; FIN bypasses capture until its data has been copied, while F_SEND
 	; protects SEND_DONE on the stack around its failure snapshot.
-DIAG_REGS	EQU ARG_DE
 DIAG_TX		EQU SEND_DONE
 
 LASTERR_BUF	EQU DLL_BSS + BSS_LASTERR
+	; Parameter block for WIN0COLD.RUN (src/include/coldctx.inc): the
+	; four hot pointers every cold RESOLVE/DNS/ARP/ICMP function reuses
+	; (TX_BUF/OUR_MAC/OUR_IP/CHECKSUM).  Fixed for the DLL instance's
+	; whole lifetime; BUILD_COLD_CTX fills them all once, right after
+	; WIN0COLD.INIT succeeds.  Anything specific to one cold call (a
+	; hostname pointer, resolve_lib's/icmp_lib's own BSS base) rides in
+	; registers at the call site instead -- see coldctx.inc's header.
+COLD_CTX	EQU DLL_BSS + BSS_COLD_CTX
 
 	ENDMODULE
 
@@ -2514,10 +2936,14 @@ LASTERR_BUF	EQU DLL_BSS + BSS_LASTERR
 	INCLUDE "rtl8019.asm"
 	INCLUDE "arp_lib.asm"
 	INCLUDE "resolve_lib.asm"
-	INCLUDE "dns_lib.asm"
+	; dns_lib.asm is NOT included here: BUILD_FRAME's DLL-mode caller
+	; (resolve_lib.HOST) redirects to the WIN0 cold blob, whose OWN
+	; assembly (unetrtl_cold.asm) includes dns_lib.asm directly -- see
+	; that file's header.
 	INCLUDE "tcp_lib.asm"
 	INCLUDE "udp_lib.asm"
 	INCLUDE "icmp_lib.asm"
+	INCLUDE "win0cold.asm"
 
 ; The whole L1 image is a 32-byte header, this code image, and one
 ; relocation bit per code byte.  0x38C7 is the exact largest code image

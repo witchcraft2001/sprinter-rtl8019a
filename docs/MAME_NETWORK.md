@@ -90,12 +90,27 @@ TAP-вариант можно рассматривать отдельно, но 
 
 Скрипт-обёртка `run_sprinter_rtl8019as.sh` уже передаёт MAME аргументы и
 печатает значения переменных `RTL8019AS_IOBASE/IRQ/MAC/NETDEV`. Для тестов
-с сетью добавить `-networkprovider pcap` через позиционные аргументы:
+с сетью добавить `-networkprovider pcap` через позиционные аргументы.
+
+**Скрипт грузит только персистентные CHD (`sp_hdd_sys.chd`/
+`sp_hdd_media.chd`, общий рабочий стол Sprinter DSS для разных
+проектов) и не подключает `distr/*.img` этого репозитория сам по
+себе.** Чтобы протестировать свежий билд, добавить его явно как
+второй флоппи (`beta:wd179x:1` уже настроен скриптом как `35hd` --
+3.5" HD, тот же формат, что у нашего FAT12-образа; более поздний
+`-flop2` в командной строке перекрывает встроенный `solid.img`):
 
 ```sh
-./run_sprinter_rtl8019as.sh -networkprovider pcap
-RTL8019AS_VERBOSE=1 ./run_sprinter_rtl8019as.sh -networkprovider pcap
+./run_sprinter_rtl8019as.sh -networkprovider pcap \
+  -flop2 /Users/dmitry/dev/zx/sprinter/sprinter-rtl8019a/distr/sprinter-rtl8019a.img
+RTL8019AS_VERBOSE=1 ./run_sprinter_rtl8019as.sh -networkprovider pcap \
+  -flop2 /Users/dmitry/dev/zx/sprinter/sprinter-rtl8019a/distr/sprinter-rtl8019a.img
 ```
+
+В DSS образ становится диском **B:** -- работать прямо с него (все
+утилиты и `NETSMPL.CFG` уже там после `make image`). НЕ использовать
+`C:\RTL1`/`C:\RTL2` на системном диске -- это устаревшие ручные копии
+этого проекта из более ранних сессий, никак не обновляемые сборкой.
 
 ## Сеть на feth-паре (рекомендуемая baseline на macOS)
 

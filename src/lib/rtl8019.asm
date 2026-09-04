@@ -126,6 +126,17 @@ INIT_BASE
 
 	; Stage 1: env override.
 	CALL	TRY_ENV_OVERRIDE
+	IFDEF	UNET_DLL
+	; UNETRTL.DLL takes the env fast path only (image-budget reasons --
+	; the auto-scan below and WRITE_ENV_HW are excluded the same way
+	; PROBE_ID/READ_PROM/PROBE_PRESENT are, see their IFNDEF UNET_DLL
+	; comments). CF here means NET_RTL_HW is missing, malformed, or the
+	; chip did not respond at the pinned slot/base; the remedy is the
+	; same in all three cases (run IFUP/NETCFG once to populate/refresh
+	; the env), so F_NETINIT maps this to NERR_NONET rather than
+	; NERR_HW. Every stand-alone utility keeps the full auto-scan.
+	RET
+	ELSE
 	RET	NC			; ISA OPEN, base accepted
 
 	; Stage 2: auto-scan currently-selected slot, then the other.
@@ -155,9 +166,14 @@ INIT_BASE
 	CALL	WRITE_ENV_HW
 	OR	A
 	RET
+	ENDIF
 
 ; Helper: walk SCAN_TABLE, set RTL_BASE_PTR to first hit.
 ; Out: CF=0 + IX = base on hit; CF=1 if nothing responds.
+;
+; Excluded from UNETRTL.DLL (image budget): only reachable from
+; Stage 2 above, which the DLL does not compile.
+	IFNDEF	UNET_DLL
 .SCAN_BASES
 	LD	HL,SCAN_TABLE
 .SLP
@@ -234,6 +250,7 @@ SCAN_TABLE
 	DW ISA_BASE_A + 0x3C0
 	DW ISA_BASE_A + 0x3E0
 	DW 0
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -393,7 +410,11 @@ PARSE_HW_VALUE
 ; CF and any DSS error are silently absorbed -- the override
 ; is best-effort persistence, not load-bearing.
 ; Trashes A, BC, DE, HL.
+;
+; Excluded from UNETRTL.DLL (image budget): only reachable from
+; the auto-scan path in INIT_BASE, which the DLL does not compile.
 ; ------------------------------------------------------
+	IFNDEF	UNET_DLL
 WRITE_ENV_HW
 	CALL	@ISA.ISA_CLOSE
 	; Build "NET_RTL_HW=S/#HHH\0" in NETENV_VAL_BUF (reused).
@@ -460,6 +481,7 @@ WRITE_ENV_HW
 .D9
 	ADD	A,'0'
 	RET
+	ENDIF
 
 
 N_RTL_HW	DB "NET_RTL_HW",0
@@ -893,7 +915,13 @@ READ_PROM
 ; DMA_WRITE: remote DMA write of BC bytes from (HL) to
 ; packet-RAM address DE.
 ; Out: CF=0 OK, CF=1 RDC timeout.
+;
+; Excluded from UNETRTL.DLL (image budget): the DLL's SEND_FRAME/
+; SEND_FRAME_SG (IFDEF UNET_DLL above) call DMA_WRITE_SG instead;
+; the only caller of this routine is the non-DLL SEND_FRAME body
+; below, and nicram.asm.
 ; ------------------------------------------------------
+	IFNDEF	UNET_DLL
 DMA_WRITE
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
@@ -992,6 +1020,7 @@ DMA_WRITE
 	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT	; leave a clean, non-DMA state
 	OR	A
 	RET
+	ENDIF
 
 	IFDEF	UNET_DLL
 ; ------------------------------------------------------

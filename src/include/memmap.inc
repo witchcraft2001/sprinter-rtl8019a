@@ -262,6 +262,12 @@ TCP_SEND_SEQ		EQU TCP_BSS_BASE + 0x2D	; 4 bytes (BE sequence used by retries)
 TCP_SEND_RETRY_LEFT	EQU TCP_BSS_BASE + 0x31	; 1 byte
 TCP_RECV_UNACKED	EQU TCP_BSS_BASE + 0x32	; 1 byte (full-context DLL build)
 TCP_RECV_TIMEOUT	EQU TCP_BSS_BASE + 0x33	; 2 bytes (one-shot override)
+; Milliseconds left in the CURRENT SEND_ATTEMPTS attempt (USE_TCP_ASYNCSEND).
+; Inside the swap tail like the rest of the ACK-wait scratch above: an
+; ASYNCSEND transaction can be resumed after SELECT_CHANNEL swapped to
+; the other channel and back, so the remaining per-attempt budget must
+; travel with the channel, not live as session-global scratch.
+TCP_ATTEMPT_MS_LEFT	EQU TCP_BSS_BASE + 0x35	; 2 bytes
 ; Multichannel (USE_TCP_MULTICHAN): BUILD_ACK's advertised window
 ; becomes runtime state here instead of the fixed TCP_RECV_WIN_HI/LO
 ; constant, so an ACK built while processing a FOREIGN channel's
@@ -280,14 +286,14 @@ TCP_RECV_TIMEOUT	EQU TCP_BSS_BASE + 0x33	; 2 bytes (one-shot override)
 ; channel opened second inherit the zeroed slot's window 0, so its
 ; very first ACK advertised a closed window and the peer stalled after
 ; the in-flight bytes.)
-TCP_ADV_WIN_HI		EQU TCP_BSS_BASE + 0x35	; 1 byte
-TCP_ADV_WIN_LO		EQU TCP_BSS_BASE + 0x36	; 1 byte
+TCP_ADV_WIN_HI		EQU TCP_BSS_BASE + 0x37	; 1 byte
+TCP_ADV_WIN_LO		EQU TCP_BSS_BASE + 0x38	; 1 byte
 
 ; Length of SELECT_CHANNEL's second swap slice: TCP_ACK_WAIT_STATE
-; (0x28) .. TCP_RECV_TIMEOUT+1 (0x34) inclusive.  Deliberately NOT
-; TCP_BSS_SIZE-0x28: everything appended after TCP_RECV_TIMEOUT is
+; (0x28) .. TCP_ATTEMPT_MS_LEFT+1 (0x36) inclusive.  Deliberately NOT
+; TCP_BSS_SIZE-0x28: everything appended after TCP_ATTEMPT_MS_LEFT is
 ; session-global and must stay out of the per-channel swap.
-TCP_SWAP_TAIL_SIZE	EQU 13		; 0x28..0x34
+TCP_SWAP_TAIL_SIZE	EQU 15		; 0x28..0x36
 
 ; Total per-session TCP state size; copied wholesale by
 ; TCP.SAVE_CTX / TCP.RESTORE_CTX so apps can multiplex
@@ -298,7 +304,7 @@ TCP_CTX_SIZE		EQU 38		; 0x26: TCP_STATE .. TCP_RX_DATA_LEN+1
 
 ; Entire tcp_lib BSS span including non-context scratch above.
 ; Literal for relocatable DLL builds; never derive this from addresses.
-TCP_BSS_SIZE		EQU 55		; 0x37 bytes
+TCP_BSS_SIZE		EQU 57		; 0x39 bytes
 
 ; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + MSS(536)
 ; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF

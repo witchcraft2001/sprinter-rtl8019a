@@ -15,6 +15,9 @@ tree, mirrored byte for byte from the Wi-Fi project; the prose
 reference is `docs/UNETAPI.md` there.  This page covers only what is
 specific to the RTL backend.
 
+For running `UNETTEST.EXE` scenarios against this DLL in MAME or on real
+hardware, see `docs/UNETRTL_TESTING_RU.md`.
+
 ## Prerequisites
 
 The network must already be configured, exactly as for the
@@ -81,19 +84,31 @@ test `A`, never `CF`.
 
 ## What this backend supports
 
-`GETCAPS` reports `0x001F` = `TCP | UDP | RESOLVE | PING | MULTICHAN`, ABI
-`0x0100`.
+`GETCAPS` reports `0x023F` = `TCP | UDP | RESOLVE | PING | MULTICHAN |
+LISTEN | ASYNCSEND`, ABI `0x0100`.
 
-| Capability | State | Note |
-|------------|-------|------|
-| `TCP`      | yes   | channels 0 and 1; `SEND` chunks at the 536-byte MSS |
-| `UDP`      | yes   | connected UDP, payload up to the standard 1472-byte MTU |
-| `RESOLVE`  | yes   | software DNS; never returns `NERR_NOTSUP` |
-| `PING`     | yes   | software ICMP echo |
-| `MULTICHAN`| yes   | channels 0 and 1 may be open simultaneously |
-| `LISTEN`   | no    | client only |
-| `RAWETH`   | no    | no raw-frame entry point in the current ABI |
-| `RXFLOW`   | no    | the card buffers receive in its own ring |
+| Capability   | State | Note |
+|--------------|-------|------|
+| `TCP`        | yes   | channels 0 and 1; `SEND` chunks at the 536-byte MSS |
+| `UDP`        | yes   | connected UDP, payload up to the standard 1472-byte MTU |
+| `RESOLVE`    | yes   | software DNS; `NERR_NOTSUP` only if `NETINIT` could not reload the DLL's own file (see below) |
+| `PING`       | yes   | software ICMP echo |
+| `MULTICHAN`  | yes   | channels 0 and 1 may be open simultaneously |
+| `LISTEN`     | yes   | passive TCP open; see "Passive open (LISTEN)" below |
+| `ASYNCSEND`  | yes   | `SEND` can suspend with `NERR_AGAIN`; see "Non-blocking SEND" below |
+| `RAWETH`     | no    | no raw-frame entry point in the current ABI |
+| `RXFLOW`     | no    | the card buffers receive in its own ring |
+
+The resolver and ping logic lives in an overlay appended to
+`UNETRTL.DLL`'s own file, which `NETINIT` loads by re-reading that
+file (looked up in the calling program's home directory, then by the
+bare name `UNETRTL.DLL` in the current directory). Keep the DLL under
+its original name where the consumer can find it. If the overlay
+cannot be loaded, `NETINIT` still succeeds -- TCP/UDP on already
+armed or accepted channels and `LISTEN` work in full -- but `RESOLVE`
+and `PING` report `NERR_NOTSUP`, and `CONNECT`/`UDPOPEN` fail with
+`NERR_CONNECT` because they resolve their host argument (literal IP
+addresses included) through the same overlay.
 
 ## Differences from the ESP backend
 
@@ -131,15 +146,17 @@ which card it got.  None of them changes the calling convention.
 
   ```
   RTL hw=1/#0300 st=CONNECT nerr=04 tcp=02 res=00 tx=E4/42/01/22
-      regs=22 42 40 04 02 00 46 60 4A 4B
   ```
 
   `st` is the operation that failed, `nerr` the status returned,
-  `tcp` and `res` the TCP and resolver failure codes, `tx` the
-  transmit stage plus ISR/TSR/CR, and `regs` the NIC registers in
-  the order `CR ISR DCR RCR TCR IMR PSTART PSTOP BNRY CURR`.  The
-  values are captured at the moment of failure, so `LASTERR` never
-  reports a chip that has since recovered.
+  `tcp` and `res` the TCP and resolver failure codes, and `tx` the
+  transmit stage plus ISR/TSR/CR.  The values are captured at the
+  moment of failure, so `LASTERR` never reports a chip that has since
+  recovered.  Unlike earlier builds, this string does not carry a raw
+  `CR ISR DCR RCR TCR IMR PSTART PSTOP BNRY CURR` register dump (image
+  budget, made room for `LISTEN`); a consumer that needs those reads
+  them the same way every stand-alone utility does, via its own
+  `@RTL.SNAPSHOT_REGS` call.
 
 ## Bounded TCP retransmission
 
@@ -187,6 +204,105 @@ flush fails after bytes were delivered, those bytes are still returned and
 the ACK debt is retried by the next `RECV`; with no bytes to return the call
 reports `NERR_HW`.
 
+## Non-blocking SEND
+
+By default `SEND` blocks like any stop-and-wait TCP client: up to four
+1-second ACK-wait attempts (see "Bounded TCP retransmission" above)
+before it gives up. `SETOPT UNET_OPT_SENDSLICE` (option value in
+`DE`) trades that block for a bounded one: `DE=0` restores the
+default blocking behavior; any other value is the maximum number of
+milliseconds one `SEND` call may wait before returning, clamped to a
+50 ms minimum (1..49 are raised to 50; values from 256 upward pass
+through unclamped since the low byte alone cannot express them).
+
+While a slice expires with the current attempt's ACK still
+outstanding, `SEND` returns `NERR_AGAIN` and `DE` reports the bytes
+already confirmed by earlier chunks of the same call -- the
+in-flight chunk is neither dropped nor retransmitted yet, so the
+consumer's own retransmit timer keeps counting down across repeated
+`NERR_AGAIN` calls. The very next `SEND` call on that channel must
+pass the *same* buffer pointer and length as the original call (a
+resume, not a new send); calling `SEND` with different arguments, or
+on a different channel, while a send is suspended returns
+`NERR_STATE`. Once the whole four-attempt/four-second budget is
+exhausted with no ACK, `SEND` finally reports `NERR_SEND` as usual.
+
+While a `SEND` is suspended, `RECV` on the same channel serves only
+data already queued from the pending-payload slot (see "Bounded TCP
+retransmission") -- it does not touch the NIC, and a connection that
+the peer closed while the send was suspended is not reported as
+`NERR_CLOSED` until the send resume completes. `CONNECT`, `UDPOPEN`,
+`CLOSE`, `NETDONE`, `NETINIT`, `LISTEN`, `UNLISTEN`, `PING` and
+`RESOLVE` all return `NERR_BUSY` while any channel has a suspended
+send.
+
+Developer test:
+
+```
+python3 tools/dev/unettest_asyncsend_stall.py --bind 192.168.7.1 --port 8080
+UNETTEST -a 192.168.7.1 8080
+```
+
+`UNETTEST -a` SETOPTs a short `SENDSLICE`, `CONNECT`s, then `SEND`s a
+~1200-byte payload against the stalling peer above (its receive window
+closes shortly after accept, so at least one `SEND` attempt is expected
+to suspend); it prints how many `NERR_AGAIN` resumes were needed before
+the transfer settled. See `docs/UNETRTL_TESTING_RU.md` for the MAME
+walkthrough.
+
+## Passive open (LISTEN)
+
+`LISTEN` (`A`=channel, `DE`=local TCP port 1..65535) arms one closed
+channel as a single-backlog server socket; there is only ever one
+listening channel across both, and `LISTEN` on a second channel while
+one is already listening returns `NERR_STATE`. Progress is entirely
+`RECV`-driven: each `RECV` call on the listening channel (or on the
+timeout-bounded default when `IY=0`, one poll) checks for an
+unsolicited SYN to the armed port, replies with SYN+ACK, and once the
+peer's final ACK of the handshake arrives promotes the channel to an
+ordinary connected `ST_ESTAB` channel indistinguishable from one
+`CONNECT` made -- `STATUS` reports `UNET_ST_LISTEN` while armed, and
+once a peer is accepted ORs `UNET_ST_ACCEPT` into the normal
+`UNET_ST_CONN | UNET_ST_RXPEND` bits for as long as that inbound
+connection stays open. A
+data- or FIN-bearing final ACK is not lost at the accept boundary: the
+same `RECV` call that completes the handshake immediately re-enters
+the normal established-connection path and can return that segment's
+payload.
+
+Because progress only happens inside `RECV`, a SYN that arrives while
+the consumer is blocked in some other call (`SEND`, `CONNECT` on the
+other channel, `PING`, ...) is not dropped -- it is simply not
+answered until the next `RECV`, and the peer's own SYN retransmit
+timer covers the gap. A second SYN from a different peer while one
+handshake is already in progress is not queued (backlog is exactly 1)
+and is silently ignored; that peer's own retransmit brings it back
+once the first handshake resolves one way or the other.
+
+`UNLISTEN` (`A`=the currently listening channel) stops the server. If
+no peer has been accepted yet, this simply closes the socket. If a
+peer *has* been accepted (the channel promoted to an ordinary
+connection), that connection is left running -- `UNLISTEN` only
+detaches the "please re-arm this port" bookkeeping -- and the
+consumer closes it separately with `CLOSE` when done. Symmetrically,
+closing an accepted connection with `CLOSE` (or its own natural
+`NERR_CLOSED`) automatically re-arms the same channel back to
+`LISTEN` on the same port, so a simple accept-serve-close loop never
+needs to call `LISTEN` more than once. `NETDONE` always tears the
+listener down first, so a pending re-arm never outlives it.
+
+Developer test:
+
+```
+python3 tools/dev/unettest_listen_client.py --host 192.168.7.2 --port 9000
+UNETTEST -l 9000 192.168.7.1
+```
+
+(`UNETTEST -l` arms the port immediately; run the client twice -- the
+DSS side accepts and serves exactly two peers on the same channel
+before `UNLISTEN`, to prove the CLOSE-triggered re-arm above actually
+works.) See `docs/UNETRTL_TESTING_RU.md` for the MAME walkthrough.
+
 ## Two channels
 
 Channel arguments 0 and 1 have independent TCP/UDP tuples, sequence state,
@@ -215,16 +331,29 @@ that the control reply survived as pending data.
 
 ## Interrupt and window state on return
 
-Every function returns with the ISA window **closed** and interrupts
-**enabled**.  A consumer that calls the DLL with interrupts disabled
-will get them back enabled.  The ESP backend behaves the same way,
-for the same reason: both use the shared `ISA_OPEN`/`ISA_CLOSE`
-pair, and the system's 50 Hz interrupt must be serviced between
-chip accesses.
+Every function returns with the ISA window **closed** and the caller's
+interrupt state **restored exactly as found**: `ISA_OPEN` samples the
+caller's IFF2 before disabling interrupts to map the card, and
+`ISA_CLOSE` re-enables them only if that sample said they were on.  A
+consumer that keeps interrupts enabled across the call (for example to
+let a music player's IRQ-driven routine keep running) gets them back
+enabled; a consumer that calls in with interrupts already disabled
+(running its own critical section) does not have them force-enabled by
+the DLL.  Nested `ISA_OPEN`/`ISA_CLOSE` pairs inside a single UNET call
+(library-internal close/reopen around a delay or a DSS call) do not
+disturb this: only the outermost open records the caller's IFF2, and
+only the matching close restores it.
+
+One consequence: `SETOPT CANCELKEYS` and the millisecond pacing delay
+inside a wait loop both still run when the caller entered with
+interrupts disabled, but the Esc/Ctrl-C/Ctrl-Z poll is inert in that
+case -- `DSS_SCANKEY`'s buffer is filled by the 50 Hz system interrupt,
+which does not run without interrupts enabled. A consumer that wants
+cancel keys to work must keep interrupts enabled around the call.
 
 `UNETRTL.DLL` is published at the repository root and ships in both
 the release archive and the floppy image, so a consumer can take the
 ready-built file without installing the assembler or libman.  Its L1
 header records the ABI line in the numeric version field and the full
 package revision in the 15-byte text tag, for example
-`UNETRTL v0.2.47`.
+`UNETRTL v0.3.0`.

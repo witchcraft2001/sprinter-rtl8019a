@@ -1,7 +1,10 @@
-.PHONY: build package image clean
+.PHONY: build test-host package image clean
 
 build:
 	tools/build.sh
+
+test-host:
+	tools/test-host.sh
 
 package:
 	tools/package.sh

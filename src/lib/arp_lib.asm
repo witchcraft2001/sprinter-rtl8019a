@@ -57,12 +57,17 @@ OUR_IP_PTR	DW 0
 
 ; ------------------------------------------------------
 ; ARP.BUILD_REQUEST: assemble a 60-byte broadcast ARP
-; "who-has" frame at (DE).
+; "who-has" frame at (DE).  Excluded from UNET_DLL builds (image
+; budget): resolve_lib.asm's DLL-mode callers redirect to the WIN0
+; cold blob's FN_BUILD_ARP_REQUEST instead (see win0cold.asm /
+; unetrtl_cold.asm) -- pure register/buffer logic with no RST, safe
+; to run with DSS/BIOS unreachable.
 ;   In:  DE = destination buffer.
 ;        HL = pointer to 4-byte target IP.
 ;   Out: (DE..DE+59) populated with frame; DE = DE + 60.
 ; Trashes A, BC, HL.
 ; ------------------------------------------------------
+	IFNDEF	UNET_DLL
 BUILD_REQUEST
 	PUSH	HL			; save target_ip_ptr
 	; DST = FF*6
@@ -135,6 +140,7 @@ BUILD_REQUEST
 	INC	DE
 	DJNZ	.PAD
 	RET
+	ENDIF
 
 	ENDIF
 

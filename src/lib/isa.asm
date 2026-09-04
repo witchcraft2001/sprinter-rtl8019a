@@ -3,6 +3,15 @@
 ; ISA peripherals are memory-mapped into 0xC000..0xFFFF after
 ; ISA_OPEN; restored by ISA_CLOSE. The selected ISA slot is
 ; stored as the self-modifying byte ISA_SLOT (0=ISA0, 1=ISA1).
+;
+; Interrupt contract: ISA_OPEN samples the caller's IFF2 before
+; disabling interrupts, and ISA_CLOSE restores exactly that state
+; (EI only if the caller had interrupts enabled). A caller that
+; enters with interrupts already disabled keeps them disabled after
+; ISA_CLOSE; a caller with interrupts enabled gets them back. Only
+; the outermost open/close pair samples/restores; nested pairs
+; (IS_OPEN already 1) are no-ops with respect to IFF2.
+;
 ; Adapted from sprinter_wifi/network/src/lib/isa.asm
 ; (Roman Boykov, BSD 3-Clause).
 ; ======================================================
@@ -21,18 +30,44 @@
 ; All RTL8019AS register accesses (port window + DMA data port +
 ; reset port) fit within the 14-bit memory window, so PORT_ISA
 ; stays at 0 (A14..A19 = 0, AEN = 0).
-; Saves MMU page 3 in SAVE_MMU3 for ISA_CLOSE to restore.
+; Saves MMU page 3 in SAVE_MMU3 for ISA_CLOSE to restore, and the
+; caller's IFF2 in SAVE_IFF so ISA_CLOSE restores the interrupt
+; state it actually found rather than forcing EI. IS_OPEN is a
+; flag, not a nesting counter: only the outermost open records
+; SAVE_IFF, and only the real close (the one that unmaps the
+; window) restores it.
 ; ------------------------------------------------------
 ISA_OPEN
+	PUSH	AF			; protect the caller's AF before LD A,I clobbers
+					; A and the flags
+	; Sample the caller's IFF2 BEFORE the DI below (DI clears it).
+	; Guard against the classic Z80 erratum where P/V can misreport
+	; after LD A,I if a maskable interrupt lands mid-instruction: if
+	; the erratum fired, that interrupt has already run and its
+	; handler returns with EI, so a second read correctly observes
+	; IFF2=1.
+	LD	A,I
+	JP	PE,.IFF_ON
+	LD	A,I
+	JP	PE,.IFF_ON
+	XOR	A
+	JR	.IFF_SAMPLED
+.IFF_ON
+	LD	A,1
+.IFF_SAMPLED
 	DI				; MMU3 now maps ISA, not the system page the
 					; 50Hz ISR runs from -- an interrupt here would
 					; execute over the ISA window and corrupt the
 					; chip (incl. reset/data ports).  Match the
 					; espprobe pattern: keep IRQs off while open.
-	PUSH	AF,BC
+	PUSH	BC
+	LD	B,A			; stash the sampled IFF2 flag; BC is still free
 	LD	A,(IS_OPEN)
 	OR	A
-	JR	NZ,OPEN_ALREADY	; keep IRQs disabled while ISA remains mapped
+	JR	NZ,OPEN_ALREADY	; nested open: already mapped, IRQs already off;
+					; only the outermost open records SAVE_IFF
+	LD	A,B
+	LD	(SAVE_IFF),A
 	LD	BC,PAGE3
 	IN	A,(C)
 	LD	(SAVE_MMU3),A
@@ -56,7 +91,10 @@ OPEN_ALREADY
 
 ; ------------------------------------------------------
 ; Close access to ISA ports.
-; Restores MMU page 3 from SAVE_MMU3.
+; Restores MMU page 3 from SAVE_MMU3, and the caller's IFF2 from
+; SAVE_IFF: EI fires only when the outermost ISA_OPEN found
+; interrupts enabled. A caller that entered with DI in effect (e.g.
+; to run its own critical section) gets its own DI preserved.
 ; ------------------------------------------------------
 ISA_CLOSE
 	PUSH	AF,BC
@@ -71,14 +109,19 @@ ISA_CLOSE
 	OUT	(C),A
 	XOR	A
 	LD	(IS_OPEN),A
+	LD	A,(SAVE_IFF)
+	OR	A
+	JR	Z,.NO_EI
+	EI				; caller had interrupts enabled -- restore them
+.NO_EI
 	POP	BC,AF
-	EI				; system page restored -- safe to take IRQs again
 	RET
 CLOSE_ALREADY
 	POP	BC,AF
 	RET				; preserve caller's current interrupt state
 
 SAVE_MMU3	DB 0
+SAVE_IFF	DB 0
 IS_OPEN	DB 0
 
 	ENDMODULE
