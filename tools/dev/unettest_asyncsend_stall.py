@@ -15,9 +15,20 @@ window) and then does not call recv() at all for --stall seconds, long
 enough for the DLL to fill that window and have at least one SEND
 attempt's SENDSLICE quantum expire with no ACK.
 
-If UNETTEST still reports zero NERR_AGAIN resumes, your OS clamped
-SO_RCVBUF higher than expected -- try a smaller --rcvbuf or a longer
---stall (see docs/UNETRTL_TESTING_RU.md).
+If UNETTEST still reports zero NERR_AGAIN resumes, the accepted socket's
+logged rcvbuf is almost certainly nowhere near --rcvbuf: macOS's TCP
+receive-buffer auto-tuning (`net.inet.tcp.doautorcvbuf`, on by default)
+overwrites whatever SO_RCVBUF the listening socket requested as soon as
+the connection is accepted -- confirmed by probing loopback, where a
+1-byte request still came back as ~320 KB, and matches the ~8.5 KB seen
+on feth regardless of --rcvbuf. No amount of --rcvbuf/--stall tuning
+works around this; disable auto-tuning for the test instead:
+
+    sudo sysctl -w net.inet.tcp.doautorcvbuf=0
+    python3 tools/dev/unettest_asyncsend_stall.py --bind 192.168.7.1 --port 8080 --rcvbuf 256 --stall 3
+    sudo sysctl -w net.inet.tcp.doautorcvbuf=1   # restore afterward
+
+(see docs/UNETRTL_TESTING_RU.md).
 
 Usage:
     python3 tools/dev/unettest_asyncsend_stall.py --bind 192.168.7.1 --port 8080

@@ -162,8 +162,13 @@ sudo python3 tools/dev/unettest_tcp_probe.py --bind 192.168.7.1 --port 80 --mode
 ```
 
 Подтверждает, что `SEND`/`RECV` на разорванном соединении в `UNETTEST`
-печатают отдельное, отличимое от `NERR_PARAM` сообщение
-(`receive error` / `lasterr:` с иным кодом).
+никогда не показывают `NERR_PARAM`. На практике `SEND` успевает уйти
+раньше, чем RST долетает до стороны DSS, а первый же `RECV`
+получает `NERR_CLOSED` (`DE=0`) и коротким путём сразу печатает
+`--- closed ---` -- без отдельной строки `receive error`/`lasterr`,
+это ожидаемо (см. `.recv_closed_data`/`.recv_closed` в
+`unettest.asm`). Если вместо этого видно зависание или `NERR_PARAM` --
+вот это уже находка, фиксировать отдельно.
 
 ## Сценарий B: UDP (`-u`)
 

@@ -19,8 +19,9 @@ refers to.
 - [ ] Responder logged `CONN` + `REQ (matches UNETTEST shape=True)` +
       `REPLIED and closed`
 - [ ] DSS printed `request sent`, the HTTP reply headers, `--- closed ---`
-- [ ] `--mode abort` baseline: SEND/RECV on a reset connection reports a
-      distinct error (not `NERR_PARAM`)
+- [ ] `--mode abort` baseline: SEND/RECV on a reset connection never
+      reports `NERR_PARAM` (expected: `SEND` succeeds, then `RECV`
+      reports `NERR_CLOSED` and prints `--- closed ---` directly)
 
 ## Scenario B -- UDP (`-u`)
 
