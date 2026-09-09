@@ -93,6 +93,7 @@
 ARP_TIMEOUT_MS	EQU 3000
 ARP_RETRIES	EQU 3
 DNS_TIMEOUT_MS	EQU 3000
+DNS_RETRIES	EQU 3
 
 ETH_TYPE_ARP	EQU 0x0806
 ETH_TYPE_IPV4	EQU 0x0800
@@ -282,6 +283,20 @@ HOST
 	RET
 .BF_OK
 
+	; DNS runs over UDP, so a single query with no retransmit turns any
+	; dropped request or reply into a hard "could not resolve host" --
+	; the ARP phase above already retries ARP_RETRIES times for exactly
+	; this reason.  Retransmit the frame that is still sitting in TX_BUF
+	; (RX_BUF starts at TX_BUF + RESOLVE_MAX_FRAME in every consumer, so
+	; the receive loop cannot overwrite it) and keep the same XID, which
+	; is what a resolver is supposed to do: a late reply to attempt 1
+	; still matches while attempt 2 is in flight.
+	;
+	; Only a reply TIMEOUT is retried.  NXDOMAIN / malformed reply (6)
+	; and user cancel (7) are answers, not losses, and give up at once.
+	LD	A,DNS_RETRIES
+	LD	(.DNS_LEFT),A
+.DNS_SEND
 	LD	HL,@MAIN.TX_BUF
 	LD	BC,(RESOLVE_QFRAME_LEN)
 	CALL	@RTL.SEND_FRAME
@@ -298,6 +313,18 @@ HOST
 	LD	(RESOLVE_TIMEOUT_LEFT),HL
 	CALL	WAIT_DNS
 	JR	NC,.W_OK
+	LD	A,(LAST_FAIL)
+	CP	5				; 5 = reply timeout; anything else
+	JR	NZ,.W_FAIL			; is a decisive answer
+	; Attempts left live in the immediate operand below (see
+	; the ISA_SLOT idiom in isa.asm) -- no BSS byte, and the
+	; DLL's resolve region stays 0x29 bytes wide.
+	LD	A,0
+.DNS_LEFT EQU $-1
+	DEC	A
+	LD	(.DNS_LEFT),A
+	JR	NZ,.DNS_SEND
+.W_FAIL
 	POP	HL
 	; LAST_FAIL set inside WAIT_DNS.
 	SCF

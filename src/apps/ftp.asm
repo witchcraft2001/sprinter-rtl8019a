@@ -1835,8 +1835,16 @@ TCP_OPEN_FAIL
 	JP	@UTIL.EXIT_FAIL
 
 RESOLVE_FAIL
+	; @RESOLVE.LAST_FAIL: 1 usage, 2 no DNS1, 3 no GW, 4 ARP,
+	; 5 DNS timeout (after DNS_RETRIES tries), 6 DNS parse/RCODE,
+	; 7 cancel.  See wget.asm for the same handler.
+	LD	A,(@RESOLVE.LAST_FAIL)
 	CALL	@ISA.ISA_CLOSE
-	PRINTLN MSG_E_RESOLVE
+	PUSH	AF
+	PRINT	MSG_E_RESOLVE
+	POP	AF
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	LINE_END
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
@@ -2221,7 +2229,7 @@ MSG_E_SEND	DB "[E A1] DMA write or PTX timeout",0
 MSG_E_ARP	DB "ARP request timed out.",0
 MSG_E_TCP_OPEN	DB "TCP connect failed, code 0x",0
 MSG_E_RECV	DB "TCP recv failed.",0
-MSG_E_RESOLVE	DB "[E] could not resolve host.",0
+MSG_E_RESOLVE	DB "[E] could not resolve host, code 0x",0
 MSG_E_BAD_REPLY	DB "[E] FTP server returned non-2xx.",0
 MSG_E_TCP_SEND	DB "[E] TCP send failed.",0
 MSG_E_PASV	DB "[E] could not parse PASV reply.",0

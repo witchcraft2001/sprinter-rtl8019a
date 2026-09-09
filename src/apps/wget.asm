@@ -1604,8 +1604,17 @@ TCP_OPEN_FAIL
 	JP	@UTIL.EXIT_FAIL
 
 RESOLVE_FAIL
+	; @RESOLVE.LAST_FAIL: 1 usage, 2 no DNS1, 3 no GW, 4 ARP,
+	; 5 DNS timeout (after DNS_RETRIES tries), 6 DNS parse/RCODE,
+	; 7 cancel.  Printed because the DNS/ARP causes are otherwise
+	; indistinguishable from a screenshot.
+	LD	A,(@RESOLVE.LAST_FAIL)
 	CALL	@ISA.ISA_CLOSE
-	PRINTLN MSG_E_RESOLVE
+	PUSH	AF
+	PRINT	MSG_E_RESOLVE
+	POP	AF
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	LINE_END
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
@@ -1853,7 +1862,7 @@ MSG_E_NO_LOC	DB "[E] redirect with no Location header",0
 MSG_E_BAD_LOC	DB "[E] cannot parse redirect Location",0
 MSG_E_TOO_MANY	DB "[E] too many redirects (cap = 5)",0
 MSG_E_HTTPS	DB "[E] redirect to https:// is not supported (no TLS).",0
-MSG_E_RESOLVE	DB "[E] could not resolve host.",0
+MSG_E_RESOLVE	DB "[E] could not resolve host, code 0x",0
 MSG_DONE_PRE	DB "Done. ",0
 MSG_BYTES	DB " bytes received.",0
 MSG_USAGE_ERR	DB "[E] usage: missing or invalid URL",0

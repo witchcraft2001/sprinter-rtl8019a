@@ -34,6 +34,43 @@ const arpToServer = { mac: [2, 0, 0, 0, 0, 1] };
   assert.strictEqual(Buffer.from(data.data || data).toString(), 'Hello from a fake HTTP server.\n');
   checkCleanupClaimedPage(r);
 }
+{ // Download through a HOSTNAME, not a literal IP.  Every other WGET
+  // vector passes a dotted quad, so the DNS-then-TCP sequence -- resolve
+  // over UDP, then open a TCP session on the same NIC and ring -- was
+  // never exercised end to end.  That is exactly the shape that fails in
+  // the field ("Resolved ... ESTABLISHED ... TCP recv failed 0x02"), so
+  // it needs to be a standing vector rather than a manual check.
+  const r = run('WGET', 'http://example.com/file.txt -y', {
+    environment: { ...NET_ENV, NET_DNS1: '192.168.7.1' },
+    responders: {
+      arp: arpToServer,
+      dns: { ip: [192, 168, 7, 1] },
+      tcp: { body: 'Hello from a fake HTTP server.\n' },
+    },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Resolved example\.com -> 192\.168\.7\.1 port 80/);
+  assert.match(r.output, /ESTABLISHED\./);
+  assert.match(r.output, /Done\. 31 bytes received\./);
+  const data = r.files['C:\\NET\\FILE.TXT'];
+  assert.strictEqual(Buffer.from(data.data || data).toString(), 'Hello from a fake HTTP server.\n');
+  checkCleanupClaimedPage(r);
+}
+{ // ...and the same download when the first two DNS queries are lost, so
+  // the retransmit path in resolve_lib runs immediately before the TCP
+  // session rather than on its own.
+  const r = run('WGET', 'http://example.com/file.txt -y', {
+    environment: { ...NET_ENV, NET_DNS1: '192.168.7.1' },
+    responders: {
+      arp: arpToServer,
+      dns: { ip: [192, 168, 7, 1], drop: 2 },
+      tcp: { body: 'Hello from a fake HTTP server.\n' },
+    },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Done\. 31 bytes received\./);
+  checkCleanupClaimedPage(r);
+}
 { // -o overrides the derived output filename
   const r = run('WGET', 'http://192.168.7.1/file.txt -y -o OUT.BIN', {
     environment: { ...NET_ENV }, responders: { arp: arpToServer, tcp: { body: 'x' } },

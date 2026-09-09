@@ -330,6 +330,46 @@ const arpToDns = { mac: [2, 0, 0, 0, 0, 1] };
   assert.match(r.output, /RESULT OK/);
   checkCleanupClaimedPage(r);
 }
+{ // DNS is UDP, so a dropped query or reply must not be a hard failure:
+  // resolve_lib retransmits up to DNS_RETRIES (3) times.  Two dropped
+  // queries still resolve on the third.
+  const r = run('NTP', '', {
+    environment: { ...NET_ENV_DNS, NET_NTP: 'pool.ntp.org' },
+    responders: {
+      arp: arpToDns,
+      dns: { ip: [192, 168, 7, 1], drop: 2 },
+      ntp: { unixSeconds: 1700000000, stratum: 2 },
+    },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Querying NTP at 192\.168\.7\.1 from 192\.168\.7\.2/);
+  assert.match(r.output, /RESULT OK/);
+  checkCleanupClaimedPage(r);
+  count();
+}
+{ // ...and the retry budget is finite: a DNS server that never answers
+  // still fails, with LAST_FAIL 5 (reply timeout), after 3 attempts.
+  const r = run('NTP', '', {
+    environment: { ...NET_ENV_DNS, NET_NTP: 'pool.ntp.org' },
+    responders: { arp: arpToDns, dns: { mode: 'drop' } },
+  });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, /could not resolve host/);
+  checkCleanupClaimedPage(r);
+  count();
+}
+{ // NXDOMAIN is an answer, not a loss: it must NOT consume retries.
+  // The responder counts queries, so a single one proves no retry.
+  const dns = { nxdomain: true };
+  const r = run('NTP', '', {
+    environment: { ...NET_ENV_DNS, NET_NTP: 'pool.ntp.org' },
+    responders: { arp: arpToDns, dns },
+  });
+  assert.strictEqual(r.exitCode, 3);
+  assert.strictEqual(dns._count, 1, 'NXDOMAIN must not be retried');
+  checkCleanupClaimedPage(r);
+  count();
+}
 { // an explicit argument still overrides NET_NTP.  NET_NTP is set to an
   // unresolvable name with no DNS server configured, so reaching the
   // network at all proves the argument won rather than the env.

@@ -550,7 +550,15 @@ function respond(frame, card, scenario) {
     return;
   }
 
-  if (responders.tcp) { respondTcp(frame, card, responders.tcp); return; }
+  // Only claim frames that really are TCP.  This branch used to swallow
+  // every non-ARP frame whenever a tcp responder was configured, which
+  // made it impossible to combine `tcp` with `dns` (or any other UDP
+  // responder) in one scenario -- and WGET resolving a hostname before
+  // opening its HTTP session needs exactly that combination.
+  if (responders.tcp && parseTcpSegment(frame)) {
+    respondTcp(frame, card, responders.tcp);
+    return;
+  }
 
   const echo = icmpEchoRequest(frame);
   if (responders.icmp && echo) {
