@@ -440,11 +440,16 @@ IS_HELP
 	IFDEF USE_CMDL_PARSE
 
 ; ------------------------------------------------------
-; PARSE_IPV4: HL = ASCIIZ; DE = 4-byte dest.
+; PARSE_IPV4: HL = ASCIIZ; DE = 4-byte dest.  Excluded from UNET_DLL
+; builds (image budget): resolve_lib.asm's DLL-mode HOST redirects to
+; the WIN0 cold blob's FN_PARSE_LITERAL_IP instead (see win0cold.asm /
+; unetrtl_cold.asm) -- pure register/buffer logic with no RST, safe to
+; run with DSS/BIOS unreachable.
 ;   Out: dest filled, CF=0 ok; CF=1 parse error.
 ;   HL advanced; DE preserved.
 ;   Trashes A,BC.
 ; ------------------------------------------------------
+	IFNDEF	UNET_DLL
 PARSE_IPV4
 	PUSH	DE
 	LD	B,4
@@ -473,6 +478,7 @@ PARSE_IPV4
 	POP	DE
 	SCF
 	RET
+	ENDIF
 
 
 ; ------------------------------------------------------

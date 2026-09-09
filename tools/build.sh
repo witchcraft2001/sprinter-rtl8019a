@@ -119,6 +119,40 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
       "${mkdll_cmd[@]}" verify "$out" --target 1.3
       echo "Built $out"
 
+      # UNETRTL-only: append the WIN0-cold blob (src/dll/unetrtl_cold.asm,
+      # RESOLVE/DNS/ARP/PING logic that runs via src/lib/win0cold.asm's
+      # MMU-window-0 overlay -- see that file's header) as
+      # [2-byte LE length][blob bytes] right after the L1 image.  libman's
+      # loader only ever reads the L1 header's own file_size bytes, so this
+      # trailing data is inert to every OTHER consumer of the DLL; verified
+      # against `sprinter-mkdll verify`/`inspect`, which report it as
+      # ordinary trailing_size and still pass.  A missing/failed cold-blob
+      # assembly is a hard error, not a silent skip: WIN0COLD.INIT's own
+      # best-effort fallback (see its header) is what makes a MISSING blob
+      # safe at runtime, but a build that meant to ship one and silently
+      # didn't would ship a DLL that always reports RESOLVE/PING NERR_NOTSUP.
+      if [ "$dll" = "unetrtl" ]; then
+        cold_src="$repo_root/src/dll/unetrtl_cold.asm"
+        if [ -f "$cold_src" ]; then
+          cold_bin="$repo_root/build/unetrtl_cold.bin"
+          sjasmplus -I "$repo_root/src/include" -I "$repo_root/src/lib" \
+            "--raw=$cold_bin" "$cold_src"
+          python3 - "$out" "$cold_bin" <<'PYEOF'
+import struct, sys
+out_path, cold_path = sys.argv[1], sys.argv[2]
+with open(cold_path, "rb") as f:
+    cold = f.read()
+with open(out_path, "ab") as f:
+    f.write(struct.pack("<H", len(cold)))
+    f.write(cold)
+PYEOF
+          "${mkdll_cmd[@]}" verify "$out" --target 1.3
+          cold_size="$(wc -c < "$cold_bin" | tr -d ' ')"
+          echo "Appended $cold_size-byte cold blob to $out"
+          rm -f "$cold_bin"
+        fi
+      fi
+
       # Keep a ready-to-use runtime DLL at the repository root.  Consumers
       # can take this file directly; it is regenerated only after the L1
       # container has passed verification above.

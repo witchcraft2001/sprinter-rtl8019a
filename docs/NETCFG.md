@@ -35,9 +35,21 @@ informative.  The reason decides the exit code:
 
 The remaining variables are still published, so a plain `NETCFG`
 afterwards shows how far the configuration got.  The fix is either to
-make the card reachable (check `RTL_HW`, and `RTL_RESET=SOFT` for a clone
-whose board reset port stalls the bus) or to state the address by hand
+make the card reachable (check `RTL_HW`) or to state the address by hand
 with `RTL_MAC=`.
+
+`-i` also settles how the card may be reset.  With no `RTL_RESET=` line
+the driver reads the chip ID and pulses the board reset port at
+`BASE+0x1F` only for a genuine Realtek; a clone gets the soft path and
+
+```
+[W03] non-Realtek clone: board reset port skipped
+```
+
+`NETCFG -i` then publishes `NET_RTL_RESET=SOFT` so later utilities and
+`UNETRTL.DLL` inherit the answer instead of re-probing.  After a Realtek
+the variable is deliberately left unset, so replacing the card with a
+clone cannot carry a stale `HARD` over into a machine freeze.
 
 The status is returned through `DSS_EXIT`, so a batch flow that can test
 it should stop before `IFUP`.  Note that every `.BAT` shipped with this

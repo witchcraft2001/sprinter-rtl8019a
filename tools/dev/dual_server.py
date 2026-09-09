@@ -19,7 +19,19 @@ def log(message):
 def listener(host, port):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
+    try:
+        server.bind((host, port))
+    except OSError as exc:
+        # Almost always an earlier run of this script still holding the
+        # socket.  Suspending a responder with Ctrl+Z does NOT release it,
+        # and a stopped process ignores SIGTERM until it is resumed, so the
+        # hint below spells out the one command that actually works.
+        log(f"bind {host}:{port} failed: {exc}")
+        log(f"Find the holder:  lsof -nP -iTCP:{port}")
+        log("If it is a suspended responder of your own (STAT 'T'), end it with")
+        log("kill -9 <pid>  -- plain kill does nothing to a stopped process.")
+        log("Use Ctrl+C rather than Ctrl+Z to stop responders in the future.")
+        raise SystemExit(1)
     server.listen(1)
     return server
 
@@ -120,7 +132,16 @@ def main():
     # USER/PASS shape and the one that exercises SEND's pend-guard
     # ordering; the default mid-transfer reply exercises the
     # foreign-channel receive path instead.  Both are worth running.
-    parser.add_argument("--lockstep", action="store_true")
+    parser.add_argument(
+        "--lockstep", action="store_true",
+        help="Answer the control command immediately instead of mid-stream, to try to make "
+             "the reply ride the ACK of that command (UNETTEST then prints 'reply rode our "
+             "ACK - SEND guard path exercised'). Best effort only: this controls when the "
+             "APPLICATION replies, not when the KERNEL acknowledges. If the host stack ACKs "
+             "before Python gets to reply, UNETTEST prints 'not hit' and the branch was "
+             "simply never entered -- not a failure. Measured on macOS 2026-09-09: 'not hit' "
+             "either way, including with net.inet.tcp.delayed_ack=1, so do not burn time "
+             "chasing it from a macOS host (see docs/UNETRTL_TESTING_RU.md scenario C).")
     args = parser.parse_args()
     if min(args.control_port, args.data_port, args.count, args.chunk) <= 0:
         parser.error("ports, count and chunk must be positive")

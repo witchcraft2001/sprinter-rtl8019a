@@ -60,6 +60,10 @@
 	ENDIF
 	ENDIF
 
+	IFDEF USE_TCP_LISTEN
+	INCLUDE "coldctx.inc"
+	ENDIF
+
 	MODULE TCP
 
 	IFDEF USE_TCP
@@ -144,6 +148,13 @@ ST_SYN_SENT		EQU 1
 ST_ESTAB		EQU 2
 ST_CLOSE_WAIT		EQU 3
 ST_LAST_ACK		EQU 4
+; USE_TCP_LISTEN passive-open states.  An accepted connection is
+; plain ST_ESTAB -- these two are transient, before the first peer
+; is seen (ST_LISTEN) and while its handshake is completing
+; (ST_SYN_RCVD).  Requires USE_TCP_MULTICHAN (the only definer,
+; UNETRTL.DLL, always sets both).
+ST_LISTEN		EQU 5
+ST_SYN_RCVD		EQU 6
 
 ; TCP flags
 TF_FIN			EQU 0x01
@@ -160,6 +171,7 @@ F_RST			EQU 3
 F_BAD_SEG		EQU 4
 F_CANCEL		EQU 5
 F_OTHER			EQU 6	; head packet belongs to another UNET channel
+F_AGAIN			EQU 7	; USE_TCP_ASYNCSEND: silent for one slice, budget remains
 
 
 ; ------------------------------------------------------
@@ -216,6 +228,18 @@ OPEN
 	; and the connect timed out.  TCP_PORT_SALT lives outside the
 	; context-swap block and is intentionally never initialized:
 	; leftover RAM is the seed, R stirs it per attempt.
+	IFDEF	USE_TCP_LISTEN
+	; The salt-stir + ISN draw + SND_UNA mirror is shared with
+	; LISTEN_POLL's passive open via GEN_ISN (image budget); only the
+	; ephemeral-port derivation from the stirred salt stays here.
+	; Byte order and semantics match the inline ELSE branch exactly.
+	CALL	GEN_ISN			; -> HL = stirred salt
+	LD	A,L
+	LD	(TCP_LOCAL_PORT_LO),A
+	LD	A,H
+	OR	0xC0
+	LD	(TCP_LOCAL_PORT_HI),A
+	ELSE
 	LD	HL,(TCP_PORT_SALT)
 	LD	D,H
 	LD	E,L
@@ -248,6 +272,7 @@ OPEN
 	LD	DE,TCP_SND_UNA
 	LD	BC,4
 	LDIR
+	ENDIF
 	; RCV_NXT will be set after SYN+ACK arrives; zero for now.
 	XOR	A
 	LD	HL,TCP_RCV_NXT
@@ -370,11 +395,60 @@ INC_SEQ32
 	RET
 
 
+	IFDEF	UNET_DLL
+; ------------------------------------------------------
+; BUILD_TCP_PORTS_SEQ (UNET_DLL only, image budget): the local/remote
+; port pair and the 4-byte big-endian SND_NXT sequence number --
+; BUILD_SYN/BUILD_ACK/BUILD_FIN build this leading 12-byte span
+; identically before diverging (ack/flags/options/window differ per
+; segment type).  Non-DLL builds keep each copy inline byte-identical
+; to before; this shared copy exists only under UNET_DLL, so it costs
+; nothing there.
+;   In:  DE = TCP header start (BUILD_ETH_IP's own "DE = TX_BUF + 14
+;        + 20" contract).
+;   Out: DE advanced past the sequence number (+12).
+; Trashes A, BC, HL.
+; ------------------------------------------------------
+BUILD_TCP_PORTS_SEQ
+	LD	A,(TCP_LOCAL_PORT_HI)
+	LD	(DE),A
+	INC	DE
+	LD	A,(TCP_LOCAL_PORT_LO)
+	LD	(DE),A
+	INC	DE
+	LD	A,(TCP_REMOTE_PORT_HI)
+	LD	(DE),A
+	INC	DE
+	LD	A,(TCP_REMOTE_PORT_LO)
+	LD	(DE),A
+	INC	DE
+	LD	HL,TCP_SND_NXT
+	LD	BC,4
+	LDIR
+	RET
+	ENDIF
+
 ; ------------------------------------------------------
 ; BUILD_SYN: build SYN segment with MSS option in TX_BUF.
 ; Sets TCP_TX_LEN to total Ethernet frame length.
+;
+; BUILD_SYN.SYNACK_ENTRY (USE_TCP_LISTEN, called as
+; "CALL BUILD_SYN.SYNACK_ENTRY") is the same builder with flags
+; SYN|ACK and ack=TCP_RCV_NXT instead of SYN alone and ack=0 -- the
+; passive-open reply to an unsolicited SYN.  A non-LISTEN build never
+; sees the extra entry point or the .SYNACK_FLAG byte; every
+; instruction below this comment stays byte-identical for it.
 ; ------------------------------------------------------
 BUILD_SYN
+	IFDEF	USE_TCP_LISTEN
+	XOR	A
+	LD	(.SYNACK_FLAG),A
+	JR	.BODY
+.SYNACK_ENTRY
+	LD	A,1
+	LD	(.SYNACK_FLAG),A
+.BODY
+	ENDIF
 	; TCP header = 24 bytes (20 + 4-byte MSS option).
 	; TCP segment length = 24, IP total = 44, frame = 58.
 	LD	HL,24
@@ -384,6 +458,13 @@ BUILD_SYN
 	CALL	BUILD_ETH_IP
 	; --- TCP header ---
 	; DE points just past IP header (= TX_BUF + 14 + 20).
+	; src port, dst port, seq (BE): identical in BUILD_SYN/BUILD_ACK/
+	; BUILD_FIN.  IFDEF UNET_DLL shares it via BUILD_TCP_PORTS_SEQ
+	; (image budget); non-DLL builds keep this inline, byte-identical
+	; to before.
+	IFDEF	UNET_DLL
+	CALL	BUILD_TCP_PORTS_SEQ
+	ELSE
 	; src port
 	LD	A,(TCP_LOCAL_PORT_HI)
 	LD	(DE),A
@@ -402,7 +483,19 @@ BUILD_SYN
 	LD	HL,TCP_SND_NXT
 	LD	BC,4
 	LDIR
-	; ack = 0 (not yet acking anything)
+	ENDIF
+	; ack = 0 (not yet acking anything), or TCP_RCV_NXT for a
+	; SYNACK_ENTRY reply (peer's seq+1, already set by the caller).
+	IFDEF	USE_TCP_LISTEN
+	LD	A,(.SYNACK_FLAG)
+	OR	A
+	JR	Z,.ACK_ZERO
+	LD	HL,TCP_RCV_NXT
+	LD	BC,4
+	LDIR
+	JR	.ACK_DONE
+.ACK_ZERO
+	ENDIF
 	XOR	A
 	LD	(DE),A
 	INC	DE
@@ -412,12 +505,24 @@ BUILD_SYN
 	INC	DE
 	LD	(DE),A
 	INC	DE
+	IFDEF	USE_TCP_LISTEN
+.ACK_DONE
+	ENDIF
 	; data offset (6 << 4 = 0x60), reserved = 0
 	LD	A,0x60
 	LD	(DE),A
 	INC	DE
-	; flags = SYN
+	; flags = SYN, or SYN|ACK for a SYNACK_ENTRY reply
+	IFDEF	USE_TCP_LISTEN
+	LD	A,(.SYNACK_FLAG)
+	OR	A
 	LD	A,TF_SYN
+	JR	Z,.FLAGS_OK
+	LD	A,TF_SYN | TF_ACK
+.FLAGS_OK
+	ELSE
+	LD	A,TF_SYN
+	ENDIF
 	LD	(DE),A
 	INC	DE
 	; advertised window (BE) -- see TCP_RECV_WIN_HI/LO at top.
@@ -460,6 +565,9 @@ BUILD_SYN
 	LD	(TCP_TX_LEN),HL
 	RET
 .TCP_LEN	DW 0
+	IFDEF	USE_TCP_LISTEN
+.SYNACK_FLAG	DB 0
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -487,6 +595,9 @@ BUILD_ACK
 	LD	BC,20
 	CALL	BUILD_ETH_IP
 	; --- TCP header ---
+	IFDEF	UNET_DLL
+	CALL	BUILD_TCP_PORTS_SEQ
+	ELSE
 	LD	A,(TCP_LOCAL_PORT_HI)
 	LD	(DE),A
 	INC	DE
@@ -503,6 +614,7 @@ BUILD_ACK
 	LD	HL,TCP_SND_NXT
 	LD	BC,4
 	LDIR
+	ENDIF
 	; ack
 	LD	HL,TCP_RCV_NXT
 	LD	BC,4
@@ -1004,6 +1116,322 @@ IS_TCP_FROM_PEER
 	RET
 
 
+	IFDEF	USE_TCP_LISTEN
+; ------------------------------------------------------
+; GEN_ISN: draw a fresh initial sequence number into TCP_SND_NXT and
+; mirror it to TCP_SND_UNA.  Shared by OPEN's per-attempt draw (its
+; IFDEF USE_TCP_LISTEN branch) and LISTEN_POLL's passive open; OPEN
+; additionally derives its ephemeral port from the stirred salt this
+; returns, LISTEN's local port is fixed by LISTEN_INIT instead.
+;   Out: HL = the stirred TCP_PORT_SALT value.
+; Trashes A, BC, DE.
+; ------------------------------------------------------
+GEN_ISN
+	LD	HL,(TCP_PORT_SALT)
+	LD	D,H
+	LD	E,L
+	ADD	HL,HL
+	ADD	HL,DE			; salt *= 3
+	LD	A,R
+	LD	E,A
+	LD	D,0
+	ADD	HL,DE			; += R
+	LD	DE,0x9E37
+	ADD	HL,DE			; += odd constant (full-period walk)
+	LD	(TCP_PORT_SALT),HL
+	LD	A,R
+	LD	(TCP_SND_NXT + 0),A
+	LD	A,H
+	LD	(TCP_SND_NXT + 1),A
+	LD	A,L
+	LD	(TCP_SND_NXT + 2),A
+	LD	A,R
+	LD	(TCP_SND_NXT + 3),A
+	; Mirror to SND_UNA, preserving the salt in HL for OPEN.
+	PUSH	HL
+	LD	HL,TCP_SND_NXT
+	LD	DE,TCP_SND_UNA
+	LD	BC,4
+	LDIR
+	POP	HL
+	RET
+
+
+; ------------------------------------------------------
+; IS_TCP_SYN_TO_LPORT: filter RX_BUF for an unsolicited IPv4/TCP SYN
+; (SYN set, ACK/RST/FIN clear) addressed to TCP_LOCAL_PORT.  Unlike
+; IS_TCP_FROM_PEER this does not check the source tuple -- ST_LISTEN
+; has no peer yet; this segment is what establishes one.
+;   Out: CF=1 if match; CF=0 otherwise.
+; ------------------------------------------------------
+IS_TCP_SYN_TO_LPORT
+	LD	A,(@MAIN.RX_BUF + 12)
+	CP	HIGH ETH_TYPE_IPV4
+	JR	NZ,.NO
+	LD	A,(@MAIN.RX_BUF + 13)
+	CP	LOW ETH_TYPE_IPV4
+	JR	NZ,.NO
+	LD	A,(@MAIN.RX_BUF + 14)
+	CP	0x45
+	JR	NZ,.NO
+	LD	A,(@MAIN.RX_BUF + 14 + 9)
+	CP	IP_PROTO_TCP
+	JR	NZ,.NO
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 2)		; dst port
+	LD	HL,TCP_LOCAL_PORT_HI
+	CP	(HL)
+	JR	NZ,.NO
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 3)
+	INC	HL
+	CP	(HL)
+	JR	NZ,.NO
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)	; flags
+	AND	(TF_RST | TF_SYN | TF_ACK | TF_FIN)
+	CP	TF_SYN
+	JR	NZ,.NO
+	SCF
+	RET
+.NO
+	OR	A
+	RET
+
+
+; ------------------------------------------------------
+; LISTEN_INIT: arm a fresh passive-open TCB on port HL (host order,
+; 1..65535).  Caller (unetrtl.asm) has already verified the channel
+; is closed.  Also the re-arm path: closing an accepted connection
+; calls this again with the same port.
+; ------------------------------------------------------
+LISTEN_INIT
+	XOR	A
+	LD	(TCP_LAST_FAIL),A
+	LD	(RECV_UNACKED),A
+	IFDEF	USE_TCP_RELIABLE_SEND
+	LD	(TCP_ACK_WAIT_STATE),A
+	ENDIF
+	LD	A,H
+	LD	(TCP_LOCAL_PORT_HI),A
+	LD	A,L
+	LD	(TCP_LOCAL_PORT_LO),A
+	LD	A,ST_LISTEN
+	LD	(TCP_STATE),A
+	RET
+
+
+; ------------------------------------------------------
+; LISTEN_POLL: progress a passive-open channel by one bounded poll.
+; ST_LISTEN: accept an unsolicited SYN to TCP_LOCAL_PORT (fills
+;   TCP_REMOTE_IP/MAC/PORT and TCP_RCV_NXT from it), reply with a
+;   SYN+ACK, and move to ST_SYN_RCVD.  ST_SYN_RCVD: a duplicate SYN
+;   re-sends the SAME SYN+ACK (idempotent, same ISN); RST drops back
+;   to ST_LISTEN; the final ACK completes the handshake (ST_ESTAB).
+;   A data- or FIN-bearing final ACK is left UNCOMMITTED at the ring
+;   head instead of being consumed here, so the normal established-
+;   connection RECV path delivers its payload in order -- reprocessing
+;   the ACK field there is idempotent (SND_UNA already equals it).
+; Foreign frames follow WAIT_SYN_ACK's multichan etiquette. Budget is
+; decrement-before-tick (RECV's shape): a non-blocking poll against
+; an idle ring costs nothing.
+;   In: TCP_TIMEOUT_LEFT already set by the caller (RECV-style budget).
+;   Out: CF=0 A=0 idle (budget spent, nothing progressed);
+;        CF=0 A=1 accepted (TCP_STATE==ST_ESTAB; caller re-reads via
+;                  the normal RECV path for any uncommitted payload);
+;        CF=1 fail (TCP_LAST_FAIL: F_CANCEL, F_SEND, F_OTHER).
+; Requires USE_TCP_MULTICHAN (PEEK_PACKET/COMMIT_PACKET/
+; HANDLE_FOREIGN_FRAME) -- always true, UNETRTL.DLL is the only
+; definer of USE_TCP_LISTEN and always sets both.
+; ------------------------------------------------------
+LISTEN_POLL
+.LP
+	CALL	@RTL.RING_HAS_PACKET
+	JR	NZ,.HAVE
+.TICK
+	LD	HL,(TCP_TIMEOUT_LEFT)
+	DEC	HL
+	LD	(TCP_TIMEOUT_LEFT),HL
+	LD	A,H
+	OR	L
+	JR	Z,.IDLE
+	CALL	@MAIN.TICK_AND_CHECK_KEY
+	JP	C,.CANCEL
+	JR	.LP
+.IDLE
+	XOR	A
+	RET
+.HAVE
+	LD	HL,@MAIN.RX_HDR
+	LD	DE,@MAIN.RX_BUF
+	LD	BC,@MAIN.RX_BUF_SIZE
+	CALL	@RTL.PEEK_PACKET
+	JR	C,.TICK
+	LD	A,(TCP_STATE)
+	CP	ST_SYN_RCVD
+	JP	Z,.RCVD
+	; -- ST_LISTEN: look for an unsolicited SYN to our port --
+	CALL	IS_TCP_SYN_TO_LPORT
+	JR	C,.GOT_SYN
+	CALL	.HANDLE_FOREIGN
+	RET	C
+	JP	.TICK
+.GOT_SYN
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	LD	HL,@MAIN.RX_BUF + 6			; Ethernet src MAC
+	LD	DE,TCP_REMOTE_MAC
+	LD	BC,6
+	LDIR
+	LD	HL,@MAIN.RX_BUF + 14 + 12		; IP src
+	LD	DE,TCP_REMOTE_IP
+	LD	BC,4
+	LDIR
+	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 0	; TCP src port
+	LD	DE,TCP_REMOTE_PORT_HI
+	LD	BC,2
+	LDIR
+	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4	; seq (BE)
+	LD	DE,TCP_RCV_NXT
+	LD	BC,4
+	LDIR
+	LD	DE,TCP_RCV_NXT
+	CALL	INC_SEQ32
+	CALL	GEN_ISN			; SND_NXT = SND_UNA = ISN
+	; The final ACK that completes the handshake acks ISN+1 (our SYN
+	; consumes one sequence number), so keep SND_UNA one ahead for
+	; .CMPACK below.  SND_NXT stays at ISN while in ST_SYN_RCVD so a
+	; duplicate-SYN resend (see .RCVD) rebuilds the SAME SYN+ACK;
+	; .ACCEPTED advances it once the handshake completes.
+	LD	DE,TCP_SND_UNA
+	CALL	INC_SEQ32
+.SEND_SYNACK
+	CALL	BUILD_SYN.SYNACK_ENTRY
+	LD	HL,@MAIN.TX_BUF
+	LD	BC,(TCP_TX_LEN)
+	CALL	@RTL.SEND_FRAME
+	JR	C,.SYNACK_FAIL
+	LD	A,ST_SYN_RCVD
+	LD	(TCP_STATE),A
+	JP	.TICK
+.SYNACK_FAIL
+	LD	A,F_SEND
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.RCVD
+	; -- ST_SYN_RCVD: wait for the final ACK from the SAME peer.  A
+	; duplicate SYN (the peer never saw our SYN+ACK) re-sends the
+	; SAME-ISN SYN+ACK -- see .CHK_ACK; RST drops back to ST_LISTEN;
+	; any other non-ACK segment is dropped. --
+	CALL	IS_TCP_FROM_PEER
+	JR	C,.PEER_SEG
+	CALL	.HANDLE_FOREIGN
+	RET	C
+	JP	.TICK
+.PEER_SEG
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)	; flags
+	LD	B,A
+	AND	TF_RST
+	JR	Z,.CHK_ACK
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	LD	A,ST_LISTEN
+	LD	(TCP_STATE),A
+	JP	.TICK
+.CHK_ACK
+	LD	A,B
+	AND	TF_ACK
+	JR	NZ,.HAS_ACK
+	; No ACK: a duplicate SYN means our SYN+ACK was lost in transit --
+	; commit it and re-send the SAME-ISN SYN+ACK (SND_NXT still holds
+	; the ISN, RCV_NXT the peer's seq+1: a true retransmission carries
+	; the same peer ISN, and a genuinely NEW attempt with a different
+	; one gets a stale ack it answers with RST, which resets us to
+	; ST_LISTEN for its next SYN).  Anything else without ACK: drop.
+	LD	A,B
+	AND	TF_SYN
+	JR	Z,.DROP
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	JP	.SEND_SYNACK
+.HAS_ACK
+	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 8		; ack BE
+	LD	DE,TCP_SND_UNA
+	LD	B,4
+.CMPACK
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.DROP
+	INC	DE
+	INC	HL
+	DJNZ	.CMPACK
+	; Accepted.  Commit only a payload-free, non-FIN final ACK here;
+	; anything else is left at the ring head for the normal RECV path.
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 12)
+	AND	0xF0
+	RRCA
+	RRCA					; A = data_offset * 4
+	LD	C,A
+	LD	B,0
+	LD	A,(@MAIN.RX_BUF + 14 + 2)
+	LD	H,A
+	LD	A,(@MAIN.RX_BUF + 14 + 3)
+	LD	L,A				; HL = IP total length
+	LD	DE,IP_HDR_LEN
+	OR	A
+	SBC	HL,DE
+	OR	A
+	SBC	HL,BC				; HL = segment payload length
+	LD	A,H
+	OR	L
+	JR	NZ,.ACCEPTED
+	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)
+	AND	TF_FIN
+	JR	NZ,.ACCEPTED
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+.ACCEPTED
+	; Our SYN consumed one sequence number: advance SND_NXT to ISN+1
+	; (SND_UNA is already there, see .GOT_SYN) so the first byte we
+	; send is numbered where the peer expects it.
+	LD	DE,TCP_SND_NXT
+	CALL	INC_SEQ32
+	LD	A,ST_ESTAB
+	LD	(TCP_STATE),A
+	LD	A,1
+	RET
+.DROP
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	JP	.TICK
+.CANCEL
+	LD	A,F_CANCEL
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+; Shared by both ST_LISTEN and ST_SYN_RCVD's "not ours" exit: queue
+; or drop a frame belonging to the other channel, matching
+; WAIT_SYN_ACK's multichan etiquette.
+;   Out: CF=0 -> caller should JP .TICK; CF=1 -> propagate to the
+;        caller of LISTEN_POLL (F_OTHER already set).
+.HANDLE_FOREIGN
+	LD	A,1				; caller protocol = TCP
+	CALL	@UNET.HANDLE_FOREIGN_FRAME
+	JR	NC,.HF_COMMIT
+	OR	A
+	JR	Z,.HF_OK
+	LD	A,F_OTHER
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.HF_COMMIT
+	LD	HL,@MAIN.RX_HDR
+	CALL	@RTL.COMMIT_PACKET
+	CALL	@ARP.ANSWER_REQUEST
+.HF_OK
+	OR	A
+	RET
+	ENDIF
+
+
 ; ------------------------------------------------------
 ; ADD32_BE_BC: 32-bit big-endian value at (DE) += BC.
 ; Trashes A; preserves DE, HL.
@@ -1075,6 +1503,14 @@ SEND
 	LD	A,SEND_ATTEMPTS
 	LD	(TCP_SEND_RETRY_LEFT),A
 .TRY
+	IFDEF	USE_TCP_ASYNCSEND
+	; Fresh per-attempt silence budget.  USE_TCP_ASYNCSEND slices this
+	; into smaller waits (see .WAIT_ACK); reaching zero is what lets a
+	; retry/retransmit happen, exactly as SEND_ACK_TIMEOUT_MS alone
+	; used to gate it.
+	LD	HL,SEND_ACK_TIMEOUT_MS
+	LD	(TCP_ATTEMPT_MS_LEFT),HL
+	ENDIF
 	; BUILD_DATA reads TCP_SND_NXT.  Put the original sequence there
 	; for the build, then restore the post-segment value before the
 	; frame goes on the wire.  Every retry therefore carries the same
@@ -1111,7 +1547,28 @@ SEND
 .WAIT_ACK
 	LD	A,ACK_WAIT_ACTIVE
 	LD	(TCP_ACK_WAIT_STATE),A
+	IFDEF	USE_TCP_ASYNCSEND
+	; Quantum for this wait: the whole remaining attempt budget when
+	; blocking (@UNET.OPT_SLICE=0, byte-identical to the pre-ASYNCSEND
+	; behavior below), or the smaller of the remaining budget and the
+	; slice when the caller armed UNET_OPT_SENDSLICE.
+	LD	HL,(TCP_ATTEMPT_MS_LEFT)
+	LD	DE,(@UNET.OPT_SLICE)
+	LD	A,D
+	OR	E
+	JR	Z,.QUANTUM_READY
+	OR	A
+	SBC	HL,DE
+	JR	C,.RESTORE_BUDGET
+	EX	DE,HL
+	JR	.QUANTUM_READY
+.RESTORE_BUDGET
+	ADD	HL,DE
+.QUANTUM_READY
+	LD	(.QUANTUM),HL
+	ELSE
 	LD	HL,SEND_ACK_TIMEOUT_MS
+	ENDIF
 	LD	(RECV_TIMEOUT),HL
 	CALL	RECV
 	JR	C,.WAIT_FAIL
@@ -1136,10 +1593,39 @@ SEND
 	LD	A,(TCP_LAST_FAIL)
 	CP	F_TIMEOUT
 	JR	NZ,.FATAL
+	IFDEF	USE_TCP_ASYNCSEND
+	; Consume the quantum just waited from this attempt's budget.  RECV
+	; only returns F_TIMEOUT after waiting its full requested
+	; RECV_TIMEOUT, so .QUANTUM is exactly the elapsed silence.
+	LD	HL,(TCP_ATTEMPT_MS_LEFT)
+	LD	DE,(.QUANTUM)
+	OR	A
+	SBC	HL,DE
+	LD	(TCP_ATTEMPT_MS_LEFT),HL
+	LD	A,H
+	OR	L
+	JR	Z,.ATTEMPT_EXHAUSTED	; whole attempt budget spent: fall
+					; into the existing retry ladder below
+	; Silence within the attempt but budget remains: suspend without
+	; burning a retry or retransmitting.  SEND_RESUME re-enters
+	; .WAIT_ACK directly for this same outstanding segment.
+	LD	A,F_AGAIN
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+.ATTEMPT_EXHAUSTED
+	ENDIF
 	LD	A,(TCP_SEND_RETRY_LEFT)
 	DEC	A
 	LD	(TCP_SEND_RETRY_LEFT),A
+	; USE_TCP_ASYNCSEND's extra code between here and .TRY pushes the
+	; back-branch out of JR range; plain USE_TCP_RELIABLE_SEND builds
+	; (dldirect/dldircp) keep the shorter JR unchanged.
+	IFDEF	USE_TCP_ASYNCSEND
+	JP	NZ,.TRY
+	ELSE
 	JR	NZ,.TRY
+	ENDIF
 	; Keep SND_NXT and SND_UNA at the first unacknowledged byte on
 	; failure.  A caller that elects to
 	; retry the same application write will therefore fill the same
@@ -1204,6 +1690,28 @@ SEND
 	ENDIF
 .SAVE_LEN	DW 0
 .SAVE_DATA	DW 0
+	IFDEF	USE_TCP_ASYNCSEND
+.QUANTUM	DW 0
+	ENDIF
+
+
+; ------------------------------------------------------
+; SEND_RESUME: continue a SEND transaction that suspended with
+; F_AGAIN.  Same contract as SEND (In: HL = data ptr, BC = length --
+; the SAME data/length the suspended SEND was called with).  The
+; segment already on the wire is NOT retransmitted; only the ACK
+; wait continues, so a resume can never duplicate stream bytes.
+; TCP_SEND_SEQ/TCP_ACK_WAIT_TARGET/TCP_SEND_RETRY_LEFT/
+; TCP_ATTEMPT_MS_LEFT are exactly as SEND left them.
+;   Out: CF=0 ok; CF=1 fail (TCP_LAST_FAIL holds reason, F_AGAIN
+;        included -- the caller may need to suspend again).
+; ------------------------------------------------------
+	IFDEF	USE_TCP_ASYNCSEND
+SEND_RESUME
+	LD	(SEND.SAVE_LEN),BC
+	LD	(SEND.SAVE_DATA),HL
+	JP	SEND.WAIT_ACK
+	ENDIF
 
 
 	IFDEF USE_TCP_RELIABLE_SEND
@@ -1775,6 +2283,9 @@ BUILD_DATA
 BUILD_FIN
 	LD	BC,20
 	CALL	BUILD_ETH_IP
+	IFDEF	UNET_DLL
+	CALL	BUILD_TCP_PORTS_SEQ
+	ELSE
 	LD	A,(TCP_LOCAL_PORT_HI)
 	LD	(DE),A
 	INC	DE
@@ -1790,6 +2301,7 @@ BUILD_FIN
 	LD	HL,TCP_SND_NXT
 	LD	BC,4
 	LDIR
+	ENDIF
 	LD	HL,TCP_RCV_NXT
 	LD	BC,4
 	LDIR

@@ -172,10 +172,13 @@ bounded and its timeout path prints an error, so a freeze there means the
 Z80 is stopped inside the ISA bus cycle itself, which no software timeout
 can break.
 
-The workaround is `RTL_RESET=SOFT` in `NET.CFG` (see `HOWTO.md`): the
-driver then never touches `BASE+0x1F` and brings the controller up through
-its normal register file.  `NICINFO` prints `[W02] soft reset: port 1F
-skipped.` when it is active.
+The driver now avoids this on its own: with no `RTL_RESET=` line in
+`NET.CFG` it reads the chip ID first and pulses `BASE+0x1F` only for a
+card that answers with the Realtek signature, so a clone gets the soft
+path automatically and `NETCFG -i` prints `[W03] non-Realtek clone:
+board reset port skipped`.  `RTL_RESET=SOFT` forces the same path
+explicitly and makes utilities print `[W02] soft reset: port 1F
+skipped.` (see `HOWTO.md`).
 
 With `RTL_HW=0/#300` and `RTL_RESET=SOFT` the UM9003AF passes the whole
 stage sequence on real hardware: `NICINFO`, `NICRAM` (remote DMA round

@@ -1,7 +1,8 @@
 ; ======================================================
 ; UNETTEST - backend-neutral smoke test for the UNET network DLL.
 ;
-;   UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT] HOST [PORT]
+;   UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT]
+;            [-l LISTENPORT] [-a] [HOST [PORT]]
 ;
 ; Loads a UNET DLL (default UNETRTL.DLL) via libman into window 1, then walks
 ; the API: l_info, GETCAPS, SETOPT, STATUS, NETINIT, GETINFO, RESOLVE, PING,
@@ -12,7 +13,15 @@
 ; already covers it) -- up to 1472 this exercises the standard-MTU zero-copy
 ; TX path end to end, and above 1472 it exercises the backend's own
 ; NERR_PARAM rejection.  -2 replaces it with a simultaneous two-channel TCP
-; exercise: control on PORT and data on DATAPORT.
+; exercise: control on PORT and data on DATAPORT.  -l exercises passive open
+; (LISTEN/UNLISTEN, UNET_CAP_LISTEN): arms LISTENPORT, accepts and serves two
+; peers in a row on the SAME channel to prove CLOSE re-arms it automatically,
+; then UNLISTENs; pair with tools/dev/unettest_listen_client.py (or plain
+; `nc`) run twice.  -a exercises non-blocking SEND (ASYNCSEND,
+; UNET_CAP_ASYNCSEND / UNET_OPT_SENDSLICE): CONNECTs to HOST:PORT, then SENDs
+; a multi-chunk payload against a peer that stalls its TCP receive window
+; (tools/dev/unettest_asyncsend_stall.py) so at least one NERR_AGAIN resume
+; is exercised end to end.
 ; Because the whole exercise goes through the DLL, the SAME binary tests any
 ; backend - point -d at UNETESP.DLL to exercise the Wi-Fi card instead.
 ;
@@ -226,7 +235,19 @@ START
 	LD	HL,MSG_FAILED
 	CALL	PUTS_LN
 .after_ping
-	; -u / -2 select an exercise other than the plain TCP one.
+	; -l / -a / -u / -2 select an exercise other than the plain TCP one.
+	LD	A,(LISTEN_MODE)
+	AND	A
+	JR	Z,.check_async
+	CALL	LISTEN_PHASE
+	JP	.teardown
+.check_async
+	LD	A,(ASYNC_MODE)
+	AND	A
+	JR	Z,.check_dual
+	CALL	ASYNC_PHASE
+	JP	.teardown
+.check_dual
 	LD	A,(DUAL_MODE)
 	AND	A
 	JR	Z,.check_udp
@@ -475,6 +496,8 @@ ERR_UDPOPEN
 USAGE_EXIT
 	LD	HL,MSG_USAGE
 	CALL	PUTS_LN
+	LD	HL,MSG_USAGE2
+	CALL	PUTS_LN
 	LD	B,1
 	JP	EXIT
 
@@ -678,21 +701,12 @@ UDP_PHASE
 	; 21-byte string, straight from the image, exactly as before.
 	; Sized (-u PORT SIZE): a generated i&0xFF pattern in PATTERN_BUF,
 	; exercising payload sizes up to the standard UDP MTU (1472) and
-	; the backend's own NERR_PARAM rejection just above it. ---
-	LD	HL,(UDP_TEST_SIZE)
-	LD	A,H
-	OR	L
-	JR	Z,.default_payload
-	LD	DE,PATTERN_BUF
-	LD	BC,(UDP_TEST_SIZE)
-	CALL	FILL_PATTERN
-	LD	DE,PATTERN_BUF
-	LD	IX,(UDP_TEST_SIZE)
-	JR	.have_payload
-.default_payload
-	LD	DE,UDP_PAYLOAD
-	LD	IX,UDP_PAYLOAD_LEN
-.have_payload
+	; the backend's own NERR_PARAM rejection just above it.
+	; The DE/IX arguments are loaded AFTER all printing (see
+	; .size_noted below): PUT_DEC_HL exits with DE=0 (its EX DE,HL
+	; hands back the divided-down value), so loading the payload
+	; pointer before the size line silently sent 21 bytes read from
+	; address 0x0000 instead of the payload. ---
 	; Print the effective outgoing size before SEND.  A misplaced HOST
 	; argument between the UDP port and SIZE (e.g. "-u 7777 1.2.3.4
 	; 1472") makes SIZE parse as HOST instead of a decimal token, so
@@ -718,6 +732,20 @@ UDP_PHASE
 	CALL	PUTS
 .size_noted
 	CALL	CRLF
+	LD	HL,(UDP_TEST_SIZE)
+	LD	A,H
+	OR	L
+	JR	Z,.default_payload
+	LD	DE,PATTERN_BUF
+	LD	BC,(UDP_TEST_SIZE)
+	CALL	FILL_PATTERN
+	LD	DE,PATTERN_BUF
+	LD	IX,(UDP_TEST_SIZE)
+	JR	.have_payload
+.default_payload
+	LD	DE,UDP_PAYLOAD
+	LD	IX,UDP_PAYLOAD_LEN
+.have_payload
 	XOR	A				; channel 0
 	LD	B,UNET_FN_SEND
 	CALL	DO_CALL				; -> A, DE=sent
@@ -1046,6 +1074,284 @@ DUAL_CHECK_SEQ
 	DEC	BC
 	JR	.loop
 
+; ======================================================
+; LISTEN exercise (-l LISTENPORT): LISTEN -> accept -> SEND/RECV -> CLOSE,
+; run twice on channel 0 to verify UNET's documented auto-re-arm-on-CLOSE
+; (docs/UNETRTL.md "Passive open (LISTEN)"), then UNLISTEN.
+; Pair with tools/dev/unettest_listen_client.py (or plain `nc HOST PORT`)
+; run twice from the host, or a manual `nc 192.168.7.2 LISTENPORT`.
+; ======================================================
+LISTEN_PHASE
+	LD	A,(CAPS)
+	AND	UNET_CAP_LISTEN
+	JR	NZ,.supported
+	LD	HL,MSG_LISTEN_UNSUP
+	JP	PUTS_LN
+.supported
+	LD	HL,MSG_LISTEN
+	CALL	PUTS
+	LD	HL,LISTEN_PORT_BUF
+	CALL	PUTS_LN
+	LD	HL,LISTEN_PORT_BUF
+	CALL	PARSE_DEC_TOKEN			; -> HL=port (0..9999), CF=1 invalid
+	JP	C,ERR_LISTEN_PORT
+	EX	DE,HL				; DE = port, binary
+	XOR	A				; channel 0
+	LD	B,UNET_FN_LISTEN
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_LISTEN
+	LD	HL,MSG_LISTENING
+	CALL	PUTS_LN
+
+	LD	C,1				; ascending peer number for the log
+	LD	B,LISTEN_MAX_PEERS
+.peer_loop
+	PUSH	BC
+	LD	A,C
+	CALL	LISTEN_ACCEPT_SERVE
+	POP	BC
+	INC	C
+	DJNZ	.peer_loop
+
+	XOR	A				; the (still) listening channel
+	LD	B,UNET_FN_UNLISTEN
+	CALL	DO_CALL
+	LD	HL,MSG_UNLISTENED
+	CALL	PUTS_LN
+	RET
+
+ERR_LISTEN
+	LD	HL,MSG_ERR_LISTEN
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+
+; LISTENPORT failed PARSE_DEC_TOKEN (non-digits, empty, or >4 digits) --
+; a usage error, but caught late (after the DLL is up), so clean up like
+; the other mid-session error exits instead of jumping to USAGE_EXIT.
+ERR_LISTEN_PORT
+	LD	HL,MSG_USAGE
+	CALL	PUTS_LN
+	LD	HL,MSG_USAGE2
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,1
+	JP	EXIT
+
+; One accept-serve-close cycle on channel 0.  In: A = peer number (for the
+; log only).  Never propagates an error upward -- always prints and
+; returns so LISTEN_PHASE can try the next peer (this is a diagnostic
+; loop, not a fatal-on-first-error client).
+LISTEN_ACCEPT_SERVE
+	PUSH	AF				; peer number: PUTS (RST DSS) trashes A
+	LD	HL,MSG_LISTEN_WAITING
+	CALL	PUTS
+	POP	AF
+	CALL	PUT_DEC_A
+	CALL	CRLF
+	LD	A,LISTEN_ACCEPT_TRIES
+	LD	(RECV_LEFT),A
+.wait
+	LD	A,(RECV_LEFT)
+	AND	A
+	JP	Z,.timeout
+	DEC	A
+	LD	(RECV_LEFT),A
+	XOR	A				; channel 0
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,2000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; -> A, DE=got (progresses the accept)
+	OR	A
+	JP	NZ,.recv_err
+	LD	(LISTEN_RX_LEN),DE
+	XOR	A
+	LD	B,UNET_FN_STATUS
+	CALL	DO_CALL				; -> A=0, DE=state bits
+	LD	A,E
+	AND	UNET_ST_ACCEPT
+	JR	Z,.wait
+	; accepted
+	LD	HL,MSG_LISTEN_ACCEPTED
+	CALL	PUTS_LN
+	LD	DE,(LISTEN_RX_LEN)
+	LD	A,D
+	OR	E
+	JR	Z,.reply
+	CALL	PRINT_RECV
+	CALL	CRLF
+.reply
+	XOR	A				; channel 0
+	LD	DE,LISTEN_REPLY
+	LD	IX,LISTEN_REPLY_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL
+	OR	A
+	JR	NZ,.send_err
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,1000
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL				; drain once more, non-fatal
+	CP	NERR_CLOSED
+	JR	Z,.peer_closed
+	OR	A
+	JR	NZ,.recv_err_close
+	LD	A,D
+	OR	E
+	JR	Z,.close
+	CALL	PRINT_RECV
+	CALL	CRLF
+.close
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	LD	HL,MSG_LISTEN_CLOSED
+	CALL	PUTS_LN
+	RET
+; The peer read the reply and closed on its own (normal shutdown, not
+; an error): RECV's own NERR_CLOSED report (unetrtl.asm F_RECV
+; .report_closed) has ALREADY re-armed LISTEN for us (docs/UNETRTL.md
+; "Passive open (LISTEN)": "closing ... with CLOSE (or its own natural
+; NERR_CLOSED) automatically re-arms"). Calling CLOSE again here would
+; run RELEASE_OR_REARM a second time with LISTEN_ACCEPTED already
+; cleared, which unarms the listener instead (CH_STATE -> 0) --
+; confirmed on real MAME as the peer-#2 "receive error nerr=0B
+; (NERR_STATE)". Do not CLOSE on this path.
+.peer_closed
+	LD	HL,MSG_LISTEN_PEER_CLOSED
+	CALL	PUTS_LN
+	RET
+.send_err
+	LD	HL,MSG_ERR_SEND
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+; Pre-accept RECV error: the channel is still just listening, so do NOT
+; CLOSE it (that would tear the listener down instead of re-arming it).
+.recv_err
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	JP	DUMP_LASTERR
+; Post-accept RECV error: CLOSE the accepted connection so LISTEN
+; re-arms and the next peer iteration still stands a chance.
+.recv_err_close
+	LD	HL,MSG_RECV_ERR
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+.timeout
+	LD	HL,MSG_LISTEN_TIMEOUT
+	CALL	PUTS_LN
+	RET
+
+; ======================================================
+; ASYNCSEND exercise (-a): SETOPT SENDSLICE, CONNECT to HOST:PORT, then
+; SEND a multi-chunk payload against a peer that stalls its TCP receive
+; window (tools/dev/unettest_asyncsend_stall.py) to force at least one
+; NERR_AGAIN, verifying the documented resume contract: repeat the SAME
+; channel/buffer/length until SEND finally settles.
+; ======================================================
+ASYNC_PHASE
+	LD	A,(CAPS+1)
+	AND	HIGH UNET_CAP_ASYNCSEND
+	JR	NZ,.supported
+	LD	HL,MSG_ASYNC_UNSUP
+	JP	PUTS_LN
+.supported
+	LD	A,UNET_OPT_SENDSLICE
+	LD	DE,ASYNC_SLICE_MS
+	LD	B,UNET_FN_SETOPT
+	CALL	DO_CALL
+	OR	A
+	JR	Z,.slice_ok
+	; the backend advertises CAP_ASYNCSEND, so a SETOPT refusal is a
+	; genuine failure, not a missing feature -- exit 3 like other
+	; network errors (Exit Status Guidelines).
+	LD	HL,MSG_ASYNC_SETOPT_FAIL
+	CALL	PUTS_LN
+	CALL	DUMP_LASTERR
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+.slice_ok
+	LD	HL,MSG_ASYNC_CONNECT
+	CALL	PUTS
+	LD	HL,HOST_BUFF
+	CALL	PUTS
+	LD	A,':'
+	CALL	PUT_CHAR
+	LD	HL,PORT_BUFF
+	CALL	PUTS_LN
+	XOR	A				; channel 0
+	LD	DE,HOST_BUFF
+	LD	IX,PORT_BUFF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,ERR_CONNECT			; prints, frees, exit 3
+.connected
+	LD	DE,PATTERN_BUF
+	LD	BC,ASYNC_PAYLOAD_LEN
+	CALL	FILL_PATTERN
+	XOR	A
+	LD	(ASYNC_AGAIN_COUNT),A
+.send_attempt
+	XOR	A				; channel 0
+	LD	DE,PATTERN_BUF
+	LD	IX,ASYNC_PAYLOAD_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL				; -> A, DE=confirmed so far
+	CP	NERR_AGAIN
+	JR	NZ,.settled
+	LD	HL,ASYNC_AGAIN_COUNT
+	INC	(HL)
+	LD	A,(HL)
+	CP	ASYNC_MAX_AGAIN
+	JR	NC,.stuck
+	LD	HL,MSG_ASYNC_AGAIN
+	CALL	PUTS
+	PUSH	DE
+	POP	HL
+	CALL	PUT_DEC_HL
+	CALL	CRLF
+	JR	.send_attempt			; resume: SAME buffer/length
+.stuck
+	LD	HL,MSG_ASYNC_STUCK
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+.settled
+	OR	A
+	JP	NZ,ERR_SEND			; prints, frees, exit 3
+.ok
+	LD	HL,MSG_SENT
+	CALL	PUTS_LN
+	LD	HL,MSG_ASYNC_AGAIN_COUNT
+	CALL	PUTS
+	LD	A,(ASYNC_AGAIN_COUNT)
+	CALL	PUT_DEC_A
+	CALL	CRLF
+.close
+	XOR	A
+	LD	B,UNET_FN_CLOSE
+	CALL	DO_CALL
+	RET
+
 ; Compare the received datagram with the payload we sent.
 ; Out: ZF=1 on an exact match. Trashes A, B, DE, HL.
 UDP_ECHO_MATCH
@@ -1160,6 +1466,8 @@ PARSE_ARGS
 	LD	(DLL_ARG_FLAG),A		; default: no -d, resolve beside the EXE
 	LD	(UDP_MODE),A			; default: TCP exercise
 	LD	(DUAL_MODE),A
+	LD	(LISTEN_MODE),A
+	LD	(ASYNC_MODE),A
 	LD	(UDP_TEST_SIZE),A
 	LD	(UDP_TEST_SIZE+1),A		; default: fixed 21-byte payload
 	; init parse state
@@ -1188,6 +1496,14 @@ PARSE_ARGS
 	LD	DE,STR_DASH_2
 	CALL	STREQ
 	JR	Z,.flag_2
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_L
+	CALL	STREQ
+	JP	Z,.flag_l
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_A
+	CALL	STREQ
+	JP	Z,.flag_a
 	JP	USAGE_EXIT			; unknown flag
 .flag_d
 	LD	DE,DLL_NAME
@@ -1245,6 +1561,20 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -2 without a data port
 	LD	A,1
 	LD	(DUAL_MODE),A
+	JP	.next_flag
+.flag_l
+	; LISTENPORT is parsed later by PARSE_DEC_TOKEN (0..9999; ample for
+	; any test port), so just capture the raw token here like -u/-2 do.
+	LD	DE,LISTEN_PORT_BUF
+	LD	C,PORT_BUFF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,USAGE_EXIT			; -l without a port
+	LD	A,1
+	LD	(LISTEN_MODE),A
+	JP	.next_flag
+.flag_a
+	LD	A,1
+	LD	(ASYNC_MODE),A
 	JP	.next_flag
 .host_is_tok
 	LD	HL,TOKEN_BUF
@@ -1588,7 +1918,8 @@ PRINT_RECV
 ; Strings
 ; ======================================================
 MSG_BANNER	DB "UNETTEST - universal network DLL smoke test",0
-MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT] [HOST [PORT]]",0
+MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT]",0
+MSG_USAGE2	DB "               [-l LISTENPORT] [-a] [HOST [PORT]]",0
 MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
 MSG_VER		DB "  v",0
@@ -1668,6 +1999,22 @@ MSG_DUAL_CTRL	DB "control reply: ",0
 MSG_DUAL_CTRL_NONE DB "control channel returned nothing",0
 DUAL_PROBE	DB "UNETTEST DUAL CONTROL",13,10
 DUAL_PROBE_LEN	EQU $ - DUAL_PROBE
+MSG_LISTEN	DB "listen on port ",0
+MSG_LISTEN_UNSUP DB "listen not supported by this backend",0
+MSG_LISTENING	DB "listening; connect a peer now (docs/UNETRTL_TESTING_RU.md)",0
+MSG_ERR_LISTEN	DB "Listen failed.",0
+MSG_LISTEN_WAITING DB "waiting for peer #",0
+MSG_LISTEN_TIMEOUT DB "no peer connected in time",0
+MSG_LISTEN_ACCEPTED DB "peer accepted",0
+MSG_LISTEN_CLOSED DB "closed (re-arms LISTEN automatically)",0
+MSG_LISTEN_PEER_CLOSED DB "peer closed after reading reply (re-armed)",0
+MSG_UNLISTENED	DB "unlisten done",0
+MSG_ASYNC_UNSUP	DB "ASYNCSEND not supported by this backend",0
+MSG_ASYNC_SETOPT_FAIL DB "SETOPT SENDSLICE failed",0
+MSG_ASYNC_CONNECT DB "connect ",0
+MSG_ASYNC_AGAIN	DB "SEND suspended (NERR_AGAIN), confirmed so far: ",0
+MSG_ASYNC_AGAIN_COUNT DB "resumes needed: ",0
+MSG_ASYNC_STUCK	DB "gave up after too many NERR_AGAIN resumes",0
 MSG_CRLF	DB 13,10,0
 
 DEF_DLL		DB "UNETRTL.DLL",0
@@ -1676,6 +2023,8 @@ DEF_PORT	DB "80",0
 STR_DASH_D	DB "-d",0
 STR_DASH_U	DB "-u",0
 STR_DASH_2	DB "-2",0
+STR_DASH_L	DB "-l",0
+STR_DASH_A	DB "-a",0
 
 REQ_HEAD	DB "HEAD / HTTP/1.0",13,10,"Host: ",0
 REQ_TAIL	DB 13,10,"Connection: close",13,10,13,10,0
@@ -1683,6 +2032,10 @@ REQ_TAIL	DB 13,10,"Connection: close",13,10,13,10,0
 ; Echo probe: sent with an explicit length, so no terminator travels.
 UDP_PAYLOAD	DB "SPRINTER UNETTEST UDP"
 UDP_PAYLOAD_LEN	EQU $ - UDP_PAYLOAD
+
+; -l reply: sent with an explicit length, so no terminator travels.
+LISTEN_REPLY	DB "UNETTEST LISTEN REPLY",13,10
+LISTEN_REPLY_LEN	EQU $ - LISTEN_REPLY
 
 	ENDMODULE
 
@@ -1738,7 +2091,11 @@ DUAL_NEXT	EQU DUAL_MODE + 1
 DUAL_BAD	EQU DUAL_NEXT + 1
 DUAL_TOTAL	EQU DUAL_BAD + 1
 DUAL_MAX_RECV	EQU DUAL_TOTAL + 2
-DEC_BUF		EQU DUAL_MAX_RECV + 2
+LISTEN_MODE	EQU DUAL_MAX_RECV + 2	; 1 = -l given
+ASYNC_MODE	EQU LISTEN_MODE + 1	; 1 = -a given
+LISTEN_RX_LEN	EQU ASYNC_MODE + 1
+ASYNC_AGAIN_COUNT	EQU LISTEN_RX_LEN + 2
+DEC_BUF		EQU ASYNC_AGAIN_COUNT + 1
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
 DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE
@@ -1746,7 +2103,8 @@ HOST_BUFF	EQU DLL_PATH + DLL_PATH_SIZE
 PORT_BUFF	EQU HOST_BUFF + HOST_BUFF_SIZE
 UDP_PORT_BUF	EQU PORT_BUFF + PORT_BUFF_SIZE
 DUAL_PORT_BUF	EQU UDP_PORT_BUF + PORT_BUFF_SIZE
-TOKEN_BUF	EQU DUAL_PORT_BUF + PORT_BUFF_SIZE
+LISTEN_PORT_BUF	EQU DUAL_PORT_BUF + PORT_BUFF_SIZE
+TOKEN_BUF	EQU LISTEN_PORT_BUF + PORT_BUFF_SIZE
 STR_BUF		EQU TOKEN_BUF + TOKEN_BUF_SIZE
 REQ_BUF		EQU STR_BUF + STR_BUF_SIZE
 RECV_BUF	EQU REQ_BUF + REQ_BUF_SIZE
@@ -1764,6 +2122,11 @@ STACK_TOP	EQU STACK_BOTTOM + 0x600
 RECV_MAX_BLOCKS	EQU 4
 UDP_MAX_TRIES	EQU 3			; 3 x 2000 ms before giving up
 DUAL_MAX_ROUNDS EQU 200			; bounded data-channel drain loop
+LISTEN_MAX_PEERS	EQU 2		; accept-serve-close twice: proves re-arm
+LISTEN_ACCEPT_TRIES	EQU 15		; 15 x 2000 ms before giving up on a peer
+ASYNC_SLICE_MS	EQU 150			; SETOPT SENDSLICE: min useful is 50
+ASYNC_PAYLOAD_LEN	EQU 1200	; > 2 TCP_MSS chunks, well under PATTERN_BUF_SIZE
+ASYNC_MAX_AGAIN	EQU 20			; bounded NERR_AGAIN resume loop
 
 	ASSERT STACK_TOP <= 0xC000
 

@@ -38,10 +38,14 @@ both in `NET.CFG`:
 RTL_HW=0/#300      pin slot + I/O base: the card has no Realtek 8019 ID
                    (its page-0 ID reads 20 01), so the auto-scan will
                    not accept it
-RTL_RESET=SOFT     skip the NE2000 board reset port at BASE+0x1F, which
-                   on this card stalls the ISA bus cycle and freezes the
-                   machine -- see HOWTO.md
 ```
+
+`RTL_RESET=SOFT` is no longer needed for it.  The NE2000 board reset
+port at `BASE+0x1F` stalls the ISA bus cycle on this card and freezes
+the machine, so the driver reads the chip ID first and pulses that port
+only for a card that identifies as a genuine Realtek.  `NETCFG -i`
+reports `[W03] non-Realtek clone: board reset port skipped` when it
+takes the safe path.  See `HOWTO.md` for the explicit overrides.
 
 ## Installing on Sprinter DSS
 
@@ -143,7 +147,26 @@ ifconfig feth1
 Launch MAME pointing at `feth0` (the wire-side end).  The
 launcher script
 `/Users/dmitry/dev/zx/sprinter/mame/run_sprinter_rtl8019as.sh`
-reads `MAME_RTL_NIC` from the environment (default `feth0`).
+only prints the requested NIC name; the actual pcap interface
+is selected once via MAME's own UI (Tab -> Network Devices)
+and persisted in `cfg/sprinter.cfg`.
+
+The script's built-in disks (`sp_hdd_sys.chd`/`sp_hdd_media.chd`)
+are a shared, persistent Sprinter DSS desktop used across
+projects -- it does NOT include this repo's build.  Attach the
+freshly built floppy image explicitly, appended after the
+script's own arguments (a later `-flop2` overrides the script's
+built-in one, which otherwise holds an unrelated utility disk on
+the same 3.5" HD drive):
+
+```sh
+run_sprinter_rtl8019as.sh -networkprovider pcap \
+  -flop2 /Users/dmitry/dev/zx/sprinter/sprinter-rtl8019a/distr/sprinter-rtl8019a.img
+```
+
+DSS then sees the build on drive `B:` -- work from there directly
+(it already carries every utility and `NETSMPL.CFG`).  See
+`docs/MAME_NETWORK.md` for the full setup.
 
 `/dev/bpf*` permissions are required for `pcap` to work.
 First run typically needs:

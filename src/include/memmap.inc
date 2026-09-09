@@ -116,14 +116,23 @@ CMDL_SOURCE_PTR		EQU CMDL_BSS_BASE + 0x31	; 2 bytes
 RTL_TX_SOURCE_PTR	EQU LIBBSS_BASE + 0x134	; 2 bytes, caller's frame buffer
 RTL_TX_LENGTH		EQU LIBBSS_BASE + 0x136	; 2 bytes
 RTL_TX_RETRY_LEFT	EQU LIBBSS_BASE + 0x138	; 1 byte
-; RTL_SOFT_RESET: nonzero -> RTL.RESET must NOT touch the NE2000
-; board reset port at BASE+0x1F.  Some NE2000 clones stall the ISA
-; cycle on that port and a bus cycle that never completes cannot be
-; timed out in software, so this is a configuration choice (NET.CFG
-; RTL_RESET=SOFT -> env NET_RTL_RESET), never a runtime probe.
+; RTL_SOFT_RESET: how RTL.RESET is allowed to reach the NE2000 board
+; reset port at BASE+0x1F.  Some NE2000 clones stall the ISA cycle on
+; that port, and a bus cycle that never completes cannot be timed out
+; in software -- the machine simply dies, with no diagnostic.  Three
+; states (NET.CFG RTL_RESET= -> env NET_RTL_RESET -> here):
+;   RTL_RESET_HARD (0)  pulse BASE+0x1F, the standard NE2000 bring-up
+;   RTL_RESET_SOFT (1)  never touch BASE+0x1F; stop the core via CR
+;   RTL_RESET_AUTO (2)  default: hard only if the chip identifies as a
+;                       genuine Realtek RTL8019AS, soft otherwise
+; RESET resolves AUTO in place (writes back 0 or 1) so the ID probe
+; runs once per session and apps can report which path was taken.
 ; Placed in the 0x139..0x13F gap so LIBBSS_SIZE -- and with it every
 ; literal BSS offset in src/dll/unetrtl.asm -- stays unchanged.
 RTL_SOFT_RESET	EQU LIBBSS_BASE + 0x139	; 1 byte
+RTL_RESET_HARD	EQU 0
+RTL_RESET_SOFT	EQU 1
+RTL_RESET_AUTO	EQU 2
 RTL_TX_VERIFY_BUF	EQU LIBBSS_BASE + 0x140	; 42 bytes read back from NIC packet RAM
 RTL_TX_VERIFY_SIZE	EQU 42
 RTL_TX_LAST_CLDA	EQU LIBBSS_BASE + 0x16A	; 2 bytes, page-0 CLDA0/1 after TX
@@ -262,6 +271,12 @@ TCP_SEND_SEQ		EQU TCP_BSS_BASE + 0x2D	; 4 bytes (BE sequence used by retries)
 TCP_SEND_RETRY_LEFT	EQU TCP_BSS_BASE + 0x31	; 1 byte
 TCP_RECV_UNACKED	EQU TCP_BSS_BASE + 0x32	; 1 byte (full-context DLL build)
 TCP_RECV_TIMEOUT	EQU TCP_BSS_BASE + 0x33	; 2 bytes (one-shot override)
+; Milliseconds left in the CURRENT SEND_ATTEMPTS attempt (USE_TCP_ASYNCSEND).
+; Inside the swap tail like the rest of the ACK-wait scratch above: an
+; ASYNCSEND transaction can be resumed after SELECT_CHANNEL swapped to
+; the other channel and back, so the remaining per-attempt budget must
+; travel with the channel, not live as session-global scratch.
+TCP_ATTEMPT_MS_LEFT	EQU TCP_BSS_BASE + 0x35	; 2 bytes
 ; Multichannel (USE_TCP_MULTICHAN): BUILD_ACK's advertised window
 ; becomes runtime state here instead of the fixed TCP_RECV_WIN_HI/LO
 ; constant, so an ACK built while processing a FOREIGN channel's
@@ -280,14 +295,14 @@ TCP_RECV_TIMEOUT	EQU TCP_BSS_BASE + 0x33	; 2 bytes (one-shot override)
 ; channel opened second inherit the zeroed slot's window 0, so its
 ; very first ACK advertised a closed window and the peer stalled after
 ; the in-flight bytes.)
-TCP_ADV_WIN_HI		EQU TCP_BSS_BASE + 0x35	; 1 byte
-TCP_ADV_WIN_LO		EQU TCP_BSS_BASE + 0x36	; 1 byte
+TCP_ADV_WIN_HI		EQU TCP_BSS_BASE + 0x37	; 1 byte
+TCP_ADV_WIN_LO		EQU TCP_BSS_BASE + 0x38	; 1 byte
 
 ; Length of SELECT_CHANNEL's second swap slice: TCP_ACK_WAIT_STATE
-; (0x28) .. TCP_RECV_TIMEOUT+1 (0x34) inclusive.  Deliberately NOT
-; TCP_BSS_SIZE-0x28: everything appended after TCP_RECV_TIMEOUT is
+; (0x28) .. TCP_ATTEMPT_MS_LEFT+1 (0x36) inclusive.  Deliberately NOT
+; TCP_BSS_SIZE-0x28: everything appended after TCP_ATTEMPT_MS_LEFT is
 ; session-global and must stay out of the per-channel swap.
-TCP_SWAP_TAIL_SIZE	EQU 13		; 0x28..0x34
+TCP_SWAP_TAIL_SIZE	EQU 15		; 0x28..0x36
 
 ; Total per-session TCP state size; copied wholesale by
 ; TCP.SAVE_CTX / TCP.RESTORE_CTX so apps can multiplex
@@ -298,7 +313,7 @@ TCP_CTX_SIZE		EQU 38		; 0x26: TCP_STATE .. TCP_RX_DATA_LEN+1
 
 ; Entire tcp_lib BSS span including non-context scratch above.
 ; Literal for relocatable DLL builds; never derive this from addresses.
-TCP_BSS_SIZE		EQU 55		; 0x37 bytes
+TCP_BSS_SIZE		EQU 57		; 0x39 bytes
 
 ; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + MSS(536)
 ; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF
