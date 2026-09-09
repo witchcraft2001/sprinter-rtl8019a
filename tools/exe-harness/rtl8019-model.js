@@ -56,8 +56,12 @@ class Rtl8019 {
     };
     this.promLayout = scenario.promLayout || 'direct';
     this.prom = buildProm(this.mac, this.promLayout, scenario.promSignature);
-    this.id0 = this.variant === 'UM9003' ? 0xff : 0x50;
-    this.id1 = this.variant === 'UM9003' ? 0xff : 0x70;
+    // 8019ID0/ID1.  A real UM9003AF answers 0x20/0x01, measured on the
+    // card -- NOT 0xff, which is also the open-bus value and would let a
+    // "clone rejected" test pass for the wrong reason (absent card rather
+    // than wrong signature).
+    this.id0 = this.variant === 'UM9003' ? 0x20 : 0x50;
+    this.id1 = this.variant === 'UM9003' ? 0x01 : 0x70;
 
     // Page-0 registers (write side / configured value).
     this.cr = 0x21; // PAGE0_STOP

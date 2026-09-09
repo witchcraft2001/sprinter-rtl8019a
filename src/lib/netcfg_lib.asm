@@ -229,7 +229,9 @@ APPLY_DEFAULTS
 	LD	(DHCP_MODE),A
 	; RTL_HW also defaults empty -- driver will auto-scan.
 	LD	(OUR_RTL_HW),A
-	; RTL_RESET defaults to the standard NE2000 board reset.
+	; No RTL_RESET= line means AUTO: the driver decides from the chip
+	; ID whether the board reset port at BASE+0x1F may be touched.
+	LD	A,RTL_RESET_AUTO
 	LD	(OUR_RTL_RESET),A
 	RET
 
@@ -405,17 +407,31 @@ PARSE
 	CALL	PARSE_HW_LINE
 	JP	.LINE
 .RESET
-	; RTL_RESET=SOFT -> skip the board reset port at BASE+0x1F.
-	; Any other value (or an absent key) keeps the hard reset.
+	; RTL_RESET=SOFT  -> never touch the board reset port at BASE+0x1F.
+	; RTL_RESET=<any other non-empty value, e.g. HARD> -> force the
+	; standard NE2000 board reset even on a chip that does not report
+	; the Realtek ID.  An empty value falls back to AUTO, same as an
+	; absent key -- see the default in LOAD_DEFAULTS.
 	LD	BC,10			; len("RTL_RESET=")
 	ADD	HL,BC
 	CALL	SKIP_WS
+	; SKIP_WS stops on CR/LF/NUL, so all three mean "key present but
+	; no value" -- treat that exactly like an absent key.
 	LD	A,(HL)
-	AND	0xDF			; crude upcase; 0 stays 0
+	OR	A
+	JR	Z,.RESET_AUTO
+	CP	13
+	JR	Z,.RESET_AUTO
+	CP	10
+	JR	Z,.RESET_AUTO
+	AND	0xDF			; crude upcase
 	CP	'S'
-	LD	A,0
+	LD	A,RTL_RESET_HARD
 	JR	NZ,.RESET_STORE
-	INC	A
+	LD	A,RTL_RESET_SOFT
+	JR	.RESET_STORE
+.RESET_AUTO
+	LD	A,RTL_RESET_AUTO
 .RESET_STORE
 	LD	(OUR_RTL_RESET),A
 	; Every key handler must leave HL on the next line before

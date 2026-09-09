@@ -105,6 +105,28 @@ const dllScenario = (extra = {}) => ({
   assert.match(r.output, /udp echo ok/);
   count();
 }
+{ // -u one byte past UDPLIB_MAX_PAYLOAD: the backend rejects it locally
+  // with NERR_PARAM (09) BEFORE opening the ISA window, so nothing may
+  // reach the wire.  Belongs here rather than in a real-hardware run:
+  // the check never touches the chip, so a live card proves nothing the
+  // harness cannot, and here the "no frame transmitted" half is an
+  // assertion instead of an eyeballed silent terminal.
+  const r = run('UNETTEST', '-u 7777 1473 192.168.7.1', dllScenario({
+    responders: { arp: arpToServer, udp: { port: 7777 } },
+  }));
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, /udp payload: 1473 bytes/);
+  assert.match(r.output, /Send failed\./);
+  assert.match(r.output, /st=SEND nerr=09/);
+  // Only ARP resolution may have gone out; no UDP datagram.
+  const udpFrames = r.transmittedFrames.filter((f) => {
+    const b = typeof f === 'string' ? Buffer.from(f, 'hex') : Buffer.from(f);
+    return b.length > 23 && b[12] === 0x08 && b[13] === 0x00 && b[23] === 17;
+  });
+  assert.strictEqual(udpFrames.length, 0,
+    'an over-length UDP payload must be rejected before anything is transmitted');
+  count();
+}
 { // -l arms LISTEN, times out on both bounded accept waits (the harness
   // peer never dials in -- docs/UNETRTL_TESTING_RU.md scenario D covers
   // a real inbound accept), then UNLISTENs cleanly.
@@ -137,6 +159,51 @@ const dllScenario = (extra = {}) => ({
   }));
   assert.strictEqual(r.exitCode, 3);
   assert.match(r.output, /Connect failed\./);
+  count();
+}
+
+// ---------------------------------------------------------------------
+// Board reset port on a non-Realtek clone.
+//
+// UNETRTL.DLL has no image budget for the chip-ID probe that resolves
+// RTL_RESET_AUTO in the .EXE builds, so it defaults to SOFT instead: the
+// same safe direction, reached by a different route.  This is the DLL half
+// of the regression that hung a real Sprinter -- F_NETINIT calls RTL.RESET
+// straight after INIT_BASE, so a clone that stalls BASE+0x1F used to take
+// the whole machine down before the first ABI call returned.
+// ---------------------------------------------------------------------
+const clone = { quirks: { variant: 'UM9003', hangOnResetPort: true } };
+{ // no NET_RTL_RESET published at all -> must still come up
+  const r = run('UNETTEST', '192.168.7.1 80', dllScenario({
+    ...clone, responders: { arp: arpToServer, tcp: { body: 'hi', status: 200 } },
+  }));
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /NETINIT ok/);
+  assert.match(r.output, /HTTP\/1\.1 200 OK/);
+  count();
+}
+{ // NETCFG's published SOFT reaches the DLL the same way
+  const base = dllScenario({
+    ...clone, responders: { arp: arpToServer, tcp: { body: 'hi', status: 200 } },
+  });
+  const r = run('UNETTEST', '192.168.7.1 80', {
+    ...base, environment: { ...base.environment, NET_RTL_RESET: 'SOFT' },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /NETINIT ok/);
+  count();
+}
+{ // ...and an explicit HARD still forces the pulse, proving the DLL reads
+  // the variable rather than ignoring the port unconditionally
+  const base = dllScenario({
+    ...clone, responders: { arp: arpToServer, tcp: { body: 'hi', status: 200 } },
+  });
+  assert.throws(
+    () => run('UNETTEST', '192.168.7.1 80', {
+      ...base, environment: { ...base.environment, NET_RTL_RESET: 'HARD' },
+    }),
+    /reset port BASE\+0x1F read/,
+  );
   count();
 }
 

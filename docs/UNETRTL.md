@@ -34,14 +34,22 @@ kit -- `NET_IP` and `NET_MAC` set but no `NET` at all -- is still
 accepted.
 
 The DLL locates the card the same way every utility does, through
-`NET_RTL_HW`, and **honours `NET_RTL_RESET=SOFT`** (from `RTL_RESET=SOFT`
-in `NET.CFG`, see `HOWTO.TXT`).  That matters: on a clone whose NE2000
-board reset port stalls the ISA bus cycle, a DLL doing the hard reset
-freezes the machine the moment a consumer initialises the network, with
-no diagnostic of any kind.  Builds up to 0.2.54 had the soft path
-compiled out of the DLL for image-budget reasons and did exactly that;
-0.2.55 fixed it by excluding driver entry points the DLL never calls
-instead.
+`NET_RTL_HW`, and **honours `NET_RTL_RESET`**.  That matters: on a clone
+whose NE2000 board reset port stalls the ISA bus cycle, a DLL doing the
+hard reset freezes the machine the moment a consumer initialises the
+network, with no diagnostic of any kind.  Builds up to 0.2.54 had the
+soft path compiled out of the DLL for image-budget reasons and did
+exactly that; 0.2.55 fixed it by excluding driver entry points the DLL
+never calls instead.
+
+The `.EXE` utilities decide for themselves when `NET_RTL_RESET` is
+absent: they read the chip ID and pulse `BASE+0x1F` only for a genuine
+Realtek.  **The DLL cannot** -- the image has single-digit bytes of
+headroom, and the ID probe does not fit.  It defaults to the soft path
+instead, which is the same safe direction reached by a cheaper route,
+and `NETCFG -i` publishes `NET_RTL_RESET=SOFT` after it meets a clone so
+the DLL normally gets an explicit answer anyway.  An explicit
+`RTL_RESET=HARD` is still honoured here.
 
 ## Loading
 

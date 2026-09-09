@@ -38,10 +38,14 @@ both in `NET.CFG`:
 RTL_HW=0/#300      pin slot + I/O base: the card has no Realtek 8019 ID
                    (its page-0 ID reads 20 01), so the auto-scan will
                    not accept it
-RTL_RESET=SOFT     skip the NE2000 board reset port at BASE+0x1F, which
-                   on this card stalls the ISA bus cycle and freezes the
-                   machine -- see HOWTO.md
 ```
+
+`RTL_RESET=SOFT` is no longer needed for it.  The NE2000 board reset
+port at `BASE+0x1F` stalls the ISA bus cycle on this card and freezes
+the machine, so the driver reads the chip ID first and pulses that port
+only for a card that identifies as a genuine Realtek.  `NETCFG -i`
+reports `[W03] non-Realtek clone: board reset port skipped` when it
+takes the safe path.  See `HOWTO.md` for the explicit overrides.
 
 ## Installing on Sprinter DSS
 

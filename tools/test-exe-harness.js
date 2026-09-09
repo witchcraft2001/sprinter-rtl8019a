@@ -182,6 +182,55 @@ for (const base of [0x200, 0x320, 0x3e0]) {
   assert.match(r.output, /RESULT FAIL/);
   checkCleanup(r);
 }
+// ---------------------------------------------------------------------
+// Board reset port (BASE+0x1F) vs non-Realtek clones.
+//
+// A UM9003AF stalls the ISA cycle on that port: the Z80 stops inside the
+// bus cycle, so no software timeout can recover and the machine simply
+// dies with nothing on screen.  The driver therefore refuses to touch
+// BASE+0x1F unless the chip identifies itself as a genuine Realtek
+// RTL8019AS (RTL_RESET_AUTO, the default).  hangOnResetPort models the
+// stall as a throw, so "did not throw" IS the assertion here.
+// ---------------------------------------------------------------------
+const cloneHangs = {
+  quirks: { variant: 'UM9003', hangOnResetPort: true },
+  environment: { NET_RTL_HW: '1/#300' },
+};
+{ // the regression: a clone with no NET_RTL_RESET at all must not hang
+  const r = run('NICINFO', '', cloneHangs);
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /RESULT OK/);
+  checkCleanup(r);
+}
+{ // an explicit SOFT reaches the same place, and says so
+  const r = run('NICINFO', '', {
+    ...cloneHangs, environment: { ...cloneHangs.environment, NET_RTL_RESET: 'SOFT' },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /\[W02\] soft reset: port 1F skipped/);
+  assert.match(r.output, /RESULT OK/);
+  checkCleanup(r);
+}
+{ // AUTO must not degrade into "always soft": a genuine Realtek still
+  // gets the board reset, which this card models as a stall so the
+  // throw proves the hard path really ran.
+  assert.throws(
+    () => run('NICINFO', '', {
+      quirks: { hangOnResetPort: true }, environment: { NET_RTL_HW: '1/#300' },
+    }),
+    /reset port BASE\+0x1F read/,
+  );
+  count();
+}
+{ // RTL_RESET=HARD is the escape hatch: force the pulse on a clone
+  assert.throws(
+    () => run('NICINFO', '', {
+      ...cloneHangs, environment: { ...cloneHangs.environment, NET_RTL_RESET: 'HARD' },
+    }),
+    /reset port BASE\+0x1F read/,
+  );
+  count();
+}
 { // no card at all on either slot/base
   const r = run('NICINFO', '', { cardPresent: false });
   assert.strictEqual(r.exitCode, 2);

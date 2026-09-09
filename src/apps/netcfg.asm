@@ -369,14 +369,20 @@ DO_INIT
 	LD	HL,N_NET_RTL_HW
 	LD	IX,@NETCFG.OUR_RTL_HW
 	CALL	SETENV_STR
-	; RTL_RESET: publish NET_RTL_RESET=SOFT only when NET.CFG asked
-	; for it; otherwise push the empty string so SETENV_STR deletes
-	; any stale variable and the driver reverts to the hard reset.
+	; RTL_RESET: publish the mode NET.CFG asked for.  AUTO (no
+	; RTL_RESET= line) pushes the empty string so SETENV_STR deletes
+	; any stale variable and every utility re-derives the mode from
+	; the chip ID, exactly as this run is about to.
 	LD	IX,V_RESET_NONE
 	LD	A,(@NETCFG.OUR_RTL_RESET)
-	OR	A
-	JR	Z,.RESET_ENV
+	CP	RTL_RESET_SOFT
+	JR	NZ,.RESET_NOT_SOFT
 	LD	IX,V_RESET_SOFT
+	JR	.RESET_ENV
+.RESET_NOT_SOFT
+	CP	RTL_RESET_HARD
+	JR	NZ,.RESET_ENV
+	LD	IX,V_RESET_HARD
 .RESET_ENV
 	LD	HL,N_NET_RTL_RESET
 	CALL	SETENV_STR
@@ -384,6 +390,31 @@ DO_INIT
 	; If NET.CFG had no RTL_MAC= line (or it was empty), the MAC
 	; field is all-zero -- read the PROM and use that.
 	CALL	FILL_MAC_FROM_PROM
+	PUSH	AF
+	; FILL_MAC_FROM_PROM ran RTL.RESET, which resolves an AUTO mode in
+	; place.  If it came back SOFT while NET.CFG said nothing, the card
+	; did not identify as a Realtek and the board reset port was skipped
+	; on the driver's own judgement.  Say so: it is the difference
+	; between a card that works and a machine that hangs, and the user
+	; has no other way to find out which happened.
+	LD	A,(@NETCFG.OUR_RTL_RESET)
+	CP	RTL_RESET_AUTO
+	JR	NZ,.RESET_REPORTED
+	LD	A,(RTL_SOFT_RESET)
+	CP	RTL_RESET_SOFT
+	JR	NZ,.RESET_REPORTED
+	PRINTLN MSG_CLONE_RESET
+	; Latch the answer in the environment.  Only the SOFT outcome is
+	; published: it is the safe direction, it saves every later utility
+	; the ID probe, and it is the one UNETRTL.DLL cannot work out for
+	; itself.  A HARD outcome deliberately leaves the variable deleted
+	; so the next utility re-probes -- otherwise swapping a Realtek for
+	; a clone would carry a stale "HARD" over and hang the machine.
+	LD	HL,N_NET_RTL_RESET
+	LD	IX,V_RESET_SOFT
+	CALL	SETENV_STR
+.RESET_REPORTED
+	POP	AF
 	; A = 0, or the exit code for why no MAC could be obtained.  Without
 	; NET_MAC nothing downstream can run, so this is fatal: NETCFG's job
 	; is to leave a usable environment behind, and it did not.  Report
@@ -916,6 +947,7 @@ MSG_USAGE_ERR	DB "[E] usage: unknown or malformed flag",0
 MSG_E_NO_CARD	DB "[E2] card not found; check RTL_HW in NET.CFG",0
 MSG_E_PROM	DB "[E3] card found but PROM read failed",0
 MSG_E_NO_MAC	DB "[E4] no MAC in card PROM; add RTL_MAC= to NET.CFG",0
+MSG_CLONE_RESET	DB "[W03] non-Realtek clone: board reset port skipped",0
 MSG_HELP
 	DB "Usage:",13,10
 	DB "  NETCFG          show current NET_* env values",13,10
@@ -947,6 +979,7 @@ N_NET		DB "NET",0
 ; bogus "SOFT : <not set>" row, and V_RESET_NONE (an empty string) read
 ; as the table terminator, hiding NET from the listing entirely.
 V_RESET_SOFT	DB "SOFT",0
+V_RESET_HARD	DB "HARD",0
 V_RESET_NONE	DB 0
 V_STATIC	DB "STATIC",0
 V_DHCP		DB "DHCP",0

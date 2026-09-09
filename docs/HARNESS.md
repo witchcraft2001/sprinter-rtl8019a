@@ -85,13 +85,19 @@ code was 0.
   promLayout: 'direct',     // 'direct' | 'doubled' | 'unknown'
   promSignature: 0x57,      // 0x57 ('W','W') or 0x42 ('B','B')
   quirks: {
-    variant: 'RTL8019AS',   // or 'UM9003' (id0/id1 read as 0xFF)
+    variant: 'RTL8019AS',   // or 'UM9003' (id0/id1 read as 0x20/0x01,
+                             // measured on the card -- not 0xFF, which is
+                             // the open-bus value an absent card gives)
     loopbackToRing: true,   // MAME: loopback frame lands in the RX ring + PRX.
                              // false: real-HW FIFO/RSR path (no PRX).
     isrRstOnStop: false,    // MAME: STP alone does not set ISR.RST.
                              // true: real HW sets it immediately.
-    hangOnResetPort: false, // UM9003-style clone: reading BASE+0x1F throws
-                             // (proves the driver honours NET_RTL_RESET=SOFT).
+    hangOnResetPort: false, // UM9003-style clone: reading BASE+0x1F throws.
+                             // Models a stalled ISA cycle, which on real
+                             // hardware freezes the machine outright, so
+                             // "did not throw" is the assertion.  Used to
+                             // prove the driver only pulses that port on a
+                             // card that reports the Realtek ID.
   },
   config: { cfg0, cfg1, cfg2, cfg3, cfg4 }, // page-3 CONFIG raw bytes
   txError: true,             // or {attempts:[1,2]} to fail specific TXP attempts

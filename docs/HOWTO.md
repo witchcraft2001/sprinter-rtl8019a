@@ -144,7 +144,9 @@ RTL_HW=1/#300             ISA slot + I/O base ("S/HHH"); accept
                           omit to auto-scan
 RTL_RESET=SOFT            skip the board reset port at BASE+0x1F
                           (some NE2000 clones stall the ISA cycle
-                          there); omit for the standard hard reset
+                          there); RTL_RESET=HARD always pulses it;
+                          omit to let the driver decide from the
+                          chip ID -- this is what you want
 DNS1=1.1.1.1              ignored when IP=DHCP
 DNS2=8.8.8.8              ignored when IP=DHCP
 NTP=pool.ntp.org          for NTP.EXE
@@ -153,7 +155,7 @@ TZ=+3                     signed integer hours
 
 Lines starting with `#` are comments; unknown keys are ignored.
 
-### `RTL_RESET=SOFT`
+### `RTL_RESET`
 
 The standard NE2000 bring-up pulses the board reset port at
 `BASE+0x1F` before programming the controller.  Some NE2000-compatible
@@ -162,15 +164,34 @@ A bus cycle that never finishes cannot be timed out in software, so
 the symptom is a dead machine right after a utility prints
 `[N1] RESET` -- not an error message.
 
-`RTL_RESET=SOFT` makes the driver skip `BASE+0x1F` entirely.  It stops
-the controller through `CR`, waits the same 2 ms, clears `ISR`, and
-lets `INIT_NORMAL` program every remaining register from scratch --
-which it does unconditionally anyway, so no state is lost beyond the
-cleaner starting point a real reset pulse guarantees.  Utilities print
-`[W02] soft reset: port 1F skipped.` while it is active.
+**Leave the key out.**  With no `RTL_RESET=` line the driver reads the
+chip ID before it goes anywhere near that port, and pulses `BASE+0x1F`
+only when the card answers with the Realtek signature `Pp`.  Anything
+else -- a UMC UM9003AF, any other clone, or an ID that comes back
+garbled -- takes the soft path instead.  The asymmetry is the whole
+argument: a hard reset on a clone kills the machine with nothing on
+screen, while a soft reset on a genuine Realtek costs only a cleaner
+starting state that `INIT_NORMAL` re-establishes anyway.
 
-Use it only for a card that actually hangs; the hard reset stays the
-default because it recovers a controller left in a bad state.
+`NETCFG -i` reports the outcome when the card turns out to be a clone:
+
+```text
+[W03] non-Realtek clone: board reset port skipped
+```
+
+and publishes `NET_RTL_RESET=SOFT` so every later utility, and
+`UNETRTL.DLL` in particular, skips the probe and inherits the answer.
+A Realtek deliberately leaves the variable unset, so swapping the card
+for a clone later cannot carry a stale `HARD` over into a freeze.
+
+The two explicit values are overrides you should not normally need:
+
+- `RTL_RESET=SOFT` never touches `BASE+0x1F`.  It stops the controller
+  through `CR`, waits the same 2 ms, and clears `ISR`.  Utilities print
+  `[W02] soft reset: port 1F skipped.` while it is active.
+- `RTL_RESET=HARD` always pulses `BASE+0x1F`, even on a card that does
+  not report the Realtek ID.  Use it only for a clone that genuinely
+  needs the pulse; on a card that stalls there it freezes the machine.
 
 `NETCFG -i` sets `NET_IP_SRC` to `STATIC` or `DHCP` based on the
 `IP=` line.  In DHCP mode it deletes any stale `NET_IP / NET_MASK

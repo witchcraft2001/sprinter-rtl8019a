@@ -467,6 +467,40 @@ const NET_CFG_SAMPLE = 'IP=192.168.7.2\r\nNETMASK=255.255.255.0\r\nGATEWAY=192.1
   assert.strictEqual(r.environment.NET_IP, '192.168.7.2');
   count();
 }
+{ // A NET.CFG with no RTL_RESET= line on a clone that stalls BASE+0x1F.
+  // This is the exact configuration that hung a real Sprinter: the fix is
+  // that the driver resolves the mode from the chip ID instead of trusting
+  // the absent key, and NETCFG then latches the answer for everything that
+  // runs later (UNETRTL.DLL above all -- it has no room for the ID probe).
+  const r = run('NETCFG', '-i', {
+    ...netcfgFiles('IP=192.168.7.2\r\nRTL_HW=1/#300\r\n'),
+    quirks: { variant: 'UM9003', hangOnResetPort: true },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /\[W03\] non-Realtek clone: board reset port skipped/);
+  assert.strictEqual(r.environment.NET_RTL_RESET, 'SOFT');
+  count();
+}
+{ // A genuine Realtek leaves NET_RTL_RESET deleted, so the next utility
+  // re-probes rather than inheriting a stale HARD across a card swap.
+  const r = run('NETCFG', '-i', netcfgFiles('IP=192.168.7.2\r\nRTL_HW=1/#300\r\n'));
+  assert.strictEqual(r.exitCode, 0);
+  assert.doesNotMatch(r.output, /\[W03\]/);
+  assert.strictEqual(r.environment.NET_RTL_RESET, undefined);
+  count();
+}
+{ // RTL_RESET=SOFT in NET.CFG still publishes SOFT verbatim
+  const r = run('NETCFG', '-i', netcfgFiles('IP=192.168.7.2\r\nRTL_RESET=SOFT\r\n'));
+  assert.strictEqual(r.exitCode, 0);
+  assert.strictEqual(r.environment.NET_RTL_RESET, 'SOFT');
+  count();
+}
+{ // RTL_RESET=HARD forces the pulse and is published as such
+  const r = run('NETCFG', '-i', netcfgFiles('IP=192.168.7.2\r\nRTL_RESET=HARD\r\n'));
+  assert.strictEqual(r.exitCode, 0);
+  assert.strictEqual(r.environment.NET_RTL_RESET, 'HARD');
+  count();
+}
 { // -c on a missing file
   const r = run('NETCFG', '-c', { appDir: NETCFG_APPDIR });
   assert.strictEqual(r.exitCode, 4);

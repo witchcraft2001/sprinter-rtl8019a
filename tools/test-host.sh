@@ -17,7 +17,7 @@ for tool in "${required_tools[@]}"; do
 done
 
 bash -n "$script_dir/artifacts.sh" "$script_dir/build.sh" "$script_dir/image.sh" \
-  "$script_dir/package.sh" "$script_dir/test-host.sh"
+  "$script_dir/package.sh" "$script_dir/test-host.sh" "$script_dir/dev/real_hw_prep.sh"
 
 node --check "$script_dir/exe-harness/Z80core.js"
 node --check "$script_dir/exe-harness/rtl8019-model.js"
@@ -30,10 +30,11 @@ node --check "$script_dir/test-exe-net.js"
 node --check "$script_dir/test-exe-tcp.js"
 node --check "$script_dir/test-exe-dll.js"
 
+# Every dev script, not a hand-kept subset: the responders are edited as
+# often as the tests that use them, and a syntax error in one only shows
+# up mid-session on the test stand otherwise.
 python3 -c 'import ast,sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' \
-  "$script_dir/dev/unettest_tcp_probe.py" "$script_dir/dev/test_unettest_tcp_probe.py" \
-  "$script_dir/dev/unettest_listen_client.py" "$script_dir/dev/unettest_asyncsend_stall.py" \
-  "$script_dir/dev/unettest_listen_timing.py" "$script_dir/dev/unettest_listen_capture.py"
+  "$script_dir"/dev/*.py
 
 # Integrity: the vendored Z80 interpreter must match the pinned checksum in
 # THIRD_PARTY.md. A drift here means someone edited or replaced the file

@@ -116,14 +116,23 @@ CMDL_SOURCE_PTR		EQU CMDL_BSS_BASE + 0x31	; 2 bytes
 RTL_TX_SOURCE_PTR	EQU LIBBSS_BASE + 0x134	; 2 bytes, caller's frame buffer
 RTL_TX_LENGTH		EQU LIBBSS_BASE + 0x136	; 2 bytes
 RTL_TX_RETRY_LEFT	EQU LIBBSS_BASE + 0x138	; 1 byte
-; RTL_SOFT_RESET: nonzero -> RTL.RESET must NOT touch the NE2000
-; board reset port at BASE+0x1F.  Some NE2000 clones stall the ISA
-; cycle on that port and a bus cycle that never completes cannot be
-; timed out in software, so this is a configuration choice (NET.CFG
-; RTL_RESET=SOFT -> env NET_RTL_RESET), never a runtime probe.
+; RTL_SOFT_RESET: how RTL.RESET is allowed to reach the NE2000 board
+; reset port at BASE+0x1F.  Some NE2000 clones stall the ISA cycle on
+; that port, and a bus cycle that never completes cannot be timed out
+; in software -- the machine simply dies, with no diagnostic.  Three
+; states (NET.CFG RTL_RESET= -> env NET_RTL_RESET -> here):
+;   RTL_RESET_HARD (0)  pulse BASE+0x1F, the standard NE2000 bring-up
+;   RTL_RESET_SOFT (1)  never touch BASE+0x1F; stop the core via CR
+;   RTL_RESET_AUTO (2)  default: hard only if the chip identifies as a
+;                       genuine Realtek RTL8019AS, soft otherwise
+; RESET resolves AUTO in place (writes back 0 or 1) so the ID probe
+; runs once per session and apps can report which path was taken.
 ; Placed in the 0x139..0x13F gap so LIBBSS_SIZE -- and with it every
 ; literal BSS offset in src/dll/unetrtl.asm -- stays unchanged.
 RTL_SOFT_RESET	EQU LIBBSS_BASE + 0x139	; 1 byte
+RTL_RESET_HARD	EQU 0
+RTL_RESET_SOFT	EQU 1
+RTL_RESET_AUTO	EQU 2
 RTL_TX_VERIFY_BUF	EQU LIBBSS_BASE + 0x140	; 42 bytes read back from NIC packet RAM
 RTL_TX_VERIFY_SIZE	EQU 42
 RTL_TX_LAST_CLDA	EQU LIBBSS_BASE + 0x16A	; 2 bytes, page-0 CLDA0/1 after TX

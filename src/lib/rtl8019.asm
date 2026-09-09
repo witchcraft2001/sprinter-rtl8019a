@@ -489,14 +489,31 @@ N_RTL_HW	DB "NET_RTL_HW",0
 	IFDEF	RTL_SOFT_RESET_SUPPORTED
 ; ------------------------------------------------------
 ; READ_RESET_MODE: set RTL_SOFT_RESET from env NET_RTL_RESET
-; (written by NETCFG from net.cfg's RTL_RESET= line).  Any value
-; starting with 'S'/'s' selects the soft path; anything else --
-; including an absent variable -- keeps the standard NE2000 board
-; reset.  ISA must be CLOSED (this issues a DSS call).
+; (written by NETCFG from net.cfg's RTL_RESET= line).  A value
+; starting with 'S'/'s' forces the soft path; any other non-empty
+; value forces the standard NE2000 board reset; an absent or empty
+; variable selects AUTO, which RESET resolves from the chip ID.
+;
+; AUTO is the default because getting this wrong is not symmetric: a
+; hard reset on a clone that stalls BASE+0x1F kills the machine with
+; no diagnostic, while a soft reset on a genuine Realtek only skips a
+; cleaner starting state that INIT_NORMAL re-establishes anyway.
+;
+; UNETRTL.DLL has no room for the ID probe (8 bytes of image budget
+; left), so it defaults to SOFT instead of AUTO -- same safe direction,
+; and NETCFG normally publishes an explicit mode before any DLL
+; consumer runs.
+; ISA must be CLOSED (this issues a DSS call).
 ; Trashes A, BC, DE, HL.
 ; ------------------------------------------------------
+	IFDEF	UNET_DLL
+RESET_MODE_DEFAULT	EQU RTL_RESET_SOFT
+	ELSE
+RESET_MODE_DEFAULT	EQU RTL_RESET_AUTO
+	ENDIF
+
 READ_RESET_MODE
-	XOR	A
+	LD	A,RESET_MODE_DEFAULT
 	LD	(RTL_SOFT_RESET),A
 	LD	HL,N_RTL_RESET
 	LD	DE,NETENV_VAL_BUF
@@ -504,14 +521,24 @@ READ_RESET_MODE
 	LD	C,DSS_ENVIRON
 	RST	DSS
 	OR	A			; A=0xFF found, 0 not
-	RET	Z
+	RET	Z			; not set -> keep the default
 	LD	A,(NETENV_VAL_BUF)
 	AND	0xDF			; crude upcase; 0 stays 0
+	RET	Z			; set but empty -> keep the default
+	; 'S' forces SOFT; anything else forces the board reset.  The
+	; latter is the escape hatch for a clone that genuinely needs the
+	; pulse but cannot report the Realtek ID -- RTL_RESET=HARD.
 	CP	'S'
-	RET	NZ
-	LD	A,1
+	LD	A,RTL_RESET_SOFT
+	JR	Z,.STORE
+	LD	A,RTL_RESET_HARD
+.STORE
 	LD	(RTL_SOFT_RESET),A
 	IFNDEF	LIB_NO_CONSOLE
+	; Only the explicit soft mode announces itself here.  AUTO is not
+	; decided yet -- RESET resolves it against the chip ID, and the
+	; app reports the outcome afterwards (see NETCFG's [W03]).
+	RET	NZ
 	LD	HL,MSG_SOFT_RESET
 	LD	C,DSS_PCHARS
 	RST	DSS
@@ -652,8 +679,34 @@ PROBE_PRESENT
 RESET
 	IFDEF	RTL_SOFT_RESET_SUPPORTED
 	LD	A,(RTL_SOFT_RESET)
+	IFDEF	UNET_DLL
+	; Two states in this image: SOFT (the default here) or a forced
+	; HARD.  There is no room for the ID probe that resolves AUTO --
+	; see READ_RESET_MODE.
 	OR	A
 	JR	NZ,.SOFT
+	ELSE
+	DEC	A
+	JR	Z,.SOFT			; RTL_RESET_SOFT: forced
+	DEC	A
+	JR	NZ,.HARD		; RTL_RESET_HARD: forced
+	; RTL_RESET_AUTO.  Reading BASE+0x1F is safe on a genuine Realtek
+	; RTL8019AS and fatal on a clone that stalls the ISA cycle there
+	; (a UMC UM9003AF, for one), so require the chip to identify
+	; itself before going anywhere near that port.  Resolve once and
+	; write the answer back: later RESET calls skip the probe, and
+	; NICINFO/NETCFG can report which path the card actually took.
+	CALL	IS_REALTEK
+	LD	A,RTL_RESET_SOFT
+	JR	C,.AUTO_SOFT
+	LD	A,RTL_RESET_HARD
+	LD	(RTL_SOFT_RESET),A
+	JR	.HARD
+.AUTO_SOFT
+	LD	(RTL_SOFT_RESET),A
+	JR	.SOFT
+.HARD
+	ENDIF
 	ENDIF
 	LD	HL,(RTL_BASE_PTR)
 	LD	DE,RTL_RESET_OFF
@@ -709,6 +762,48 @@ RESET
 	ADD	HL,DE
 	LD	(HL),0xFF
 	OR	A
+	RET
+	ENDIF
+
+
+	IFNDEF	UNET_DLL
+; ------------------------------------------------------
+; IS_REALTEK: does the chip at RTL_BASE_PTR identify as a genuine
+; Realtek RTL8019AS?  Page-0 8019ID0/ID1 must read 'P','p'.
+;
+; This is deliberately NOT the same test as PROBE_ID: that one is a
+; diagnostic that leaves the raw bytes behind for NICINFO to print and
+; starts the core (CR_PAGE0_START).  Here the chip is about to be
+; reset, so stop it instead, and answer only the one question RESET
+; needs -- may the board reset port at BASE+0x1F be touched at all.
+;
+; A clone that answers anything else gets the soft path.  So does a
+; chip whose ID read comes back garbled, which is the right way round:
+; a missed ID costs a cleaner reset, a wrong "yes" costs the machine.
+;
+; ISA must be OPEN.  Out: CF=0 Realtek, CF=1 anything else.
+; Trashes A, BC, DE, HL.  IX preserved.
+; ------------------------------------------------------
+IS_REALTEK
+	LD	HL,(RTL_BASE_PTR)
+	LD	(HL),CR_PAGE0_STOP
+	LD	DE,RTL_ID0_OFF
+	ADD	HL,DE
+	; Same write-to-read recovery the presence probe needs on a cold
+	; clone; a value sampled before the bus settles must not be
+	; allowed to read as the Realtek signature by accident.
+	CALL	PROBE_AT_IX.SETTLE
+	LD	A,(HL)
+	CP	RTL_ID0_VAL
+	JR	NZ,.NO
+	INC	HL
+	LD	A,(HL)
+	CP	RTL_ID1_VAL
+	JR	NZ,.NO
+	OR	A			; CF=0
+	RET
+.NO
+	SCF
 	RET
 	ENDIF
 
