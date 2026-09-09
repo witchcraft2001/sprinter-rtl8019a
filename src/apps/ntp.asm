@@ -9,8 +9,13 @@
 ;       result back to the DSS clock via DSS_SETTIME.
 ;
 ; Usage:
-;   NTP server-ipv4
+;   NTP [server]
 ;   NTP /?
+;
+; server is a numeric IPv4 or a hostname, and is optional: with no
+; argument NTP falls back to NET_NTP (published by NETCFG -i from
+; NET.CFG's NTP= line), matching the sprinter_wifi ESP kit's NTP.EXE.
+; Neither present is a config error (exit 4), not a usage error.
 ;
 ; Exit codes: 0 ok, 1 usage, 2 no NIC, 3 ARP/NTP timeout, 4 cfg.
 ; ======================================================
@@ -38,6 +43,10 @@ EXE_VERSION		EQU 1
 ARP_TIMEOUT_MS	EQU 3000
 NTP_TIMEOUT_MS	EQU 5000
 SCAN_C		EQU 0xAC
+
+; Buffer for the NET_NTP fallback value.  @NETENV.GET_STR takes the
+; size INCLUDING the terminator, so a host name may be 63 characters.
+NTP_HOST_BUF_SIZE EQU 64
 
 ETH_TYPE_ARP	EQU 0x0806
 ETH_TYPE_IPV4	EQU 0x0800
@@ -90,10 +99,21 @@ START
 	CALL	@CMDL.IS_HELP
 	JP	NC,SHOW_HELP
 
-	; positional 0: server (IPv4 literal or hostname)
+	; positional 0: server (IPv4 literal or hostname).  Optional --
+	; matching sprinter_wifi/network's ESP kit, fall back to NET_NTP
+	; (NETCFG -i publishes it from NET.CFG's NTP= line) when the
+	; argument is omitted.  Neither present is a config error, not a
+	; usage error: the command line itself was well-formed.
 	LD	B,0
 	CALL	@CMDL.GET_POSITIONAL
-	JP	C,USAGE_ERROR
+	JR	NC,.HAVE_HOST
+	LD	HL,N_NET_NTP
+	LD	DE,NTP_HOST_BUF
+	LD	B,NTP_HOST_BUF_SIZE
+	CALL	@NETENV.GET_STR
+	JP	C,NO_SERVER
+	LD	HL,NTP_HOST_BUF
+.HAVE_HOST
 	LD	(TARGET_HOST_PTR),HL
 
 	; Pull NET_IP / NET_MAC from env (after IFUP).
@@ -321,6 +341,14 @@ USAGE_ERROR
 	LD	C,DSS_PCHARS
 	RST	DSS
 	LD	B,1
+	JP	@UTIL.EXIT_FAIL
+
+
+; No positional argument AND NET_NTP is unset/empty.  Configuration
+; error, not a usage error: the invocation itself was fine.
+NO_SERVER
+	PRINTLN MSG_E_NO_SERVER
+	LD	B,4
 	JP	@UTIL.EXIT_FAIL
 
 
@@ -1282,8 +1310,16 @@ REG_NAMES
 N_NET_IP	DB "NET_IP",0
 N_NET_MAC	DB "NET_MAC",0
 N_NET_TZ	DB "NET_TZ",0
+N_NET_NTP	DB "NET_NTP",0
 
 ; ------- runtime BSS -------
+; NOTE: TARGET_HOST_PTR deliberately shares +23..+24 with
+; NTP_REPLY_STRATUM (+23) and the first byte of NTP_TX_SECS (+24).
+; That is safe ONLY because of call ordering: the host pointer is read
+; for the last time by @RESOLVE.HOST, and both reply fields are written
+; later, by WAIT_FOR_NTP_REPLY.  Anything that reads TARGET_HOST_PTR
+; after the reply arrives reads the timestamp instead.  New fields go
+; after NTP_HOST_BUF, not into this gap.
 OUR_IP		EQU APP_BSS_BASE		; 4
 OUR_MAC		EQU APP_BSS_BASE + 4		; 6
 TARGET_IP	EQU APP_BSS_BASE + 10		; 4
@@ -1307,6 +1343,8 @@ UTC_BACKUP	EQU APP_BSS_BASE + 51		; 4 (Unix UTC backup for second pass)
 TZ_BUF		EQU APP_BSS_BASE + 55		; 8 (NET_TZ string)
 TZ_NEG		EQU APP_BSS_BASE + 63		; 1
 TZ_HOURS	EQU APP_BSS_BASE + 64		; 1
+NTP_HOST_BUF	EQU APP_BSS_BASE + 65		; NTP_HOST_BUF_SIZE (NET_NTP fallback)
+NTP_APP_BSS_END	EQU NTP_HOST_BUF + NTP_HOST_BUF_SIZE
 
 
 ; ------- messages -------
@@ -1328,16 +1366,20 @@ MSG_E_RESET	DB "[E100] RESET timeout",0
 MSG_E_SEND	DB "[E101] DMA write or PTX timeout",0
 MSG_E_ARP	DB "ARP request timed out.",0
 MSG_E_NTP	DB "NTP reply timed out.",0
-MSG_USAGE_ERR	DB "[E] usage: missing or invalid server",0
+; "missing" is no longer possible here -- an absent argument falls back
+; to NET_NTP, and an absent NET_NTP reports MSG_E_NO_SERVER instead.
+MSG_USAGE_ERR	DB "[E] usage: invalid server",0
+MSG_E_NO_SERVER	DB "[E] no NTP server given and NET_NTP not set; pass a server or add NTP= to NET.CFG.",0
 MSG_E_RESOLVE	DB "[E] could not resolve host (DNS / ARP timeout or NXDOMAIN).",0
 MSG_E_NO_DNS1	DB "[E] NET_DNS1 not set; pass an IPv4 literal or run NETCFG/IFUP first.",0
 MSG_E_NO_GW	DB "[E] DNS server is off-subnet but NET_GW is not set.",0
 MSG_HELP
 	DB "Usage:",13,10
-	DB "  NTP server-ipv4",13,10
+	DB "  NTP [server]",13,10
 	DB "  NTP /?",13,10,13,10
-	DB "  server-ipv4   numeric IPv4 of the NTP server",13,10
-	DB "                (DNS resolver not yet implemented).",13,10,0
+	DB "  server   numeric IPv4 or hostname of the NTP server.",13,10
+	DB "           Optional; defaults to NET_NTP (set by NETCFG -i",13,10
+	DB "           from NET.CFG's NTP= line).",13,10,0
 LINE_END	DB 13,10,0
 
 	ENDMODULE
@@ -1368,6 +1410,15 @@ TX_BUF		EQU NTP_IMAGE_END
 RX_HDR		EQU TX_BUF + RESOLVE_MAX_FRAME
 RX_BUF		EQU RX_HDR + 4
 NTP_BSS_END	EQU RX_BUF + RX_BUF_SIZE
+
+	; This app has two disjoint BSS regions: the frame buffers above,
+	; which grow upward from the end of the loaded image, and the
+	; APP_BSS_BASE field map, which is fixed at 0xB000.  Both were
+	; unguarded until now (wget.asm and tftp.asm assert the first one;
+	; nothing asserted either here), so state both bounds explicitly --
+	; the runtime stack lives at the top of the same WIN2 page.
+	ASSERT NTP_BSS_END < APP_BSS_BASE
+	ASSERT NTP_APP_BSS_END < RT_STACK_TOP - 0x0100
 
 	ENDMODULE
 

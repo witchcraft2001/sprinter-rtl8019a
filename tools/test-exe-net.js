@@ -302,10 +302,56 @@ const arpToDns = { mac: [2, 0, 0, 0, 0, 1] };
   assert.match(r.output, /NTP reply timed out\./);
   checkCleanupClaimedPage(r);
 }
-{ // missing server argument -> usage error (no NET_NTP fallback is implemented)
+{ // no server argument: falls back to NET_NTP (matches sprinter_wifi's
+  // ESP kit and docs/NTP.md, which always documented this as the
+  // contract even while the RTL implementation required the argument)
+  const r = run('NTP', '', {
+    environment: { ...NET_ENV, NET_NTP: '192.168.7.1' },
+    responders: { arp: arpToDns, ntp: { unixSeconds: 1700000000, stratum: 2 } },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Querying NTP at 192\.168\.7\.1 from 192\.168\.7\.2/);
+  assert.match(r.output, /RESULT OK/);
+  checkCleanupClaimedPage(r);
+}
+{ // NET_NTP holding a HOSTNAME, which is what NET.CFG's NTP= line
+  // realistically carries (`NTP=pool.ntp.org`).  Exercises the DNS
+  // path reached through the env fallback rather than an argument.
+  const r = run('NTP', '', {
+    environment: { ...NET_ENV_DNS, NET_NTP: 'pool.ntp.org' },
+    responders: {
+      arp: arpToDns,
+      dns: { ip: [192, 168, 7, 1] },
+      ntp: { unixSeconds: 1700000000, stratum: 2 },
+    },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Querying NTP at 192\.168\.7\.1 from 192\.168\.7\.2/);
+  assert.match(r.output, /RESULT OK/);
+  checkCleanupClaimedPage(r);
+}
+{ // an explicit argument still overrides NET_NTP.  NET_NTP is set to an
+  // unresolvable name with no DNS server configured, so reaching the
+  // network at all proves the argument won rather than the env.
+  const r = run('NTP', '192.168.7.1', {
+    environment: { ...NET_ENV, NET_NTP: 'must-not-be-used.invalid' },
+    responders: { arp: arpToDns, ntp: { unixSeconds: 1700000000 } },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Querying NTP at 192\.168\.7\.1 from 192\.168\.7\.2/);
+  checkCleanupClaimedPage(r);
+}
+{ // no argument AND no NET_NTP -> config error (4), not a usage error:
+  // the invocation itself was well-formed
   const r = run('NTP', '', { environment: { ...NET_ENV } });
-  assert.strictEqual(r.exitCode, 1);
-  assert.match(r.output, /\[E\] usage: missing or invalid server/);
+  assert.strictEqual(r.exitCode, 4);
+  assert.match(r.output, /\[E\] no NTP server given and NET_NTP not set/);
+  checkCleanupClaimedPage(r);
+}
+{ // NET_NTP present but empty is treated the same as absent
+  const r = run('NTP', '', { environment: { ...NET_ENV, NET_NTP: '' } });
+  assert.strictEqual(r.exitCode, 4);
+  assert.match(r.output, /\[E\] no NTP server given and NET_NTP not set/);
   checkCleanupClaimedPage(r);
 }
 for (const missing of ['NET_IP', 'NET_MAC']) {

@@ -23,7 +23,7 @@ NTP /?
 ```
 RTL8019AS NTP v0.2.16
 
-Querying NTP at pool.ntp.org from 192.168.7.119
+Querying NTP at 162.159.200.1 from 192.168.7.119
 Reply: stratum=2
 NTP transmit timestamp: 0xEDA5F312 (seconds since 1900-01-01)
 UTC time:   2026-05-06 17:04:18
@@ -31,6 +31,10 @@ Local time: 2026-05-06 22:04:18 (TZ +5)
 DSS clock updated.
 RESULT OK
 ```
+
+The banner line always shows the *resolved* address, so a hostname
+(whether passed as an argument or taken from `NET_NTP`) appears here
+as the IPv4 it resolved to, not as the name.
 
 Local time = UTC + `NET_TZ` hours.  Missing or unparseable
 `NET_TZ` is treated as UTC+0.  `DSS_SETTIME` is fed the local
