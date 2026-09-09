@@ -105,11 +105,16 @@ ISA_CLOSE
 	LD	BC,PORT_SYSTEM
 	OUT	(C),A
 	LD	BC,PAGE3
-	LD	A,(SAVE_MMU3)
+	; SAVE_MMU3/SAVE_IFF live inside the immediate operands below,
+	; written by ISA_OPEN's LD (label) stores -- same idiom as
+	; ISA_SLOT above, no separate data bytes.
+	LD	A,0
+SAVE_MMU3 EQU $-1
 	OUT	(C),A
 	XOR	A
 	LD	(IS_OPEN),A
-	LD	A,(SAVE_IFF)
+	LD	A,0
+SAVE_IFF EQU $-1
 	OR	A
 	JR	Z,.NO_EI
 	EI				; caller had interrupts enabled -- restore them
@@ -120,8 +125,6 @@ CLOSE_ALREADY
 	POP	BC,AF
 	RET				; preserve caller's current interrupt state
 
-SAVE_MMU3	DB 0
-SAVE_IFF	DB 0
 IS_OPEN	DB 0
 
 	ENDMODULE

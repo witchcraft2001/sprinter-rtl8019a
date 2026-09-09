@@ -35,11 +35,14 @@
 ;
 ; RUN (every cold invocation, e.g. once per RESOLVE frame build or
 ; per received frame in a PING/ARP/DNS wait loop):
-;   DI, save PAGE0, write our cached physical byte to PAGE0 (one
-;   OUT, no DSS/BIOS call -- both RST vectors are UNREACHABLE once
-;   this executes, because the DLL's normal PAGE0 content, which is
-;   where they live, is what just got replaced), CALL the cold
-;   image's entry point at offset 0, restore PAGE0, EI.
+;   DI, save SP and switch to a private stack on the cold page itself
+;   (see the comment inside RUN: the consumer's stack may live in WIN0,
+;   which is about to be remapped, so the cold code must not push
+;   there), save PAGE0, write our cached physical byte to PAGE0
+;   (one OUT, no DSS/BIOS call -- both RST vectors are UNREACHABLE
+;   once this executes, because the DLL's normal PAGE0 content, which
+;   is where they live, is what just got replaced), CALL the cold
+;   image's entry point at offset 0, restore PAGE0, SP, and IFF.
 ;
 ;   The cold code touches NOTHING by absolute address: every buffer
 ;   it reads/writes and every hot routine it needs (BUILD_ETH_IP,
@@ -70,8 +73,9 @@
 ;            registers per that function's own contract.
 ;       Out: per that function's own contract.
 ;       Trashes nothing beyond what the specific cold function
-;       documents; DI/EI and the WIN0 remap are invisible to the
-;       caller.  CF=1 without touching the parameter block if INIT
+;       documents; DI/EI, the stack switch and the WIN0 remap are
+;       invisible to the caller (any consumer SP is safe, WIN0
+;       included).  CF=1 without touching the parameter block if INIT
 ;       never succeeded (defensive; callers are expected to check
 ;       INIT's own result once and not call afterward).
 ;
@@ -201,10 +205,23 @@ INIT
 	RST	DSS
 	SCF
 	RET
-.FH		DB 0
-.HDRBUF		DS 8
-.BLOBLEN	DW 0
-.SAVE_WIN3	DB 0
+; INIT-time scratch overlays @MAIN.TX_BUF instead of occupying image
+; bytes: INIT runs once, from F_NETINIT, before RTL.INIT_BASE and long
+; before the first frame is built, so TX_BUF (320 bytes) is guaranteed
+; dead for its whole lifetime; a repeated NETINIT returns on the READY
+; check before touching any of this.  Two reasons, both real:
+;   1. The libman image budget.  These 77 bytes are what pays for the
+;      cold-call stack switch in RUN below.
+;   2. .PATH used to be DS 65 in the image, but .OPEN_SELF may write
+;      up to 63 bytes of APPINFO homedir + '\' + "UNETRTL.DLL",0 = 77
+;      bytes into it -- a homedir >= 53 characters overflowed the old
+;      buffer straight into RUN's code.  In TX_BUF the buffer is 80
+;      bytes with dead scratch beyond it, so the worst case is safe.
+.FH		EQU @MAIN.TX_BUF + 0	; 1
+.SAVE_WIN3	EQU @MAIN.TX_BUF + 1	; 1
+.BLOBLEN	EQU @MAIN.TX_BUF + 2	; 2
+.HDRBUF		EQU @MAIN.TX_BUF + 4	; 8
+.PATH		EQU @MAIN.TX_BUF + 12	; 80 (63 dir + sep + 12 name + NUL slack)
 
 ; ------------------------------------------------------
 ; .OPEN_SELF: try "<exe_home>\UNETRTL.DLL", then the bare name --
@@ -265,23 +282,20 @@ INIT
 	JR	NZ,.STRCPY
 	RET
 .NAME		DB "UNETRTL.DLL",0
-.PATH		DS 65
 
 ; ------------------------------------------------------
 ; RUN: see header comment's "CALL" entry (named RUN here -- "CALL" is
 ; a Z80 mnemonic and cannot double as a label).
 ; ------------------------------------------------------
 RUN
-	PUSH	AF			; preserve the caller's function code
+	LD	(.SAVE_A),A		; the caller's function code; also keeps
+					; the READY check off the caller's stack
 	LD	A,(READY)
 	OR	A
 	JR	NZ,.go
-	POP	AF
 	SCF
 	RET
 .go
-	POP	AF
-	LD	(.SAVE_A),A
 	; Sample the caller's real IFF2 BEFORE the DI below, mirroring
 	; isa.asm's ISA_OPEN (NMOS erratum: a maskable interrupt can land
 	; mid "LD A,I" and misreport P/V once; if it did, its handler has
@@ -297,38 +311,65 @@ RUN
 .IFF_SAMPLED
 	LD	(.SAVE_IFF),A
 	DI
-	; BC is a live pass-through register in BOTH directions (e.g.
-	; CFN_PARSE_DNS_REPLY takes the message length in BC, and
-	; CFN_BUILD_ICMP_ECHO returns the frame length in BC), so the
-	; PAGE0 port loads below must not leak into or out of the cold
-	; call -- bracket them with PUSH/POP BC.
-	PUSH	BC
-	LD	BC,PAGE0
-	IN	A,(C)
-	LD	(.SAVE_PAGE0),A
-	LD	A,(PHYS_BYTE)
-	OUT	(C),A
-	POP	BC
-	LD	A,(.SAVE_A)
+	; --- Stack switch.  The consumer's SP may point anywhere,
+	; including WIN0 (0x0000..0x3FFF) -- the very window about to be
+	; repointed at the cold page.  Without a switch, the cold code's
+	; own pushes would land on the consumer's page and scar whatever
+	; sat at those addresses.  sprinter-3C509B solves this with a
+	; 96-byte private stack in its DLL BSS; this image has no such
+	; budget, so the cold call instead runs on the TOP OF THE COLD
+	; PAGE ITSELF (SP=0x4000 while it is mapped): ~14 KB of
+	; guaranteed-private depth above the blob, at zero image cost --
+	; important, because cold drains call back into hot SEND_FRAME and
+	; the whole driver TX path runs on this stack.
+	;
+	; The remap/un-map brackets could use NEITHER stack (the consumer's
+	; may be in WIN0; the cold page's does not exist yet / dies with
+	; the un-map), so they use NO STACK AT ALL: PAGE0 is an 8-bit port
+	; (0x82), which lets the immediate IN/OUT form carry the port
+	; without BC -- exactly what libman13.asm's own loader does on real
+	; hardware with 0xE2 -- and the one register that must survive the
+	; un-map, A, parks in an inline slot instead of a push.  Nothing
+	; between the cold RET and the caller's RET touches F either, so
+	; the cold function's CF/ZF reach the caller untouched.
+	; Interrupts are off throughout, so no ISR can land on either stack.
+	LD	(.SAVE_SP),SP
+	IN	A,(PAGE0)		; BC is a live pass-through in BOTH
+	LD	(.SAVE_PAGE0),A		; directions (CFN_PARSE_DNS_REPLY takes
+	LD	A,(PHYS_BYTE)		; the length in BC, CFN_BUILD_ICMP_ECHO
+	OUT	(PAGE0),A		; returns it) -- immediate I/O never
+					; touches it, so no bracket is needed.
+	LD	SP,0x4000		; top of the now-mapped cold page
+	; The .SAVE_*/.RESULT_A slots live INSIDE the immediate operands of
+	; their reload instructions (written by the LD (label) stores) --
+	; no separate data bytes, and an immediate load is cheaper than a
+	; LD from memory.  Safe here: RUN is not reentrant and IRQs are off
+	; for the whole store..reload window.
+	LD	A,0
+.SAVE_A		EQU $-1
 	CALL	0x0000
+	; Results live in AF/BC/HL/DE/IX per the function's contract and the
+	; cold stack has fully unwound.  Park A (the only register the
+	; un-map needs) in-image, un-map, put it back.
+	LD	(.RESULT_A),A
+	LD	A,0
+.SAVE_PAGE0	EQU $-1
+	OUT	(PAGE0),A
+	LD	A,0
+.RESULT_A	EQU $-1
+	; Consumer page 0 is back; the consumer stack is valid again
+	; wherever it lives.
+	LD	SP,0
+.SAVE_SP	EQU $-2
 	PUSH	AF
-	PUSH	BC
-	LD	A,(.SAVE_PAGE0)
-	LD	BC,PAGE0
-	OUT	(C),A
-	POP	BC
-	POP	AF
-	PUSH	AF
-	LD	A,(.SAVE_IFF)
+	LD	A,0
+.SAVE_IFF	EQU $-1
 	OR	A
 	JR	Z,.no_ei
 	EI
 .no_ei
 	POP	AF
 	RET
-.SAVE_A		DB 0
-.SAVE_PAGE0	DB 0
-.SAVE_IFF	DB 0
 
 	ENDMODULE
 	ENDIF

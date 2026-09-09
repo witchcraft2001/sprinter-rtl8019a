@@ -76,7 +76,8 @@ ALLOC
 	LD	(PAGEMEM_BLOCK_ID),A
 	; Walk logical indices 0..N-1, store BIOS_EMM_FN4(block_id,i).
 	LD	IX,PAGEMEM_PHYS
-	LD	A,(.SAVED_N)
+	LD	A,0			; self-modified: page count stored above
+.SAVED_N EQU $-1
 	LD	D,A			; D = N
 	LD	E,0			; E = current index i
 .LP
@@ -105,7 +106,6 @@ ALLOC
 .BAD
 	SCF
 	RET
-.SAVED_N	DB 0
 
 
 ; ------------------------------------------------------

@@ -82,7 +82,11 @@ path.
   window the DLL was loaded into** -- the whole buffer, not just its
   first byte.  Violations return `NERR_PARAM`.
 - Host strings are limited to 128 bytes, port strings to 15.
-- Keep at least ~256 bytes of free stack across a call.
+- Keep at least ~256 bytes of free stack across a call.  The stack
+  itself may live anywhere, WIN0 (0x0000..0x3FFF) included: the
+  functions that page the cold overlay over WIN0 (`RESOLVE`, `PING`,
+  and `CONNECT`'s next-hop lookup) switch to a private stack for the
+  duration, so the remap never runs on the caller's stack.
 - The library is not reentrant; make one call at a time.
 
 Arguments and results travel in **A, DE, IX and IY** only; `HL` and

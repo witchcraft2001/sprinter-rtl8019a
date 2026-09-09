@@ -207,4 +207,102 @@ const clone = { quirks: { variant: 'UM9003', hangOnResetPort: true } };
   count();
 }
 
+// ---------------------------------------------------------------------
+// Consumer stack in WIN0 vs the cold overlay.
+//
+// WIN0COLD.RUN remaps PAGE0 to the cold page for every RESOLVE/PING
+// cold call.  A consumer whose SP lives in 0x0000..0x3FFF then has the
+// memory under its stack swapped out mid-call: before the fix, RUN's
+// own PUSH/POP brackets straddled the remap (BC and AF came back as
+// whatever bytes sat at the same address in the other page), and the
+// cold code's pushes landed in the consumer's page 0.  RUN now runs
+// cold calls on the top of the cold page itself and bridges the remap
+// on an in-image mini-stack, so any consumer SP is safe.
+//
+// UNETTEST itself keeps its stack in WIN2, so this test manufactures
+// the hostile consumer: it patches the header stack field and the
+// matching LD SP,imm16 in a copy of UNETTEST.EXE to 0x3F00 and then
+// runs the full ping + HTTP flow through the DLL.
+// ---------------------------------------------------------------------
+{
+  const os = require('os');
+  const orig = fs.readFileSync(exe('UNETTEST'));
+  const patched = Buffer.from(orig);
+  const stackTop = patched.readUInt16LE(0x14);
+  assert.ok(stackTop >= 0x8000 && stackTop <= 0xc000,
+    `unexpected UNETTEST header stack 0x${stackTop.toString(16)}`);
+  // Find the single LD SP,STACK_TOP (0x31 lo hi) that matches the header.
+  const needle = Buffer.from([0x31, stackTop & 0xff, stackTop >> 8]);
+  const hits = [];
+  for (let i = patched.indexOf(needle); i !== -1; i = patched.indexOf(needle, i + 1)) hits.push(i);
+  assert.strictEqual(hits.length, 1,
+    `expected exactly one LD SP,0x${stackTop.toString(16)} in UNETTEST.EXE, found ${hits.length}`);
+  const WIN0_SP = 0x3f00;
+  patched.writeUInt16LE(WIN0_SP, 0x14);
+  patched.writeUInt16LE(WIN0_SP, hits[0] + 1);
+  const tmp = path.join(os.tmpdir(), `unettest-win0-stack-${process.pid}.EXE`);
+  fs.writeFileSync(tmp, patched);
+  try {
+    { // full TCP flow (cold calls: literal parse, next-hop, ARP build+drain)
+      const r = runExe(tmp, '192.168.7.1 80', dllScenario({
+        responders: { arp: arpToServer, tcp: { body: 'hi', status: 200 } },
+      }));
+      assert.strictEqual(r.exitCode, 0);
+      assert.match(r.output, /NETINIT ok/);
+      assert.match(r.output, /resolve: 192\.168\.7\.1/);
+      assert.match(r.output, /HTTP\/1\.1 200 OK/);
+      assert.match(r.output, /--- closed ---/);
+      count();
+    }
+    { // -u flow: ICMP echo build + drain (the deepest cold paths -- the
+      // drain calls back into hot driver code on the switched stack) plus
+      // a byte-exact UDP echo.  No tcp responder here: the harness
+      // dispatcher hands every frame to responders.tcp when it is
+      // configured, so ping and tcp cannot be exercised in one scenario.
+      const r = runExe(tmp, '-u 7777 192.168.7.1', dllScenario({
+        responders: { arp: arpToServer, icmp: {}, udp: { port: 7777 } },
+      }));
+      assert.strictEqual(r.exitCode, 0);
+      assert.match(r.output, /ping: \d+ ms/);
+      assert.match(r.output, /udp reply: len=21 data=SPRINTER UNETTEST UDP/);
+      assert.match(r.output, /udp echo ok/);
+      count();
+    }
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Deep exe-homedir: WIN0COLD.INIT's .OPEN_SELF builds "<homedir>\
+// UNETRTL.DLL" into .PATH.  That buffer used to be an in-image DS 65
+// while the worst case writes 63 (homedir) + 1 (separator) + 12
+// ("UNETRTL.DLL",0) = 76 bytes, so a homedir of 53 characters or more
+// ran off the end straight into WIN0COLD.RUN's code -- on the very first
+// NETINIT, before anything could report a problem.  .PATH now overlays
+// @MAIN.TX_BUF with 80 usable bytes.  Exercise the exact worst case: a
+// 63-character homedir, the longest .find_end's 64-byte scan accepts.
+// ---------------------------------------------------------------------
+{
+  const deepDir = `C:\\${'DEEPDIR\\'.repeat(7)}UNET`;
+  assert.strictEqual(deepDir.length, 63, 'vector must hit the 63-char worst case');
+  const r = run('UNETTEST', '-u 7777 192.168.7.1', {
+    environment: {
+      NET_IP: '192.168.7.2', NET_MASK: '255.255.255.0', NET_GW: '192.168.7.1',
+      NET_MAC: '02:80:19:11:22:33', NET_RTL_HW: '1/#300', NET: 'RTL',
+    },
+    appDir: deepDir,
+    files: { [`${deepDir}\\UNETRTL.DLL`]: dllBytes },
+    responders: { arp: arpToServer, icmp: {}, udp: { port: 7777 } },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /NETINIT ok/);
+  // PING runs through the cold overlay, so a blob that failed to load --
+  // or a RUN whose code had been overwritten by the overflow -- shows up
+  // here rather than passing silently.
+  assert.match(r.output, /ping: \d+ ms/);
+  assert.match(r.output, /udp echo ok/);
+  count();
+}
+
 console.log(`Actual DSS EXE DLL harness: ${caseCount()} UNETTEST checks passed`);
