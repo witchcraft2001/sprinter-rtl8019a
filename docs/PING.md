@@ -31,18 +31,27 @@ cancels.
 RTL8019AS PING v0.2.16
 
 Pinging 192.168.7.1 with 32 bytes of data:
-Reply from 192.168.7.1: bytes=32 time<1ms TTL=64
-Reply from 192.168.7.1: bytes=32 time<1ms TTL=64
-Reply from 192.168.7.1: bytes=32 time<1ms TTL=64
-Reply from 192.168.7.1: bytes=32 time<1ms TTL=64
+Reply from 192.168.7.1: bytes=32 time=1ms TTL=63
+Reply from 192.168.7.1: bytes=32 time<1ms TTL=63
+Reply from 192.168.7.1: bytes=32 time=2ms TTL=63
+Reply from 192.168.7.1: bytes=32 time=1ms TTL=63
 
 Ping statistics for 192.168.7.1:
     Packets: Sent = 4, Received = 4, Lost = 0.
 RESULT OK
 ```
 
-Timing resolution on the Sprinter Z80 is below 1 ms for LAN
-exchanges, so all replies show `time<1ms`.
+`time=` is the measured round trip, taken from the same ~1 ms poll
+tick that drives the reply timeout, so its resolution is one
+millisecond. A reply that arrives before the first tick prints
+`time<1ms`. The figure can only err high, never low: the receive
+loop charges one unit per non-matching frame it drains, so heavy
+broadcast traffic inflates the number rather than hiding a slow
+reply.
+
+`TTL=` is the TTL of the reply packet, which is what shows how many
+hops away the peer is. It is not the TTL of the request; use `-i`
+to set that one.
 
 ## Exit codes
 

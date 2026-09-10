@@ -40,6 +40,7 @@ EXE_VERSION		EQU 1
 
 ; Pull in the high-level RTL + ARP + NETCFG helpers we need.
 	DEFINE USE_UTIL_EXIT_NO_NIC
+	DEFINE USE_UTIL_PRINT_DEC_32		; round-trip time can exceed 255 ms
 	DEFINE USE_RTL_INIT_NORMAL
 	DEFINE USE_RTL_SEND_FRAME
 	DEFINE USE_RTL_WAIT_PTX
@@ -387,7 +388,7 @@ PING_LOOP
 	CALL	WAIT_FOR_ICMP_REPLY
 	JR	C,.TIMED_OUT
 
-	; "Reply from X.X.X.X: bytes=N time<1ms TTL=...".
+	; "Reply from X.X.X.X: bytes=N time=Nms TTL=...".
 	CALL	@ISA.ISA_CLOSE
 	PRINT MSG_REPLY_FROM
 	LD	HL,TARGET_IP
@@ -395,8 +396,38 @@ PING_LOOP
 	PRINT MSG_BYTES_EQ
 	LD	A,(PAYLOAD_LEN)
 	CALL	PRINT_DEC_A
-	PRINT MSG_TIME_TTL_PRE
-	LD	A,(TTL_VAL)
+
+	; Round-trip time.  WAIT_FOR_ICMP_REPLY counts TIMEOUT_MS_LEFT down
+	; from TIMEOUT_MS_VAL, one unit per ~1 ms tick, so the difference is
+	; the elapsed time; it was previously not measured at all and the
+	; line carried a hardcoded "time<1ms".  The figure errs in one
+	; direction only: the drain path also charges one unit per
+	; non-matching frame, so heavy broadcast traffic inflates the number
+	; rather than hiding a slow reply.
+	PRINT	MSG_TIME_PRE
+	LD	HL,(TIMEOUT_MS_VAL)
+	LD	DE,(TIMEOUT_MS_LEFT)
+	OR	A
+	SBC	HL,DE
+	LD	A,H
+	OR	L
+	JR	NZ,.RTT_EQ
+	LD	A,'<'			; reply beat the first tick
+	CALL	PUTCHAR
+	INC	HL			; HL = 1 -> "<1ms"
+	JR	.RTT_PRINT
+.RTT_EQ
+	LD	A,'='
+	CALL	PUTCHAR
+.RTT_PRINT
+	LD	DE,0
+	CALL	@UTIL.PRINT_DEC_32
+
+	; TTL of the REPLY -- that is what tells the user how many hops away
+	; the peer is.  The old line printed TTL_VAL, our own outgoing TTL,
+	; so it always echoed back the -i value (64 by default).
+	PRINT	MSG_MS_TTL_PRE
+	LD	A,(RX_BUF + 14 + 8)
 	CALL	PRINT_DEC_A
 	PRINT LINE_END
 	CALL	@ISA.ISA_OPEN
@@ -1593,7 +1624,8 @@ MSG_BYTES_DATA	DB " bytes of data:",0
 MSG_OUR_IP	DB "Our IP=",0
 MSG_REPLY_FROM	DB "Reply from ",0
 MSG_BYTES_EQ	DB ": bytes=",0
-MSG_TIME_TTL_PRE DB " time<1ms TTL=",0
+MSG_TIME_PRE	DB " time",0
+MSG_MS_TTL_PRE	DB "ms TTL=",0
 MSG_TIMED_OUT	DB "Request timed out.",0
 MSG_NEXTHOP	DB "Next-hop MAC=",0
 MSG_RX_PRE	DB "  (rx=",0

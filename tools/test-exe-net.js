@@ -85,16 +85,35 @@ for (const app of ['PING', 'PINGALT']) {
     assert.match(r.output, new RegExp(`RTL8019AS ${app} v`));
     assert.match(r.output, /Pinging 192\.168\.7\.1 with 32 bytes of data:/);
     assert.match(r.output, /Next-hop MAC=02:00:00:00:00:01/);
-    assert.strictEqual((r.output.match(/Reply from 192\.168\.7\.1: bytes=32 time<1ms TTL=64/g) || []).length, 2);
+    // TTL is the REPLY's (the responder sends 63), not our outgoing 64.
+    assert.strictEqual((r.output.match(/Reply from 192\.168\.7\.1: bytes=32 time=1ms TTL=63/g) || []).length, 2);
     assert.match(r.output, /Packets: Sent = 2, Received = 2, Lost = 0\./);
     assert.match(r.output, /RESULT OK/);
     checkCleanupClaimedPage(r);
   }
-  { // custom payload size and TTL
+  { // custom payload size and TTL.  -i sets the TTL we TRANSMIT, so that
+    // is asserted on the wire; the screen shows the reply's TTL instead,
+    // which is the number that tells the user the hop distance.
     const r = run(app, '-n 1 -l 64 -i 32 192.168.7.1', { environment: { ...NET_ENV }, responders: arpAndIcmp });
     assert.strictEqual(r.exitCode, 0);
-    assert.match(r.output, /Reply from 192\.168\.7\.1: bytes=64 time<1ms TTL=32/);
+    const echo = Buffer.from(r.transmittedFrames[1], 'hex');
+    assert.strictEqual(echo[14 + 8], 32, '-i must set the outgoing IP TTL');
+    assert.match(r.output, /Reply from 192\.168\.7\.1: bytes=64 time=1ms TTL=63/);
     checkCleanupClaimedPage(r);
+  }
+  { // Round-trip time is MEASURED, not the hardcoded "<1ms" the reply line
+    // used to carry: hold the reply back and the printed figure must track
+    // the delay.  Two different delays, so a constant cannot pass.
+    for (const delay of [25, 120]) {
+      const r = run(app, `-n 1 192.168.7.1`, {
+        environment: { ...NET_ENV },
+        responders: { arp: { mac: [2, 0, 0, 0, 0, 1] }, icmp: { afterMs: delay, ttl: 57 } },
+      });
+      assert.strictEqual(r.exitCode, 0);
+      assert.match(r.output, new RegExp(`bytes=32 time=${delay}ms TTL=57`));
+      checkCleanupClaimedPage(r);
+    }
+    count();
   }
   { // -b: forces an L2 broadcast destination, unicast IP/ICMP payload unchanged
     const r = run(app, '-b -n 1 192.168.7.1', { environment: { ...NET_ENV }, responders: arpAndIcmp });
