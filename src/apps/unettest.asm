@@ -2,7 +2,7 @@
 ; UNETTEST - backend-neutral smoke test for the UNET network DLL.
 ;
 ;   UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT]
-;            [-l LISTENPORT] [-a] [HOST [PORT]]
+;            [-l LISTENPORT] [-a] [-r SLICE] [HOST [PORT]]
 ;
 ; Loads a UNET DLL (default UNETRTL.DLL) via libman into window 1, then walks
 ; the API: l_info, GETCAPS, SETOPT, STATUS, NETINIT, GETINFO, RESOLVE, PING,
@@ -22,6 +22,9 @@
 ; a multi-chunk payload against a peer that stalls its TCP receive window
 ; (tools/dev/unettest_asyncsend_stall.py) so at least one NERR_AGAIN resume
 ; is exercised end to end.
+; -r SLICE HOST PORT checks a complete deterministic HTTP response (8192-byte
+; body), including CRC32, sequence continuity, EOF and UNET_RXF_LOST.
+; Pair with tools/dev/unettest_response_server.py; SLICE=0 is blocking.
 ; Because the whole exercise goes through the DLL, the SAME binary tests any
 ; backend - point -d at UNETESP.DLL to exercise the Wi-Fi card instead.
 ;
@@ -242,6 +245,12 @@ START
 	CALL	LISTEN_PHASE
 	JP	.teardown
 .check_async
+	LD	A,(REG_MODE)
+	OR	A
+	JR	Z,.old_async
+	CALL	REG_PHASE
+	JP	.teardown
+.old_async
 	LD	A,(ASYNC_MODE)
 	AND	A
 	JR	Z,.check_dual
@@ -1352,6 +1361,266 @@ ASYNC_PHASE
 	CALL	DO_CALL
 	RET
 
+; Byte-exact early-response regression. All buffers are caller-owned BSS.
+; 300 bounded 100-ms polls plus bounded SEND resumes; EOF is mandatory.
+REG_PHASE
+	XOR	A
+	LD	(ASYNC_AGAIN_COUNT),A
+	LD	HL,0
+	LD	(REG_TOTAL),HL
+	DEC	HL
+	LD	(REG_CRC),HL
+	LD	(REG_CRC+2),HL
+	LD	HL,REG_FIRST
+	LD	B,8
+.zero
+	LD	(HL),0
+	INC	HL
+	DJNZ	.zero
+	LD	A,UNET_OPT_SENDSLICE
+	LD	DE,(REG_SLICE)
+	LD	B,UNET_FN_SETOPT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,.bad
+	XOR	A
+	LD	DE,HOST_BUFF
+	LD	IX,PORT_BUFF
+	LD	B,UNET_FN_CONNECT
+	CALL	DO_CALL
+	OR	A
+	JP	NZ,.bad
+.send
+	XOR	A
+	LD	DE,REG_REQUEST
+	LD	IX,REG_REQUEST_LEN
+	LD	B,UNET_FN_SEND
+	CALL	DO_CALL
+	CP	NERR_AGAIN
+	JR	NZ,.sent
+	LD	HL,ASYNC_AGAIN_COUNT
+	INC	(HL)
+	LD	A,(HL)
+	CP	200
+	JP	NC,.bad
+	JR	.send
+.sent
+	OR	A
+	JP	NZ,.bad
+	LD	HL,REG_REQUEST_LEN
+	OR	A
+	SBC	HL,DE
+	JP	NZ,.bad
+	LD	HL,300
+	LD	(REG_ROUNDS),HL
+.recv
+	LD	HL,(REG_ROUNDS)
+	DEC	HL
+	LD	(REG_ROUNDS),HL
+	LD	A,H
+	OR	L
+	JP	Z,.bad
+	XOR	A
+	LD	DE,RECV_BUF
+	LD	IX,RECV_BUF_SIZE - 1
+	LD	IY,100
+	LD	B,UNET_FN_RECV
+	CALL	DO_CALL
+	LD	(API_STATUS),A
+	PUSH	IX
+	POP	HL
+	BIT	2,L			; UNET_RXF_LOST = 4
+	JP	NZ,REG_PHASE.bad
+	LD	B,D
+	LD	C,E
+	CALL	REG_SAVE_FIRST
+	LD	HL,RECV_BUF
+.bytes
+	LD	A,B
+	OR	C
+	JR	Z,.block_done
+	PUSH	BC
+	PUSH	HL
+	LD	A,(HL)
+	PUSH	AF
+	LD	HL,(REG_TOTAL)
+	LD	DE,REG_HEADER_LEN
+	OR	A
+	SBC	HL,DE
+	JR	NC,.body
+	LD	HL,(REG_TOTAL)
+	LD	DE,REG_HEADER
+	ADD	HL,DE
+	LD	E,(HL)
+	JR	.expected
+.body
+	LD	A,H
+	CP	32
+	JP	NC,REG_PHASE.byte_bad
+	LD	E,L
+.expected
+	POP	AF
+	CP	E
+	JP	NZ,REG_PHASE.byte_bad_pop
+	CALL	REG_CRC_BYTE
+	LD	HL,(REG_TOTAL)
+	INC	HL
+	LD	(REG_TOTAL),HL
+	POP	HL
+	POP	BC
+	INC	HL
+	DEC	BC
+	JR	.bytes
+.block_done
+	LD	A,(API_STATUS)
+	OR	A
+	JP	Z,REG_PHASE.recv
+	CP	NERR_CLOSED
+	JP	NZ,REG_PHASE.bad
+	LD	HL,(REG_TOTAL)
+	LD	DE,REG_HEADER_LEN + 8192
+	OR	A
+	SBC	HL,DE
+	JP	NZ,REG_PHASE.bad
+	LD	HL,(REG_CRC)
+	LD	DE,0xc79f
+	OR	A
+	SBC	HL,DE
+	JR	NZ,REG_PHASE.bad
+	LD	HL,(REG_CRC+2)
+	LD	DE,0x9d89
+	OR	A
+	SBC	HL,DE
+	JR	NZ,REG_PHASE.bad
+	CALL	REG_REPORT
+	LD	HL,REG_OK
+	JP	PUTS_LN
+; Balanced error exits from the byte loop.
+REG_PHASE.byte_bad
+	POP	AF
+REG_PHASE.byte_bad_pop
+	POP	HL
+	POP	BC
+REG_PHASE.bad
+	CALL	REG_REPORT
+	CALL	DUMP_LASTERR
+	LD	HL,REG_BAD
+	CALL	PUTS_LN
+	CALL	FREE_AND_DONE
+	LD	B,3
+	JP	EXIT
+
+; Record the first eight stream bytes even across short RECV blocks.
+REG_SAVE_FIRST
+	PUSH	BC
+	LD	HL,(REG_TOTAL)
+	LD	A,H
+	OR	A
+	JR	NZ,.done
+	LD	A,L
+	CP	8
+	JR	NC,.done
+	LD	DE,REG_FIRST
+	ADD	HL,DE
+	EX	DE,HL
+	LD	HL,(REG_TOTAL)
+	LD	A,8
+	SUB	L
+	LD	L,A
+	LD	H,0
+	OR	A
+	SBC	HL,BC
+	JR	NC,.have_count
+	LD	C,A
+	LD	B,0
+.have_count
+	LD	A,B
+	OR	C
+	JR	Z,.done
+	LD	HL,RECV_BUF
+	LDIR
+.done
+	POP	BC
+	RET
+
+; Reflected IEEE CRC32, state is complemented only for display.
+REG_CRC_BYTE
+	LD	HL,REG_CRC
+	XOR	(HL)
+	LD	(HL),A
+	LD	B,8
+.bit
+	LD	HL,REG_CRC+3
+	SRL	(HL)
+	DEC	HL
+	RR	(HL)
+	DEC	HL
+	RR	(HL)
+	DEC	HL
+	RR	(HL)
+	JR	NC,.next
+	LD	A,(HL)
+	XOR	0x20
+	LD	(HL),A
+	INC	HL
+	LD	A,(HL)
+	XOR	0x83
+	LD	(HL),A
+	INC	HL
+	LD	A,(HL)
+	XOR	0xB8
+	LD	(HL),A
+	INC	HL
+	LD	A,(HL)
+	XOR	0xED
+	LD	(HL),A
+.next
+	DJNZ	.bit
+	RET
+REG_REPORT
+	LD	HL,REG_PREFIX
+	CALL	PUTS
+	LD	HL,REG_FIRST
+	LD	B,8
+.first
+	LD	A,(HL)
+	CALL	PUT_HEX8
+	INC	HL
+	DJNZ	.first
+	CALL	CRLF
+	LD	HL,REG_LENGTH
+	CALL	PUTS
+	LD	HL,(REG_TOTAL)
+	CALL	PUT_DEC_HL
+	LD	HL,REG_CHECKSUM
+	CALL	PUTS
+	LD	HL,REG_CRC+3
+	LD	B,4
+.crc
+	LD	A,(HL)
+	CPL
+	CALL	PUT_HEX8
+	DEC	HL
+	DJNZ	.crc
+	CALL	CRLF
+	LD	HL,MSG_ASYNC_AGAIN_COUNT
+	CALL	PUTS
+	LD	A,(ASYNC_AGAIN_COUNT)
+	CALL	PUT_DEC_A
+	JP	CRLF
+REG_REQUEST
+	DB "PROPFIND / HTTP/1.1",13,10,"Host: unet-test",13,10
+	DB "Depth: 1",13,10,"Content-Length: 0",13,10,"Connection: close",13,10,13,10
+REG_REQUEST_LEN EQU $ - REG_REQUEST
+REG_HEADER
+	DB "HTTP/1.1 200 OK",13,10,"Content-Length: 8192",13,10,13,10
+REG_HEADER_LEN EQU $ - REG_HEADER
+REG_PREFIX DB "[R1] first8=",0
+REG_LENGTH DB "[R2] length=",0
+REG_CHECKSUM DB " crc32=",0
+REG_OK DB "RESULT OK",0
+REG_BAD DB "RESULT FAIL",0
+
 ; Compare the received datagram with the payload we sent.
 ; Out: ZF=1 on an exact match. Trashes A, B, DE, HL.
 UDP_ECHO_MATCH
@@ -1468,6 +1737,7 @@ PARSE_ARGS
 	LD	(DUAL_MODE),A
 	LD	(LISTEN_MODE),A
 	LD	(ASYNC_MODE),A
+	LD	(REG_MODE),A
 	LD	(UDP_TEST_SIZE),A
 	LD	(UDP_TEST_SIZE+1),A		; default: fixed 21-byte payload
 	; init parse state
@@ -1495,7 +1765,7 @@ PARSE_ARGS
 	LD	HL,TOKEN_BUF
 	LD	DE,STR_DASH_2
 	CALL	STREQ
-	JR	Z,.flag_2
+	JP	Z,.flag_2
 	LD	HL,TOKEN_BUF
 	LD	DE,STR_DASH_L
 	CALL	STREQ
@@ -1504,6 +1774,10 @@ PARSE_ARGS
 	LD	DE,STR_DASH_A
 	CALL	STREQ
 	JP	Z,.flag_a
+	LD	HL,TOKEN_BUF
+	LD	DE,STR_DASH_R
+	CALL	STREQ
+	JP	Z,.flag_r
 	JP	USAGE_EXIT			; unknown flag
 .flag_d
 	LD	DE,DLL_NAME
@@ -1571,6 +1845,18 @@ PARSE_ARGS
 	JP	C,USAGE_EXIT			; -l without a port
 	LD	A,1
 	LD	(LISTEN_MODE),A
+	JP	.next_flag
+.flag_r
+	LD	DE,TOKEN_BUF
+	LD	C,TOKEN_BUF_SIZE
+	CALL	NEXT_TOKEN
+	JP	C,USAGE_EXIT
+	LD	HL,TOKEN_BUF
+	CALL	PARSE_DEC_TOKEN
+	JP	C,USAGE_EXIT
+	LD	(REG_SLICE),HL
+	LD	A,1
+	LD	(REG_MODE),A
 	JP	.next_flag
 .flag_a
 	LD	A,1
@@ -1919,7 +2205,7 @@ PRINT_RECV
 ; ======================================================
 MSG_BANNER	DB "UNETTEST - universal network DLL smoke test",0
 MSG_USAGE	DB "Usage: UNETTEST [-d FILE.DLL] [-u UDPPORT [SIZE]] [-2 DATAPORT]",0
-MSG_USAGE2	DB "               [-l LISTENPORT] [-a] [HOST [PORT]]",0
+MSG_USAGE2	DB "               [-l LISTENPORT] [-a] [-r SLICE] [HOST [PORT]]",0
 MSG_LOADING	DB "Loading ",0
 MSG_DLL		DB "DLL: ",0
 MSG_VER		DB "  v",0
@@ -2025,6 +2311,7 @@ STR_DASH_U	DB "-u",0
 STR_DASH_2	DB "-2",0
 STR_DASH_L	DB "-l",0
 STR_DASH_A	DB "-a",0
+STR_DASH_R	DB "-r",0
 
 REQ_HEAD	DB "HEAD / HTTP/1.0",13,10,"Host: ",0
 REQ_TAIL	DB 13,10,"Connection: close",13,10,13,10,0
@@ -2095,7 +2382,13 @@ LISTEN_MODE	EQU DUAL_MAX_RECV + 2	; 1 = -l given
 ASYNC_MODE	EQU LISTEN_MODE + 1	; 1 = -a given
 LISTEN_RX_LEN	EQU ASYNC_MODE + 1
 ASYNC_AGAIN_COUNT	EQU LISTEN_RX_LEN + 2
-DEC_BUF		EQU ASYNC_AGAIN_COUNT + 1
+REG_MODE	EQU ASYNC_AGAIN_COUNT + 1
+REG_SLICE	EQU REG_MODE + 1
+REG_TOTAL	EQU REG_SLICE + 2
+REG_CRC		EQU REG_TOTAL + 2
+REG_ROUNDS	EQU REG_CRC + 4
+REG_FIRST	EQU REG_ROUNDS + 2
+DEC_BUF		EQU REG_FIRST + 8
 INFO_BUF	EQU DEC_BUF + 8
 DLL_NAME	EQU INFO_BUF + 32
 DLL_PATH	EQU DLL_NAME + DLL_NAME_SIZE

@@ -526,12 +526,16 @@ BUILD_SYN
 	LD	(DE),A
 	INC	DE
 	; advertised window (BE) -- see TCP_RECV_WIN_HI/LO at top.
+	IFDEF UNET_DLL
+	CALL	WRITE_RX_WINDOW
+	ELSE
 	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
 	LD	A,TCP_RECV_WIN_LO
 	LD	(DE),A
 	INC	DE
+	ENDIF
 	; checksum placeholder (0)
 	XOR	A
 	LD	(DE),A
@@ -579,6 +583,18 @@ BUILD_SYN
 ; exponential backoff timer.
 ;   Out: CF set on send error.
 ; ------------------------------------------------------
+	IFDEF UNET_DLL
+WRITE_RX_WINDOW
+	CALL	@UNET.RX_WINDOW
+	LD	A,H
+	LD	(DE),A
+	INC	DE
+	LD	A,L
+	LD	(DE),A
+	INC	DE
+	RET
+	ENDIF
+
 SEND_DUP_ACK
 	CALL	BUILD_ACK
 	LD	HL,@MAIN.TX_BUF
@@ -631,6 +647,9 @@ BUILD_ACK
 	; (see its declaration in memmap.inc) instead of the fixed
 	; constant, so an ACK built while processing a foreign channel's
 	; segment can advertise that channel's true one-MSS pend capacity.
+	IFDEF UNET_DLL
+	CALL	WRITE_RX_WINDOW
+	ELSE
 	IFDEF USE_TCP_MULTICHAN
 	LD	A,(TCP_ADV_WIN_HI)
 	LD	(DE),A
@@ -646,6 +665,8 @@ BUILD_ACK
 	LD	(DE),A
 	INC	DE
 	ENDIF
+	ENDIF
+
 	; csum placeholder
 	XOR	A
 	LD	(DE),A
@@ -1467,10 +1488,9 @@ ADD32_BE_BC
 ; its cumulative ACK, and retransmit the same sequence on a
 ; bounded timeout.  Only one segment is outstanding at once.
 ;
-; If peer data is piggybacked on the ACK, RECV processes and
-; acknowledges it here, then ACK_WAIT_RX_PENDING makes the next
-; public RECV return that same RX_BUF payload without touching the
-; NIC.  A caller must drain such pending data before another SEND.
+; UNET saves peer data through its pre-ACK sink, including on AGAIN/error.
+; Other reliable-send builds keep ACK_WAIT_RX_PENDING in RX_BUF until the
+; caller drains it through RECV.
 ;   In:  HL = data ptr, BC = length (1..MSS=536).
 ;   Out: CF=0 ok; CF=1 fail.
 ; ------------------------------------------------------
@@ -1515,7 +1535,11 @@ SEND
 	; for the build, then restore the post-segment value before the
 	; frame goes on the wire.  Every retry therefore carries the same
 	; sequence number and is safely de-duplicated by the peer.
+	IFDEF UNET_DLL
+	CALL	.REWIND_SEND
+	ELSE
 	CALL	.RESTORE_SEQ
+	ENDIF
 	CALL	BUILD_DATA
 	CALL	.RESTORE_TARGET
 	IFDEF	UNET_DLL
@@ -1576,18 +1600,31 @@ SEND
 	; already published through TCP_RX_DATA_PTR/LEN by RECV.
 	CALL	ACK_TARGET_MATCH
 	JR	NZ,.UNACKED_DATA
+	IFNDEF UNET_DLL
 	LD	A,B
 	OR	C
 	LD	A,ACK_WAIT_IDLE
 	JR	Z,.SET_WAIT_STATE
 	LD	A,ACK_WAIT_RX_PENDING
 .SET_WAIT_STATE
+	ELSE
+	XOR	A
+	ENDIF
 	LD	(TCP_ACK_WAIT_STATE),A
 	XOR	A
 	LD	(TCP_LAST_FAIL),A
 	OR	A
 	RET
 .WAIT_FAIL
+	IFDEF UNET_DLL
+	CALL	ACK_TARGET_MATCH
+	JR	NZ,.UNCONFIRMED
+	XOR	A
+	LD	(TCP_ACK_WAIT_STATE),A
+	LD	(TCP_LAST_FAIL),A
+	RET
+.UNCONFIRMED
+	ENDIF
 	XOR	A
 	LD	(TCP_ACK_WAIT_STATE),A
 	LD	A,(TCP_LAST_FAIL)
@@ -1642,6 +1679,9 @@ SEND
 	SCF
 	RET
 .UNACKED_DATA
+	IFDEF UNET_DLL
+	JP	.WAIT_ACK
+	ELSE
 	; Full-duplex peer data with an ACK below our target is retained,
 	; but RX_BUF cannot be reused for a further ACK wait until the caller
 	; drains it.  Report a bounded protocol failure instead of silently
@@ -1653,7 +1693,19 @@ SEND
 	LD	(TCP_LAST_FAIL),A
 	SCF
 	RET
+	ENDIF
 .RESTORE_SEQ
+	IFDEF UNET_DLL
+	LD	HL,TCP_SND_UNA
+	JR	.COPY_SEQ
+.REWIND_SEND
+	LD	HL,TCP_SEND_SEQ
+.COPY_SEQ
+	LD	DE,TCP_SND_NXT
+	LD	BC,4
+	LDIR
+	RET
+	ELSE
 	LD	HL,TCP_SEND_SEQ
 	LD	DE,TCP_SND_NXT
 	LD	BC,4
@@ -1663,6 +1715,7 @@ SEND
 	LD	BC,4
 	LDIR
 	RET
+	ENDIF
 .RESTORE_TARGET
 	LD	HL,TCP_ACK_WAIT_TARGET
 	LD	DE,TCP_SND_NXT
@@ -1753,7 +1806,39 @@ ACK_TARGET_MATCH
 ;        process that data here, then call CLOSE).
 ;        CF=1 + LAST_FAIL set: error / timeout / RST.
 ; ------------------------------------------------------
+	IFDEF UNET_DLL
+; ACK is independent of incoming payload capacity/sequence. Ignore stale
+; or future ACKs; signed modulo-32 differences also handle sequence wrap.
+UPDATE_SEND_ACK
+	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 11
+	LD	DE,TCP_SND_UNA+3
+	CALL	.ACK_DIFF
+	RET	M
+	LD	HL,TCP_SND_NXT+3
+	LD	DE,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 11
+	CALL	.ACK_DIFF
+	RET	M
+	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 8
+	LD	DE,TCP_SND_UNA
+	LD	BC,4
+	LDIR
+	RET
+.ACK_DIFF
+	LD	B,4
+	OR	A
+.loop
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	SBC	A,C
+	DEC	HL
+	DEC	DE
+	DJNZ	.loop
+	RET
+	ENDIF
+
 RECV
+	IFNDEF UNET_DLL
 	IFDEF USE_TCP_RELIABLE_SEND
 	; SEND may have consumed a payload-bearing ACK while waiting for
 	; its own cumulative ACK.  Deliver that payload exactly once before
@@ -1769,6 +1854,7 @@ RECV
 	OR	A
 	RET
 .START_WAIT
+	ENDIF
 	ENDIF
 	; Initial budget: caller's RECV_TIMEOUT (set via the public
 	; knob) or the 30 000 ms default if the caller didn't touch
@@ -1829,8 +1915,7 @@ RECV
 	LD	A,1			; caller protocol = TCP
 	CALL	@UNET.HANDLE_FOREIGN_FRAME
 	JR	NC,.COMMIT_OTHER
-	; Foreign frame consumed (queued, or dropped+dup-ACKed by
-	; HANDLE_FOREIGN_FRAME's blocked-drain path).  Go to .TICK, NOT
+	; Foreign frame consumed (saved prefix, any unaccepted tail re-ACKed).  Go to .TICK, NOT
 	; .LP: .LP skips the timeout decrement, and the blocked-drain
 	; path's dup-ACK provokes an immediate peer retransmit, so a
 	; blocked channel can refill the ring as fast as we empty it --
@@ -1865,6 +1950,13 @@ RECV
 	; Flags.
 	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)
 	LD	(.FLAGS),A
+	IFDEF UNET_DLL
+	; Account for a valid cumulative ACK even when this segment also closes
+	; the connection.  SEND's error return must still report confirmed bytes.
+	AND	TF_ACK
+	CALL	NZ,UPDATE_SEND_ACK
+	LD	A,(.FLAGS)
+	ENDIF
 	; RST -> immediate fail.
 	AND	TF_RST
 	JR	Z,.NO_RST
@@ -1916,6 +2008,7 @@ RECV
 	INC	HL
 	DJNZ	.CMPSEQ
 .SEQ_OK
+	IFNDEF UNET_DLL
 	; If has ACK, copy ack number into SND_UNA.
 	LD	A,(.FLAGS)
 	AND	TF_ACK
@@ -1925,11 +2018,24 @@ RECV
 	LD	BC,4
 	LDIR
 .NO_ACK
+	ENDIF
 	; Publish the (possibly trimmed) payload.
 	LD	HL,(.SEG_LEN)
 	LD	(TCP_RX_DATA_LEN),HL
 	LD	HL,(.SEG_PTR)
 	LD	(TCP_RX_DATA_PTR),HL
+	IFDEF UNET_DLL
+	; Save only the sequential prefix that fits; never ACK unsaved bytes.
+	CALL	@UNET.STORE_TCP_PAYLOAD
+	LD	HL,(.SEG_LEN)
+	LD	DE,(TCP_RX_DATA_LEN)
+	OR	A
+	SBC	HL,DE
+	JR	Z,.STORED_ALL
+	LD	HL,.FLAGS
+	RES	0,(HL)		; FIN follows the unaccepted suffix
+.STORED_ALL
+	ENDIF
 	; Advance RCV_NXT by data length.
 	LD	BC,(TCP_RX_DATA_LEN)
 	LD	DE,TCP_RCV_NXT
@@ -1942,6 +2048,9 @@ RECV
 	CALL	INC_SEQ32
 	LD	A,ST_CLOSE_WAIT
 	LD	(TCP_STATE),A
+	IFDEF UNET_DLL
+	CALL	@UNET.PEER_CLOSED
+	ENDIF
 .NO_FIN
 		; Decide whether to ACK this segment now.  Force ACK on FIN
 	; (state == CLOSE_WAIT here).  Otherwise apply delayed-ACK:
@@ -2030,6 +2139,11 @@ RECV
 	OR	A
 	RET
 .NORMAL_RETURN
+	IFDEF UNET_DLL
+	LD	A,(TCP_ACK_WAIT_STATE)
+	CP	ACK_WAIT_ACTIVE
+	JP	Z,.TICK		; payload already durable, continue bounded ACK wait
+	ENDIF
 	ENDIF
 	LD	HL,(TCP_RX_DATA_LEN)
 	LD	A,H
@@ -2094,7 +2208,19 @@ RECV
 	LD	HL,(.SEG_LEN)
 	OR	A
 	SBC	HL,DE				; seg_len - delta
+	IFDEF UNET_DLL
+	JR	NZ,.NOT_EXACT
+	LD	A,(.FLAGS)
+	AND	TF_FIN
+	JP	Z,.OUT_OF_ORDER
+	LD	A,(TCP_STATE)
+	CP	ST_CLOSE_WAIT
+	JP	Z,.OUT_OF_ORDER
+	OR	A			; equality accepted: no borrow
+.NOT_EXACT
+	ELSE
 	JP	Z,.OUT_OF_ORDER			; exact duplicate
+	ENDIF
 	JP	C,.OUT_OF_ORDER			; wholly old data
 	; Overlap: keep the tail.  new_len = seg_len - delta,
 	; new_ptr = seg_ptr + delta.
@@ -2124,7 +2250,13 @@ RECV
 		LD	A,(RECV_UNACKED)
 		AND	0x80
 		LD	(RECV_UNACKED),A
+	IFDEF UNET_DLL
+		LD	HL,0
+		LD	(TCP_RX_DATA_LEN),HL
+		JP	.AOK
+	ELSE
 		JP	.TICK
+	ENDIF
 .CANCEL
 	LD	A,F_CANCEL
 	LD	(TCP_LAST_FAIL),A
@@ -2237,12 +2369,16 @@ BUILD_DATA
 	LD	A,TF_PSH | TF_ACK
 	LD	(DE),A
 	INC	DE
-	LD	A,TCP_RECV_WIN_HI	; advertised window hi (BE)
+	IFDEF UNET_DLL
+	CALL	WRITE_RX_WINDOW
+	ELSE
+	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
 	LD	A,TCP_RECV_WIN_LO
 	LD	(DE),A
 	INC	DE
+	ENDIF
 	XOR	A
 	LD	(DE),A			; csum hi
 	INC	DE
@@ -2311,12 +2447,17 @@ BUILD_FIN
 	LD	A,TF_FIN | TF_ACK
 	LD	(DE),A
 	INC	DE
+	IFDEF UNET_DLL
+	CALL	WRITE_RX_WINDOW
+	XOR	A
+	ELSE
 	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
 	XOR	A
 	LD	(DE),A
 	INC	DE
+	ENDIF
 	LD	(DE),A
 	INC	DE
 	LD	(DE),A

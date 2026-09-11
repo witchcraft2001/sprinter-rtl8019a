@@ -24,6 +24,7 @@ node --check "$script_dir/exe-harness/rtl8019-model.js"
 node --check "$script_dir/exe-harness/net-builders.js"
 node --check "$script_dir/exe-harness/harness.js"
 node --check "$script_dir/exe-harness/run.js"
+node --check "$script_dir/exe-harness/unet-probe.js"
 node --check "$script_dir/exe-harness/test-util.js"
 node --check "$script_dir/test-exe-harness.js"
 node --check "$script_dir/test-exe-net.js"
@@ -66,5 +67,8 @@ node "$script_dir/test-exe-tcp.js"
 node "$script_dir/test-exe-dll.js"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$script_dir/dev" \
   python3 "$script_dir/dev/test_unettest_tcp_probe.py"
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$script_dir/dev" \
+  python3 "$script_dir/dev/test_unettest_response_server.py"
 
 echo "Host tests passed"

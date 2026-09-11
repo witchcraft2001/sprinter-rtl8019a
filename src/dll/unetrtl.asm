@@ -616,17 +616,6 @@ F_SEND
 	LD	(SEND_DONE),HL
 	CALL	@ISA.ISA_OPEN
 .chunk
-	; "Anything left to send?" MUST be tested before the pend guard
-	; below, never after.  CAPTURE_SEND_PENDING fills this channel's
-	; pend slot with any reply that rode in on our own segment's ACK,
-	; so after the FINAL chunk the loop comes back here with the work
-	; complete AND the slot occupied.  Guarding first turned that into
-	; NERR_BUSY for a send that had already fully landed -- and a
-	; consumer reacting to BUSY by draining and retrying then sent the
-	; command twice (real FTPC bug report: every FTP login failed, with
-	; the server's own reply to the "refused" PASS sitting in the drain
-	; buffer).  On a lockstep request/response protocol over a fast
-	; link that is the common case, not a corner case.
 	LD	HL,(ARG_IX)
 	LD	DE,(SEND_DONE)
 	OR	A
@@ -646,38 +635,6 @@ F_SEND
 	LD	C,L
 .have
 	LD	(CHUNK_LEN),BC
-	; The channel's own pend slot must be empty before this chunk's
-	; SEND runs.  TCP.SEND's internal wait can receive and ACK
-	; payload piggybacked on our peer's ACK; CAPTURE_SEND_PENDING
-	; below has nowhere to put it if an earlier RECV was never
-	; drained.  That used to silently drop the just-ACKed bytes --
-	; an ACK is a promise to the peer that the data is ours for good,
-	; so losing it after the fact is a protocol-level bug, not a
-	; buffering inconvenience.  Refuse instead: the caller drains via
-	; RECV and retries, exactly as the ABI already documents for the
-	; ESP backend ("peer data arriving during a send may be dropped -
-	; drain RECV before sending").  DE reports bytes sent by EARLIER
-	; chunks in this same call, per the ABI's "valid on error paths".
-	;
-	; Placed here, past the remaining-bytes test, so it can only veto a
-	; transmission that has not happened yet.  It costs nothing to sit
-	; here: A and HL are both reloaded from memory immediately below,
-	; so PEND_LEN_ADDR_A clobbering them is free.
-	;
-	; NERR_BUSY, deliberately NOT NERR_PARAM: PARAM already means "bad
-	; argument" (CHECK_BUF_RANGE above returns it for a rejected
-	; buffer), and a consumer keying "drain RECV, then retry" on a
-	; code that also covers permanent caller bugs will loop forever on
-	; those (real FTPC bug report, 2026-08-05).  BUSY is the frozen
-	; ABI's transient-refusal code for an occupied pend slot; a
-	; SILENT link instead suspends the whole SEND with NERR_AGAIN --
-	; see .fail's F_AGAIN branch below (UNET_CAP_ASYNCSEND).
-	LD	A,(ARG_CH)
-	CALL	PEND_LEN_ADDR_A
-	LD	A,(HL)
-	INC	HL
-	OR	(HL)
-	JR	NZ,.busy
 	LD	HL,(ARG_DE)
 	LD	DE,(SEND_DONE)
 	ADD	HL,DE
@@ -685,17 +642,11 @@ F_SEND
 	CALL	@TCP.SEND
 	JR	C,.fail
 .after_send
-	CALL	CAPTURE_SEND_PENDING
 	LD	HL,(SEND_DONE)
 	LD	BC,(CHUNK_LEN)
 	ADD	HL,BC
 	LD	(SEND_DONE),HL
 	JR	.chunk
-.busy
-	CALL	@ISA.ISA_CLOSE
-	LD	DE,(SEND_DONE)
-	LD	A,NERR_BUSY
-	JP	RET_A
 .done
 	CALL	@ISA.ISA_CLOSE
 	LD	DE,(SEND_DONE)
@@ -706,8 +657,8 @@ F_SEND
 	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_AGAIN
 	JR	Z,.suspend
-	LD	HL,(SEND_DONE)
-	PUSH	HL
+	CALL	SEND_PROGRESS
+	PUSH	DE
 	CALL	CAPTURE_AND_CLOSE
 	CALL	MAP_TCP_SEND_FAIL		; A = NERR_*, CF=0
 	POP	DE
@@ -729,7 +680,7 @@ F_SEND
 	LD	(APEND_DONE),HL
 	LD	HL,(CHUNK_LEN)
 	LD	(APEND_CHUNK),HL
-	LD	DE,(SEND_DONE)
+	CALL	SEND_PROGRESS
 	LD	A,NERR_AGAIN
 	JP	RET_A
 .udp
@@ -759,6 +710,24 @@ F_SEND
 	LD	A,NERR_SEND
 	JP	RET_A
 
+; Confirmed progress includes a partial ACK within the current MSS chunk.
+; The subtraction is modulo 65536: each outstanding segment is <= 536 bytes.
+SEND_PROGRESS
+	LD	A,(TCP_SND_UNA+3)
+	LD	L,A
+	LD	A,(TCP_SND_UNA+2)
+	LD	H,A
+	LD	A,(TCP_SEND_SEQ+3)
+	LD	E,A
+	LD	A,(TCP_SEND_SEQ+2)
+	LD	D,A
+	OR	A
+	SBC	HL,DE
+	LD	DE,(SEND_DONE)
+	ADD	HL,DE
+	EX	DE,HL
+	RET
+
 ; ------------------------------------------------------
 ; Function 7 - RECV.
 ;
@@ -768,6 +737,13 @@ F_SEND
 ; the NIC ring head until its owner is read.
 ; ------------------------------------------------------
 F_RECV
+	CALL	RECV_IMPL
+	PUSH	AF
+	LD	A,0xFF
+	LD	(RX_DIRECT_CH),A
+	POP	AF
+	RET
+RECV_IMPL
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	LD	(ARG_DE),DE
@@ -837,6 +813,8 @@ F_RECV
 	JR	Z,.no_closed_pending
 	JP	.report_closed
 .no_closed_pending
+	LD	A,(ARG_CH)
+	LD	(RX_DIRECT_CH),A
 	LD	A,0xFF
 	LD	(FOREIGN_HINT),A
 	XOR	A
@@ -859,14 +837,12 @@ F_RECV
 	CALL	@TCP.RECV			; -> HL=data, BC=len
 	JR	C,.rx_err_open
 	CALL	@ISA.ISA_CLOSE
-	CALL	COPY_RX_ARG
-	JP	C,.queue_fail
 	; All calls after the first are deliberately one-tick polls.  A
 	; caller's original IY is consumed only by the first TCP.RECV.
 	LD	HL,1
 	LD	(@TCP.RECV_TIMEOUT),HL
 	; A segment carrying FIN is the end of the stream even when its data
-	; fitted exactly.  COPY_RX_ARG has already delivered the bytes.
+	; fitted exactly.  STORE_TCP_PAYLOAD has already delivered the bytes.
 	LD	A,(TCP_STATE)
 	CP	@TCP.ST_CLOSE_WAIT
 	JR	Z,.mark_fin
@@ -958,19 +934,7 @@ F_RECV
 	LD	A,NERR_CLOSED
 	JP	RET_A
 .peer_fin_data
-	LD	HL,(TCP_RX_DATA_PTR)
-	CALL	COPY_RX_ARG
-	JR	C,.queue_fail
 	JR	.return_drain
-.queue_fail
-	CALL	FLUSH_RECV_ACK
-	JR	C,.hw
-	LD	DE,(COPY_LEN)
-	LD	A,D
-	OR	E
-	JR	NZ,.return_drain_ok
-	LD	A,NERR_PROTO
-	JR	.zero_return
 .hw
 	LD	A,NERR_HW
 	JR	.zero_return
@@ -1113,6 +1077,17 @@ F_RECV
 ; so the next public RECV can retry it.
 ; ------------------------------------------------------
 FLUSH_RECV_ACK
+	LD	A,0xFF
+	LD	(RX_DIRECT_CH),A
+	LD	A,(ACTIVE_CH)
+	CALL	DIRTY_ADDR_A
+	LD	A,(HL)
+	LD	(HL),0
+	OR	A
+	JR	Z,.debt
+	LD	HL,@TCP.RECV_UNACKED
+	SET	0,(HL)
+.debt
 	LD	HL,@TCP.RECV_UNACKED
 	RES	7,(HL)
 	LD	A,(HL)
@@ -1178,6 +1153,9 @@ COPY_PENDING_ARG
 	OR	C
 	RET	Z
 	LD	A,(ARG_CH)
+	CALL	DIRTY_ADDR_A
+	LD	(HL),1
+	LD	A,(ARG_CH)
 	CALL	PEND_BUF_ADDR_A
 	EX	DE,HL
 	LD	A,(ARG_CH)
@@ -1235,39 +1213,11 @@ COPY_PENDING_ARG
 	LD	(HL),A
 	RET
 
-; Copy one TCP_RX_DATA segment directly from RX_BUF.  If the caller
-; buffer ends in the middle of it, the unconsumed tail is copied to the
-; existing per-channel pend slot before RX_BUF can be reused.
-; In: HL=source, BC=segment length.  Out: CF only if pend storage fails.
-COPY_RX_ARG
-	PUSH	HL
-	LD	HL,(ARG_IX)
-	OR	A
-	SBC	HL,BC
-	JR	C,.partial
-	POP	HL
-	CALL	COPY_ARG_BC
-	RET
-.partial
-	; Copy the caller-sized prefix first.  COPY_ARG_BC leaves the advanced
-	; source in QUEUE_SRC, which is exactly the tail that must be deferred.
-	POP	HL
-	LD	(QUEUE_LEN),BC
-	LD	BC,(ARG_IX)
-	CALL	COPY_ARG_BC
-	LD	HL,(QUEUE_LEN)
-	SBC	HL,BC
-	LD	B,H
-	LD	C,L
-	LD	HL,(QUEUE_SRC)
-	LD	A,(ARG_CH)
-	JP	QUEUE_TCP_DATA
-
 ; Build IX flags for ARG_CH.  Loss is sticky until reported; the optional
 ; XCHAN bit is driven by queued data/close on the other channel.
 ; Out: IX = RECV flag word.  Preserves DE -- four call sites set the
 ; returned byte count in DE BEFORE calling this (see .report_closed,
-; .idle, .reset_by_peer, .queue_fail), so a clobber here silently
+; .idle, .reset_by_peer), so a clobber here silently
 ; corrupts RECV's return value.  PEND_HAS_A below is the one helper
 ; that used to break that; keep it DE-clean.
 BUILD_RECV_FLAGS
@@ -1998,95 +1948,144 @@ PEND_HAS_A
 	XOR	A			; Z: no pending work for this channel
 	RET
 
-; Append one accepted TCP payload to a channel's private queue.
-; In: A=channel, HL=source, BC=length. Out: CF=1 if it cannot fit.
-QUEUE_TCP_DATA
-	LD	(QUEUE_CH),A
-	LD	(QUEUE_SRC),HL
-	LD	(QUEUE_LEN),BC
+; TCP's pre-ACK sink. Accepted bytes are durable before RCV_NXT moves.
+; Direct caller space is scoped to public RECV on this exact channel.
+; Queue capacity is the unused tail; draining it completely resets offset.
+PEER_CLOSED
+	LD	A,(ACTIVE_CH)
+	CALL	CLOSED_ADDR_A
+	LD	(HL),1
+	RET
+
+DIRTY_ADDR_A
+	LD	HL,WINDOW_DIRTY
+	OR	A
+	RET	Z
+	INC	HL
+	RET
+
+RX_CAPACITY
+	LD	A,(ACTIVE_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	PUSH	DE
+	LD	A,(ACTIVE_CH)
+	CALL	PEND_OFF_ADDR_A
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	POP	HL
+	ADD	HL,DE
+	EX	DE,HL
+	LD	HL,@MAIN.CH_PEND_SIZE
+	OR	A
+	SBC	HL,DE
+	LD	A,(RX_DIRECT_CH)
+	LD	DE,ACTIVE_CH
+	EX	DE,HL
+	CP	(HL)
+	EX	DE,HL
+	RET	NZ
+	LD	DE,(ARG_IX)
+	ADD	HL,DE
+	RET
+
+; Used by every TCP header builder; no cached window can leak across channels.
+RX_WINDOW
+	PUSH	DE
+	CALL	RX_CAPACITY
+	LD	DE,2680
+	OR	A
+	SBC	HL,DE
+	JR	C,.restore
+	LD	HL,0
+.restore
+	ADD	HL,DE
+	LD	A,H
+	LD	(TCP_ADV_WIN_HI),A
+	LD	A,L
+	LD	(TCP_ADV_WIN_LO),A
+	POP	DE
+	RET
+
+STORE_TCP_PAYLOAD
+	CALL	RX_CAPACITY
+	LD	DE,(TCP_RX_DATA_LEN)
+	OR	A
+	SBC	HL,DE
+	JR	NC,.fits
+	ADD	HL,DE
+	LD	(TCP_RX_DATA_LEN),HL
+.fits
+	LD	BC,(TCP_RX_DATA_LEN)
 	LD	A,B
 	OR	C
 	RET	Z
-	LD	HL,(QUEUE_LEN)
-	LD	DE,@MAIN.CH_PEND_SIZE + 1
-	OR	A
-	SBC	HL,DE
-	JR	NC,.full
-	LD	A,(QUEUE_CH)
-	CALL	PEND_LEN_ADDR_A
-	LD	A,(HL)
-	INC	HL
-	OR	(HL)
-	JR	NZ,.full		; one deferred MSS per channel
-	LD	A,(QUEUE_CH)
-	CALL	PEND_BUF_ADDR_A
-	EX	DE,HL			; DE = destination
-	LD	HL,(QUEUE_SRC)
-	LD	BC,(QUEUE_LEN)
-	LDIR
-	LD	A,(QUEUE_CH)
-	CALL	PEND_LEN_ADDR_A
-	LD	BC,(QUEUE_LEN)
-	LD	(HL),C
-	INC	HL
-	LD	(HL),B
-	OR	A
-	RET
-.full
-	LD	A,(QUEUE_CH)
-	CALL	LOST_ADDR_A
-	LD	(HL),1
-	SCF
-	RET
-
-; TCP.SEND may receive and ACK peer payload while it waits for the cumulative
-; ACK.  Move that payload out of the shared frame buffer before another chunk
-; or channel operation overwrites it.
-CAPTURE_SEND_PENDING
-	LD	A,(TCP_ACK_WAIT_STATE)
-	CP	2			; ACK_WAIT_RX_PENDING
-	RET	NZ
+	; RX_BUF is ordinary DLL memory by this point.  Close the ISA window
+	; while copying as much as one Ethernet payload so interrupts are not
+	; held off for the whole LDIR; TCP.RECV expects it open again on return.
+	CALL	@ISA.ISA_CLOSE
 	LD	HL,(TCP_RX_DATA_PTR)
-	LD	BC,(TCP_RX_DATA_LEN)
-	LD	A,(ARG_CH)
-	CALL	QUEUE_TCP_DATA
-	XOR	A
-	LD	(TCP_ACK_WAIT_STATE),A
-	RET
-
-; Check whether the peeked TCP payload fits the owner's pending queue.
-; In: A=owner. Out: CF=0 fits, CF=1 would overflow/malformed.
-FOREIGN_TCP_FITS
-	LD	(QUEUE_CH),A
+	LD	(QUEUE_SRC),HL
+	LD	(QUEUE_LEN),BC
+	LD	A,(RX_DIRECT_CH)
+	LD	HL,ACTIVE_CH
+	CP	(HL)
+	JR	NZ,.queue
+	LD	HL,(ARG_IX)
+	OR	A
+	SBC	HL,BC
+	JR	NC,.direct
+	LD	BC,(ARG_IX)
+.direct
+	LD	A,B
+	OR	C
+	JR	Z,.queue
+	LD	HL,(QUEUE_SRC)
+	CALL	COPY_ARG_BC
+	LD	HL,(QUEUE_LEN)
+	OR	A
+	SBC	HL,BC
+	LD	(QUEUE_LEN),HL
+.queue
+	LD	BC,(QUEUE_LEN)
+	LD	A,B
+	OR	C
+	JR	Z,.done
+	LD	A,(ACTIVE_CH)
 	CALL	PEND_LEN_ADDR_A
-	LD	A,(HL)
+	LD	E,(HL)
 	INC	HL
-	OR	(HL)
-	JR	NZ,.no
-	LD	A,(@MAIN.RX_BUF + 14 + 2)
-	LD	H,A
-	LD	A,(@MAIN.RX_BUF + 14 + 3)
-	LD	L,A
-	LD	DE,20
+	LD	D,(HL)
+	PUSH	DE
+	EX	DE,HL
+	ADD	HL,BC
+	EX	DE,HL
+	LD	A,(ACTIVE_CH)
+	CALL	PEND_LEN_ADDR_A
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+	LD	A,(ACTIVE_CH)
+	CALL	PEND_OFF_ADDR_A
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)
+	POP	HL
+	ADD	HL,DE
+	PUSH	HL
+	LD	A,(ACTIVE_CH)
+	CALL	PEND_BUF_ADDR_A
+	POP	DE
+	ADD	HL,DE
+	EX	DE,HL
+	LD	HL,(QUEUE_SRC)
+	LDIR
+.done
+	CALL	@ISA.ISA_OPEN
 	OR	A
-	SBC	HL,DE
-	JR	C,.no
-	LD	A,(@MAIN.RX_BUF + 14 + 20 + 12)
-	AND	0xF0
-	RRCA
-	RRCA
-	LD	E,A
-	LD	D,0
-	OR	A
-	SBC	HL,DE			; HL = payload length
-	JR	C,.no
-	LD	DE,@MAIN.CH_PEND_SIZE + 1
-	OR	A
-	SBC	HL,DE
-	CCF				; carry when total <= CH_PEND_SIZE
-	RET
-.no
-	SCF
 	RET
 
 ; Called by tcp_lib/udp_lib after a peeked frame did not match the selected
@@ -2116,24 +2115,12 @@ HANDLE_FOREIGN_FRAME
 	JR	NZ,.check_udp
 	CALL	@TCP.IS_TCP_FROM_PEER
 	JP	NC,.restore_not_ours
-	; From here until .tcp_done, any ACK BUILD_ACK sends for this
-	; swapped-in owner context must tell the truth: the owner is not
-	; selected, so its only receive capacity is the single-MSS pend
-	; slot, not the normal window this channel advertises while
-	; active.  Restored to the default below before switching back.
-	LD	A,@TCP.TCP_FOREIGN_WIN_HI
-	LD	(TCP_ADV_WIN_HI),A
-	LD	A,@TCP.TCP_FOREIGN_WIN_LO
-	LD	(TCP_ADV_WIN_LO),A
-	LD	A,(FOREIGN_OWNER)
-	CALL	FOREIGN_TCP_FITS
-	JP	C,.tcp_blocked_drain
 	LD	A,1
 	LD	(FOREIGN_BUSY),A
 	LD	HL,1
 	LD	(@TCP.RECV_TIMEOUT),HL
 	CALL	@TCP.RECV
-	JR	NC,.tcp_data
+	JR	NC,.tcp_done
 	LD	A,(TCP_STATE)
 	CP	@TCP.ST_CLOSE_WAIT
 	JR	Z,.tcp_fin
@@ -2148,20 +2135,11 @@ HANDLE_FOREIGN_FRAME
 	LD	A,(FOREIGN_OWNER)
 	CALL	CLOSED_ADDR_A
 	LD	(HL),1
-	LD	HL,(TCP_RX_DATA_PTR)
-	LD	BC,(TCP_RX_DATA_LEN)
-.tcp_data
-	LD	A,(FOREIGN_OWNER)
-	CALL	QUEUE_TCP_DATA
 .tcp_done
 	XOR	A
 	LD	(FOREIGN_BUSY),A
 	LD	A,0xFF
 	LD	(FOREIGN_HINT),A
-	LD	A,@TCP.TCP_RECV_WIN_HI
-	LD	(TCP_ADV_WIN_HI),A
-	LD	A,@TCP.TCP_RECV_WIN_LO
-	LD	(TCP_ADV_WIN_LO),A
 	LD	A,(FOREIGN_ORIG)
 	CALL	SELECT_CHANNEL
 	XOR	A
@@ -2188,39 +2166,6 @@ HANDLE_FOREIGN_FRAME
 	OR	A
 	RET
 
-.tcp_blocked_drain
-	; The owner's single-MSS pend slot cannot take this segment: it
-	; is still occupied by an earlier undrained one, or (rarely) this
-	; segment alone exceeds CH_PEND_SIZE even with an empty slot.
-	; Previously this frame was left at the ring head (CF=1/A=1
-	; below), which stalls the WHOLE ring -- the DP8390 is a strict
-	; FIFO -- until the app happens to read exactly this channel.  If
-	; the app is busy on the OTHER channel instead (the common case:
-	; e.g. checking a control reply while a data transfer is still
-	; landing), every later frame for every channel becomes
-	; unreachable forever.  Consume it instead.  Nothing is queued --
-	; there is no room -- but re-ACKing the owner's CURRENT RCV_NXT
-	; with an honest window (0 while the slot stays occupied,
-	; TCP_FOREIGN_WIN once it was just this one oversized segment)
-	; tells the peer to slow down instead of silently inviting more
-	; data we cannot hold.  RCV_NXT does not advance, so the peer's
-	; own retransmit timer resends the segment once the app drains
-	; the queue and the window reopens.
-	LD	A,(FOREIGN_OWNER)
-	CALL	PEND_LEN_ADDR_A
-	LD	A,(HL)
-	INC	HL
-	OR	(HL)
-	JR	Z,.drain_ack		; pend empty: only this one segment was too big
-	XOR	A
-	LD	(TCP_ADV_WIN_HI),A
-	LD	(TCP_ADV_WIN_LO),A
-.drain_ack
-	CALL	@TCP.SEND_DUP_ACK
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
-	JR	.tcp_done
-
 ; Forget both contexts and their receive queues.  Used after NETINIT has
 ; closed the old links and reinitialised the card.
 RESET_CHANNEL_STATE
@@ -2236,14 +2181,6 @@ RESET_CHANNEL_STATE
 	; 0x0E23 - 0x01A5 - 1 = 0x0C7D.
 	LD	BC,0x0C7D		; TCP BSS .. end of DLL BSS, minus first byte
 	LDIR
-	; The bulk zero above also cleared TCP_ADV_WIN_HI/LO (it sits
-	; inside the zeroed span); restore it to the normal window --
-	; HANDLE_FOREIGN_FRAME only ever overrides it for the duration of
-	; one nested call and always restores this same default after.
-	LD	A,@TCP.TCP_RECV_WIN_HI
-	LD	(TCP_ADV_WIN_HI),A
-	LD	A,@TCP.TCP_RECV_WIN_LO
-	LD	(TCP_ADV_WIN_LO),A
 	LD	A,0xFF			; 0xFF = no live context selected
 	LD	(ACTIVE_CH),A
 	LD	(FOREIGN_HINT),A
@@ -2880,6 +2817,8 @@ FOREIGN_BUSY	DB 0			; reentrancy guard; OUTSIDE the TARGET_MAC
 	; APEND_DONE/CHUNK are SEND_DONE/CHUNK_LEN snapshots so the resumed
 	; chunk loop does not depend on the TARGET_IP/MAC/DIAG_TX overlay
 	; of that same memory surviving untouched across other calls.
+RX_DIRECT_CH	DB 0xFF
+WINDOW_DIRTY	DB 0,0
 OPT_SLICE	DW 0
 APEND_CH	DB 0xFF
 APEND_BUF	DW 0

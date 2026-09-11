@@ -471,6 +471,50 @@ function tcpSendNextChunk(session, card, tcp) {
   card.schedule(tcp.afterMs ?? 1, seg);
 }
 
+// Optional cumulative-ACK/window-aware deterministic stream peer. One flight
+// at a time; a partial ACK replays the unacknowledged suffix (or an overlap).
+// oversizeFirst deliberately violates MSS/window to test defensive reception.
+function tcpReliableNext(session, card, tcp, seg) {
+  const total = session.responseBytes.length;
+  const acked = (seg.ack - session.responseSeq) >>> 0;
+  // Ignore stale/future ACKs. Math.min() made a wrapped stale ACK look like
+  // a cumulative ACK for the entire response and hid retransmission bugs.
+  if (acked <= total && acked > session.ackedOffset) session.ackedOffset = acked;
+  if (session.finAcked) return;
+  if (session.finSent && seg.ack === ((session.responseSeq + total + 1) >>> 0)) {
+    session.finAcked = true;
+    return;
+  }
+  if (!seg.window) return;
+  let start = session.ackedOffset;
+  let size = Math.min(tcp.mss ?? 536, seg.window, total - start);
+  if (!session.responseStarted && tcp.oversizeFirst) size = Math.min(total, tcp.mss ?? 1460);
+  if (tcp.overlap && session.flightStart < start && start < session.flightEnd) {
+    size += start - session.flightStart;
+    start = session.flightStart;
+    size = Math.min(size, tcp.mss ?? 1460);
+  }
+  const fin = start + size === total && (tcp.finWithData || !size);
+  if (fin) session.finSent = true;
+  session.flightStart = start;
+  session.flightEnd = start + size;
+  const reply = buildTcpSegment(session, {
+    flags: TF_ACK | (size ? TF_PSH : 0) | (fin ? TF_FIN : 0),
+    seq: (session.responseSeq + start) >>> 0,
+    ack: tcp.earlyPayload && !session.responseStarted ? session.requestStart : session.clientNext,
+    payload: Array.from(session.responseBytes.subarray(start, start + size)),
+  });
+  const delay = !session.responseStarted ? (tcp.responseDelayMs ?? 1) : (tcp.afterMs ?? 1);
+  card.generated.push(reply);
+  card.schedule(delay, reply);
+  if (!session.responseStarted && tcp.earlyPayload) {
+    const ack = buildTcpSegment(session, { flags: TF_ACK, seq: session.responseSeq, ack: session.clientNext });
+    card.generated.push(ack);
+    card.schedule(tcp.dataAckDelayMs ?? 80, ack);
+  }
+  session.responseStarted = true;
+}
+
 function respondTcp(frame, card, tcp) {
   const seg = parseTcpSegment(frame);
   if (!seg) return;
@@ -489,7 +533,7 @@ function respondTcp(frame, card, tcp) {
       }
       return;
     }
-    const isn = tcp.isn !== undefined ? tcp.isn >>> 0 : Math.floor(Math.random() * 0xffffffff) >>> 0;
+    const isn = tcp.isn !== undefined ? tcp.isn >>> 0 : 0x12345678;
     session = tcp._sessions[seg.srcPort] = {
       clientMac: seg.sourceMac, clientIp: seg.sourceIp, clientPort: seg.srcPort,
       serverMac: tcp.mac || DEFAULT_SERVER_MAC, serverIp: seg.destIp, serverPort: seg.dstPort,
@@ -508,6 +552,28 @@ function respondTcp(frame, card, tcp) {
   if (session.state === 'syn-rcvd' && (seg.flags & TF_ACK) && seg.payload.length === 0) {
     session.state = 'established';
     session.serverSeq = (session.serverSeq + 1) >>> 0; // our SYN consumed one sequence number
+    return;
+  }
+
+  if (tcp.reliableResponse) {
+    if (seg.payload.length) {
+      if (seg.seq === session.clientNext) {
+        session.requestStart = seg.seq;
+        session.clientNext = (seg.seq + seg.payload.length) >>> 0;
+        session.request = Buffer.concat([session.request || Buffer.alloc(0), Buffer.from(seg.payload)]);
+      }
+      if (!session.responseBytes && session.request?.includes('\r\n\r\n')) {
+        session.responseBytes = buildHttpResponse(tcp);
+        session.responseSeq = session.serverSeq;
+        session.ackedOffset = 0;
+      }
+      if (!tcp.combinedAck || !session.responseBytes) {
+        const ack = buildTcpSegment(session, { flags: TF_ACK, seq: session.serverSeq, ack: session.clientNext });
+        card.generated.push(ack);
+        card.schedule(tcp.dataAckDelayMs ?? 1, ack);
+      }
+    }
+    if (session.responseBytes && !(seg.flags & TF_FIN)) tcpReliableNext(session, card, tcp, seg);
     return;
   }
 

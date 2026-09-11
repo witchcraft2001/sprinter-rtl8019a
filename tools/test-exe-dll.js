@@ -7,11 +7,10 @@
 // STATUS, RESOLVE (literal IP), PING (ICMP through the cold overlay),
 // CONNECT/SEND/RECV/CLOSE over the scripted TCP peer, UDPOPEN/SEND/RECV
 // echo, LISTEN/UNLISTEN arming and bounded accept timeouts, and the
-// ASYNCSEND SETOPT+CONNECT+SEND path.  Two paths still need a real network
+// ASYNCSEND SETOPT+CONNECT+SEND path. Passive accept still needs a real network
 // peer and are covered by docs/UNETRTL_TESTING_RU.md scenarios D/E instead:
-// an actual inbound accept (the harness TCP responder never initiates a
-// connection toward the DSS side) and a forced NERR_AGAIN resume (the
-// responder ACKs instantly, so SEND always settles with 0 resumes here).
+// an actual inbound accept (the ordinary responder does not initiate it).
+// The early-response matrix below forces NERR_AGAIN and exact ACK geometry.
 // SPDX-License-Identifier: BSD-3-Clause
 'use strict';
 
@@ -55,7 +54,7 @@ const run = (name, args, scenario = {}) => runExe(exe(name), args, scenario);
 // ---------------------------------------------------------------------
 // Full ABI flows through the real UNETRTL.DLL.
 // ---------------------------------------------------------------------
-const dllBytes = fs.readFileSync(exe('UNETRTL').replace(/\.EXE$/, '.DLL'));
+const dllBytes = fs.readFileSync(process.env.UNET_TEST_DLL || exe('UNETRTL').replace(/\.EXE$/, '.DLL'));
 const arpToServer = { '192.168.7.1': 'aa:bb:cc:dd:ee:01' };
 const dllScenario = (extra = {}) => ({
   environment: {
@@ -303,6 +302,214 @@ const clone = { quirks: { variant: 'UM9003', hangOnResetPort: true } };
   assert.match(r.output, /ping: \d+ ms/);
   assert.match(r.output, /udp echo ok/);
   count();
+}
+
+// Full 8192-byte stream, including data arriving before SEND returns.
+for (const mss of [536, 1460]) {
+  for (const slice of [0, 25]) {
+    for (const combinedAck of [false, true]) {
+      for (const finWithData of [false, true]) {
+        const r = run('UNETTEST', `-r ${slice} 192.168.7.1 8080`, dllScenario({
+          responders: { arp: arpToServer, tcp: {
+            body: Buffer.from(Array.from({ length: 8192 }, (_, i) => i & 255)),
+            reliableResponse: true, mss, combinedAck, finWithData,
+            oversizeFirst: mss > 536, responseDelayMs: slice ? 80 : 1,
+            dataAckDelayMs: slice ? 80 : 1,
+          } },
+        }));
+        assert.strictEqual(r.exitCode, 0, JSON.stringify({ mss, slice, combinedAck, finWithData }) + '\n' + r.output);
+        assert.match(r.output, /first8=485454502F312E31/);
+        assert.match(r.output, /length=8233 crc32=62763860/);
+        assert.match(r.output, /RESULT OK/);
+        if (slice) assert.match(r.output, /resumes needed: [1-9]/);
+        count();
+      }
+    }
+  }
+}
+
+// Deterministic packet geometry and public ABI failure paths.
+const { probe } = require('./exe-harness/unet-probe');
+const { parseTcpSegment, buildTcpSegment, respond } = require('./exe-harness/net-builders');
+const init = { fn: 3 };
+const connect = (a = 0) => ({ fn: 5, a, de: 'HOST', ix: a ? 'PORT2' : 'PORT' });
+const send = (a = 0) => ({ fn: 6, a, de: 'PAYLOAD', ix: 7 });
+const recv = (size = 1513, a = 0) => ({ fn: 7, a, de: 'BUFFER', ix: size, iy: 10 });
+const close = a => ({ fn: 8, a });
+const payload = Buffer.from(Array.from({ length: 1460 }, (_, i) => i & 255));
+function peer(onData) {
+  return card => {
+    const sessions = {};
+    card.onTransmit = frame => {
+      const seg = parseTcpSegment(frame);
+      if (!seg) { respond(frame, card, { responders: { arp: arpToServer } }); return; }
+      let t = sessions[seg.srcPort];
+      if (seg.flags === 2) {
+        t = sessions[seg.srcPort] = { clientMac: seg.sourceMac, clientIp: seg.sourceIp, clientPort: seg.srcPort,
+          serverMac: seg.destMac, serverIp: seg.destIp, serverPort: seg.dstPort,
+          serverSeq: 0x12345679, clientNext: (seg.seq + 1) >>> 0 };
+        card.schedule(1, buildTcpSegment(t, { flags: 18, seq: t.serverSeq - 1, ack: t.clientNext }));
+      } else if (t) {
+        if (seg.payload.length) t.clientNext = (seg.seq + seg.payload.length) >>> 0;
+        onData({ card, seg, t, sessions, emit: (opts, delay = 1) => card.schedule(delay,
+          buildTcpSegment(t, { flags: 24, seq: t.serverSeq, ack: t.clientNext, ...opts })) });
+      }
+    };
+  };
+}
+function checkProbe(r) {
+  assert.strictEqual(r.exitCode, 0);
+  assert.ok(r.cleanup.isaClosed && r.cleanup.filesClosed);
+  assert.ok(r.events.every(e => (e.lost || []).every(v => v === 0)), 'no silently discarded TCP payload');
+  count();
+}
+{ // Oversized ACK+payload+FIN: 536 durable, remainder not ACKed; overlap
+  // replay must trim the prefix, accept FIN once, and deliver all bytes.
+  let original, injected = false;
+  const r = probe([init, connect(), send(), recv(64), ...Array.from({length: 30}, () => recv(64)), close(0)], dllScenario(), peer(({ seg, t, emit }) => {
+    if (seg.payload.length && !injected) { injected = true; original = t.serverSeq; emit({ flags: 25, payload }); }
+    else if (injected && seg.window && seg.ack > original && seg.ack < original + payload.length) {
+      emit({ flags: 25, seq: original, payload });
+    }
+  }));
+  assert.deepStrictEqual(Buffer.concat(r.results.slice(3, -1).filter(v => v.a === 0 || v.a === 7).map(v => v.data)), payload);
+  const acks = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  assert.ok(acks.some(a => a.ack === original + 536 && a.window === 0));
+  assert.ok(acks.some(a => a.ack === original + payload.length + 1));
+  checkProbe(r);
+}
+{ // Final bytes + FIN entirely during SEND, no retransmission needed to
+  // make closure observable on the subsequent public RECV.
+  const bytes = Buffer.from('final response');
+  const r = probe([init, connect(), send(), recv(), recv(), close(0)], dllScenario(), peer(({seg, emit}) => {
+    if (seg.payload.length) emit({ flags: 25, payload: bytes });
+  }));
+  assert.deepStrictEqual(r.results[3].data, bytes);
+  assert.strictEqual(r.results[4].a, 7); // NERR_CLOSED
+  checkProbe(r);
+}
+{ // Save payload before a failed ACK transmission, then retry ACK and drain.
+  const txError = { attempts: [] };
+  let once = false;
+  const bytes = Buffer.from('durable before failed ACK');
+  const r = probe([init, connect(), send(), recv(), recv(), close(0)], dllScenario({ txError }), peer(({ card, seg, emit }) => {
+    if (seg.payload.length && !once) {
+      once = true; txError.attempts.push(card.txAttempts + 1);
+      emit({ payload: bytes });
+    }
+  }));
+  assert.strictEqual(r.results[2].a, 0);
+  assert.strictEqual(r.results[2].de, 7);
+  assert.deepStrictEqual(r.results[3].data, bytes);
+  checkProbe(r);
+}
+{ // Full pending queue must not prevent ACKing SEND on the same channel.
+  let writes = 0;
+  const r = probe([init, connect(), send(), send(), recv(), close(0)], dllScenario(), peer(({seg, emit}) => {
+    if (seg.payload.length) {
+      writes++;
+      emit({ payload: writes === 1 ? payload.subarray(0,536) : payload.subarray(0,100) });
+    }
+  }));
+  assert.strictEqual(r.results[2].de, 7);
+  assert.strictEqual(r.results[3].a, 0);
+  assert.strictEqual(r.results[3].de, 7);
+  assert.deepStrictEqual(r.results[4].data, payload.subarray(0,536));
+  checkProbe(r);
+}
+{ // Payload with a stale ACK is saved immediately, survives AGAIN, and is
+  // readable while SEND remains suspended. Resume settles on a duplicate-
+  // sequence pure ACK. Its ACK field is independent of receive capacity.
+  const bytes = Buffer.from('early data before outgoing ACK');
+  const r = probe([init, connect(), {fn: 17, a: 3, de: 25}, send(), recv(), send(), send(), send(), close(0)], dllScenario(), peer(({seg, emit}) => {
+    if (seg.payload.length) {
+      emit({ ack: seg.seq, payload: bytes });
+      emit({ flags: 16 }, 70);
+    }
+  }));
+  assert.strictEqual(r.results[3].a, 15); // NERR_AGAIN
+  assert.deepStrictEqual(r.results[4].data, bytes);
+  assert.ok(r.results.slice(5,8).some(v => v.a === 0 && v.de === 7));
+  checkProbe(r);
+}
+{ // Two channels: process a 1460-byte foreign segment while waiting for
+  // the selected channel's ACK, then reopen the owner's zero window.
+  let second, injected = false;
+  const bytes = Buffer.from('selected reply');
+  const r = probe([init, connect(), connect(1), send(), recv(1513,1), recv(), close(0), close(1)], dllScenario(), peer(({seg, t, sessions, card, emit}) => {
+    second = Object.values(sessions).find(v => v.serverPort === 8081);
+    if (seg.payload.length && !injected) {
+      injected = true;
+      card.schedule(1, buildTcpSegment(second, {flags:24,seq:second.serverSeq,ack:second.clientNext,payload}));
+      emit({ payload: bytes }, 2);
+    }
+  }));
+  assert.strictEqual(r.results[3].a, 0);
+  assert.deepStrictEqual(r.results[4].data, payload.subarray(0,536));
+  assert.deepStrictEqual(r.results[5].data, bytes);
+  const wire = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  assert.ok(wire.some(v => v.dstPort === 8081 && v.window === 0));
+  assert.ok(wire.some(v => v.dstPort === 8081 && v.window === 536));
+  assert.ok(wire.some(v => v.dstPort === 8080 && v.window > 0));
+  checkProbe(r);
+}
+
+{ // A partially ACKed SEND times out. DE is the confirmed prefix, and
+  // saved response bytes remain readable on the error path.
+  let once = false;
+  const bytes = Buffer.from('reply despite failed send');
+  const r = probe([init, connect(), send(), recv(), close(0)], dllScenario(), peer(({seg, emit}) => {
+    if (seg.payload.length && !once) {
+      once = true;
+      emit({ ack: (seg.seq + 3) >>> 0, payload: bytes });
+      emit({ flags: 16, ack: (seg.seq + 2) >>> 0 }, 2); // stale: cannot roll back UNA
+      emit({ flags: 16, ack: (seg.seq + 8) >>> 0 }, 3); // future: cannot claim SEND success
+    }
+  }));
+  assert.notStrictEqual(r.results[2].a, 0);
+  assert.strictEqual(r.results[2].de, 3);
+  assert.deepStrictEqual(r.results[3].data, bytes);
+  checkProbe(r);
+}
+{ // RST may carry the final cumulative ACK. The call still reports CLOSED,
+  // but DE must include the prefix the peer acknowledged before closing.
+  let once = false;
+  const r = probe([init, connect(), send()], dllScenario(), peer(({seg, emit}) => {
+    if (seg.payload.length && !once) {
+      once = true;
+      emit({ flags: 20, ack: (seg.seq + 3) >>> 0 });
+    }
+  }));
+  assert.strictEqual(r.results[2].a, 7); // NERR_CLOSED
+  assert.strictEqual(r.results[2].de, 3);
+  checkProbe(r);
+}
+{ // During public RECV a failed ACK cannot hide bytes already copied to
+  // the caller. Retry the debt on the next call; no duplicate delivery.
+  const txError = { attempts: [] };
+  const bytes = Buffer.from('public receive survives ACK error');
+  let once = false;
+  const r = probe([init, connect(), send(), recv(), recv(), close(0)], dllScenario({ txError }), peer(({card, seg, emit}) => {
+    if (seg.payload.length && !once) {
+      once = true;
+      emit({ flags: 16 });
+      emit({ payload: bytes }, 2);
+      txError.attempts.push(card.txAttempts + 2); // pure-ACK reply, then RECV flush
+    }
+  }));
+  assert.deepStrictEqual(r.results[3].data, bytes);
+  assert.strictEqual(r.results[4].de, 0);
+  checkProbe(r);
+}
+
+{ // Same ABI and receive sink after libman relocates the DLL into WIN2.
+  const bytes = Buffer.from('window two final bytes');
+  const r = probe([init, connect(), send(), recv(), recv(), close(0)], dllScenario(), peer(({seg, emit}) => {
+    if (seg.payload.length) emit({ flags: 25, payload: bytes });
+  }), 2);
+  assert.deepStrictEqual(r.results[3].data, bytes);
+  assert.strictEqual(r.results[4].a, 7);
+  checkProbe(r);
 }
 
 console.log(`Actual DSS EXE DLL harness: ${caseCount()} UNETTEST checks passed`);

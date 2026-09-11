@@ -186,3 +186,40 @@ carry enough detail.
 When a new test reveals an actual driver/stack bug, do not fix it silently
 in the same change that adds the harness coverage: report it so scope stays
 separated (harness work vs. bug fixes).
+
+## UNETRTL early-response regression (0.3.1)
+
+The DLL suite runs `UNETTEST -r SLICE HOST PORT` through the real loader
+and compares all 8233 HTTP bytes (8192-byte body), CRC32 `62763860`, first
+8 bytes, EOF, and the absence of LOST. Its 16-case matrix combines blocking
+and genuinely suspended SEND, separate/piggybacked ACK, 536/1460-byte
+segments, and separate/payload-bearing FIN. The 1460-byte first flight
+intentionally violates advertised MSS/window to test defensive reception.
+The optional `reliableResponse` responder tracks cumulative ACK and receive
+window, retransmitting an unacknowledged suffix instead of advancing on
+every ACK. Ordinary socket servers cannot guarantee this packet geometry.
+
+`exe-harness/unet-probe.js` assembles a small libman consumer for further
+public-ABI vectors: 64-byte RECV, filled queue, overlapping retransmissions,
+second channel, payload before ACK followed by AGAIN/resume, failed ACK in
+SEND and RECV, FIN in SEND, and partial outgoing ACK followed by timeout.
+Stale/future ACKs must not roll back progress or claim success. A second
+placement runs the DLL relocated into WIN2 with its consumer in WIN1.
+An ACK-bearing RST also verifies that SEND returns `NERR_CLOSED` with `DE`
+equal to the cumulative progress acknowledged before closure.
+
+Read-only CPU snapshots at assembled SEND/RECV/sink boundaries contain
+receive sequence, send ACK, window, ACK wait state, accepted length, both
+pending lengths and LOST. Public return records contain A/DE/IX, and wire
+frames retain full sequence/ACK/window. To save these diagnostic records:
+
+```sh
+UNET_TRACE=/tmp/unet-rx.jsonl node tools/test-exe-dll.js
+UNET_TEST_DLL=/path/to/old/UNETRTL.DLL node tools/test-exe-dll.js
+```
+
+Trace output appends one JSON line per low-level probe. The old 18084-byte
+0.3.0 DLL fails the exact same 8 KiB test on an ACK carrying 1460 bytes;
+0.3.1 passes. The socket helper has its own fragmented-request/EOF tests
+in `tools/dev/test_unettest_response_server.py`, included in `make test-host`.
+MAME/physical-card and original SNC/WebDAV acceptance remain separate.

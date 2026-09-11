@@ -44,7 +44,7 @@ never calls instead.
 
 The `.EXE` utilities decide for themselves when `NET_RTL_RESET` is
 absent: they read the chip ID and pulse `BASE+0x1F` only for a genuine
-Realtek.  **The DLL cannot** -- the image has single-digit bytes of
+Realtek.  **The DLL cannot** -- the image has very little
 headroom, and the ID probe does not fit.  It defaults to the soft path
 instead, which is the same safe direction reached by a cheaper route,
 and `NETCFG -i` publishes `NET_RTL_RESET=SOFT` after it meets a clone so
@@ -135,14 +135,9 @@ which card it got.  None of them changes the calling convention.
 - **`SETOPT RXTRIG` returns `NERR_NOTSUP`.**  It selects a 16550
   UART FIFO threshold, and there is no UART here.
   `SETOPT CANCELKEYS` works normally.
-- **`NERR_BUSY` means "drain first", not "warming up".**  There is no
-  separate network processor here, so the ESP meaning never applies.
-  Instead a TCP `SEND` returns `NERR_BUSY` when the channel still
-  holds undelivered received data (see "Bounded TCP retransmission"
-  below): call `RECV` to drain it, then repeat the `SEND`.  This is
-  deliberately distinct from `NERR_PARAM`, which always indicates a
-  caller bug (bad channel, buffer out of range) where a retry cannot
-  help.
+- **A full TCP receive queue does not refuse `SEND`.** The DLL advertises
+  zero receive space while it continues to process ACKs of outgoing data.
+  `NERR_BUSY` still applies to unrelated operations during suspended SEND.
 - **`PING` round-trip time is coarse.**  This stack has no
   millisecond timer, so `DE` returns the number of poll-loop ticks
   consumed (roughly milliseconds).  A reply that arrives on the
@@ -177,24 +172,29 @@ stop-and-wait: each segment must receive its cumulative ACK before the
 next segment is sent.  A missing data segment or ACK is retried with the
 same TCP sequence number, up to four transmissions with a one-second ACK
 wait per attempt.  Exhaustion returns `NERR_SEND`; `DE` still reports the
-bytes confirmed before the failing chunk.
+bytes confirmed, including a partial ACK of the failing chunk.
 
-A payload-bearing ACK is not discarded while `SEND` waits.  Its payload
-is retained in that channel's 536-byte receive queue and returned by the
-next `RECV`.  The consumer must drain pending data before another `SEND`
-on the same channel; a `SEND` attempted with the queue still occupied is
-refused with `NERR_BUSY` (`DE` = bytes sent by earlier chunks of the same
-call).  A `SEND` that transmits its whole buffer always reports success,
-even when the peer's reply arrived on that last segment's ACK and is
-already queued -- the refusal can only ever veto a chunk that has not
-gone out, so `NERR_BUSY` never means "your data may or may not have been
-sent".  The safe recovery sequence is: `STATUS` (bit 1, `RXPEND`, reports
-whether the channel holds deliverable data), `RECV` until `RXPEND`
-clears, then repeat the `SEND`.  When the queue is occupied, `RECV`
-serves it directly from memory without touching the NIC.  All `RECV`
-waits are bounded by the caller's `IY` timeout: the millisecond pacing is
-a calibrated CPU loop, not the 50 Hz system tick, so the bound holds
-even while interrupts are disabled by the caller.
+Since 0.3.1, every received TCP payload is saved BEFORE advancing the receive
+sequence or sending its ACK. During public `RECV`, bytes go to the caller
+and then to its pending queue. During `SEND` or foreign-channel processing,
+only the owner's 536-byte queue is available. If a segment exceeds capacity,
+only the fitting sequential prefix is saved and acknowledged. The peer must
+retransmit the remainder; overlapping retransmissions are trimmed. FIN is
+accepted only after all preceding payload is saved. A failed ACK leaves the
+saved bytes available and an ACK debt that the next `RECV` retries.
+
+The advertised window is the available caller capacity plus unused queue
+tail, capped at 2680 bytes. Outside public `RECV`, only queue space counts;
+a full queue advertises zero. Draining the queue reopens its window with an
+ACK update. Partial reads retain the queue's offset until fully drained.
+Window calculation uses the current channel and never inherits another
+channel's receive capacity. Outgoing ACK processing is independent of the
+ability to receive payload, including stale-sequence and zero-window frames.
+A successful `SEND` always returns its full requested length. Final received
+bytes are delivered before closure or with `NERR_CLOSED`.
+
+All waits remain bounded. While SEND is suspended, RECV serves saved bytes
+from memory; the next active network operation publishes freed capacity.
 
 This remains a deliberately small TCP client, not a general TCP engine:
 there is one outstanding segment, no congestion window or fast retransmit,
@@ -320,7 +320,7 @@ works.) See `docs/UNETRTL_TESTING_RU.md` for the MAME walkthrough.
 Channel arguments 0 and 1 have independent TCP/UDP tuples, sequence state,
 timeouts, close state and pending TCP data.  When a frame for the other TCP
 channel reaches the head of the RTL receive ring, the DLL processes and ACKs
-it under that channel's context, then queues its payload before continuing the
+it under that channel's context, saving its payload before ACKing and continuing the
 original wait.  A foreign UDP datagram remains protected at the ring head
 until its owner is read.  `STATUS` reports `UNET_ST_RXPEND`, and `RECV` flag
 bit 3 reports `UNET_RXF_XCHAN`, when the other channel needs service.
@@ -368,4 +368,21 @@ the release archive and the floppy image, so a consumer can take the
 ready-built file without installing the assembler or libman.  Its L1
 header records the ABI line in the numeric version field and the full
 package revision in the 15-byte text tag, for example
-`UNETRTL v0.3.0`.
+`UNETRTL v0.3.1`.
+
+## Complete early-response regression (0.3.1)
+
+Developer floppy: `UNETTEST -r SLICE HOST PORT`. Use `SLICE=0` for blocking
+SEND or `25` for sliced SEND. The host helper is
+`python3 tools/dev/unettest_response_server.py --port 8080`.
+The request is one complete PROPFIND with an empty body. The expected reply
+is 8233 bytes, beginning `HTTP/1.1`, with an 8192-byte body (byte i = i & 255)
+and IEEE CRC32 `62763860`. The test checks every byte, length, checksum,
+absence of LOST, and mandatory EOF, with bounded SEND resumes and 300
+receive polls of at most 100 ms each. It prints first8, length, CRC32,
+resume count and RESULT OK/FAIL. Exit 0 means verified; exit 3 means a
+communication/content failure. Other normal UNETTEST exit codes still apply.
+A socket helper guarantees these bytes, but cannot force TCP segmentation
+or guarantee a nonzero resume count. The host harness controls ACK/data/FIN
+geometry and delay deterministically. MAME/real-card and original SNC
+WebDAV acceptance require their own run and packet capture.

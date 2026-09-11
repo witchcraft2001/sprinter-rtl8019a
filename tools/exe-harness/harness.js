@@ -38,10 +38,21 @@ function runExe(exePath, args = '', inputScenario = {}) {
     throw new Error('invalid DSS EXE header');
   }
   const headerSize = u16(exe, 4), entry = u16(exe, 16), entry2 = u16(exe, 18), stack = u16(exe, 20);
-  if (headerSize !== 128 && headerSize !== 256) throw new Error(`unsupported DSS EXE header size ${headerSize}`);
+  if (headerSize !== 128 && headerSize !== 256 && headerSize !== 512) {
+    throw new Error(`unsupported DSS EXE header size ${headerSize}`);
+  }
   if (entry !== entry2) throw new Error('unsupported DSS EXE header layout (entry mismatch)');
+  // PRELOAD (win0_exe.py, OFFCOD=512): LOADER (u16 at offset 8) is the size of
+  // a stage-1 loader placed at `entry`, DSS loads ONLY that loader and leaves
+  // the .EXE file open positioned right after it -- the loader itself streams
+  // the rest (a size table + up to 3 window blobs) via DSS_READ. See the
+  // SprinTalk port plan's win0 migration and lib/win0/loader.c.
+  const loaderSize = u16(exe, 8);
   const loadAddress = entry - headerSize;
-  if (loadAddress < 0 || loadAddress + exe.length > 0x10000) throw new Error('EXE image does not fit in the 64K address space');
+  const residentLength = loaderSize > 0 ? headerSize + loaderSize : exe.length;
+  if (loadAddress < 0 || loadAddress + residentLength > 0x10000) {
+    throw new Error('EXE image does not fit in the 64K address space');
+  }
 
   // ---- paged memory: 1 MB backing store, 4 x 16 KB windows ----
   const mem = new Uint8Array(0x100000);
@@ -52,6 +63,15 @@ function runExe(exePath, args = '', inputScenario = {}) {
   const card = new Rtl8019(scenario);
   if (scenario.responders) card.onTransmit = (frame) => netBuilders.respond(frame, card, scenario);
   let systemIsa = false, isaOpen = false, selectedSlot = 0;
+  // Simulated keyboard input: `key` delivers one key, `keys` a sequence on
+  // successive SCANKEY pops (SprinTalk needs two ESCs to quit, for one).
+  const keyQueue = scenario.keys ? [...scenario.keys] : (scenario.key ? [scenario.key] : []);
+  const loadKeyRegs = (s, name) => {
+    if (name === 'escape') { s.b = 0; s.d = 1; s.e = 0x1b; }
+    else if (name === 'ctrl-c') { s.b = 0x20; s.d = 0xac; s.e = 0; }
+    else throw new Error(`unknown simulated key ${name}`);
+    s.a = s.e;
+  };
   const closedChipAccesses = [];
   // Off by default: the chip is only ever reachable through the isaOpen-gated
   // path below (by construction), so a closed-window access at this address
@@ -114,7 +134,14 @@ function runExe(exePath, args = '', inputScenario = {}) {
     mem[lin(address)] = value;
   };
 
-  for (let i = 0; i < exe.length; i++) mem[lin(loadAddress + i)] = exe[i];
+  // scenario.dumpAt: {label: address} -- read as a 16-bit LE word whenever a
+  // debugging build wants ad-hoc visibility into specific globals at the
+  // moment of a crash (any of the "unknown ..." throws below). Debugging aid
+  // only; empty/absent in every normal scenario.
+  const dumpAtStr = () => Object.entries(scenario.dumpAt || {})
+    .map(([k, a]) => `${k}=0x${(rd(a) | (rd((a + 1) & 0xffff) << 8)).toString(16)}`).join(' ');
+
+  for (let i = 0; i < residentLength; i++) mem[lin(loadAddress + i)] = exe[i];
 
   const cpu = new Z80({
     mem_read: rd,
@@ -130,7 +157,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
       if (lowPort === 0xa2) return win[1] & 0xff;
       if (lowPort === 0xc2) return win[2] & 0xff;
       if (lowPort === 0xe2) return win[3] & 0xff;
-      throw new Error(`unknown I/O read ${port.toString(16)}`);
+      throw new Error(`unknown I/O read ${port.toString(16)} PC=0x${cpu.getState().pc.toString(16)} ${dumpAtStr()} ` +
+        `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
     },
     io_write: (port, value) => {
       port &= 0xffff; value &= 0xff;
@@ -139,12 +167,30 @@ function runExe(exePath, args = '', inputScenario = {}) {
       // to restore a saved window-3 page) appears here as port
       // `(savedValue<<8)|0xE2`, not bare 0x00E2.
       const lowPort = port & 0xff;
-      if (lowPort === 0x82) { win[0] = value; return; }
-      if (lowPort === 0xa2) { win[1] = value; return; }
-      if (lowPort === 0xc2) { win[2] = value; return; }
+      // ROM overlay control (win0's stage-1 loader clears it before jumping
+      // into the payload, lib/win0/loader.c: "out (#0x3C),a ; ROM overlay
+      // off"). This harness models flat RAM only -- no ROM ever occupies any
+      // window -- so there is nothing to toggle; accept and ignore.
+      if (lowPort === 0x3c) return;
+      // A window port takes a PHYSICAL page number. The backing store models
+      // 1 MB = 64 pages, so anything above that is out of range -- in practice
+      // a DSS block id (GETMEM's return, numbered separately under
+      // scenario.distinctBlockIds) used where a page number is required. Fail
+      // loudly instead of silently reading/writing off the end of the array.
+      const mapWindow = (index, page) => {
+        if (page >= 0x100000 / 0x4000) {
+          throw new Error(`window ${index} mapped to page ${page}, past the harness's ` +
+            `1 MB backing store (64 pages) -- a DSS block id used as a physical page? ` +
+            `PC=0x${cpu.getState().pc.toString(16)}`);
+        }
+        win[index] = page;
+      };
+      if (lowPort === 0x82) { mapWindow(0, value); return; }
+      if (lowPort === 0xa2) { mapWindow(1, value); return; }
+      if (lowPort === 0xc2) { mapWindow(2, value); return; }
       if (lowPort === 0xe2) {
         if (systemIsa && (value === 0xd4 || value === 0xd6)) { selectedSlot = (value - 0xd4) >> 1; return; }
-        win[3] = value;
+        mapWindow(3, value);
         return;
       }
       if (port === 0x1ffd) {
@@ -157,7 +203,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
         isaOpen = true;
         return;
       }
-      throw new Error(`unknown I/O write ${port.toString(16)}=${value.toString(16)}`);
+      throw new Error(`unknown I/O write ${port.toString(16)}=${value.toString(16)} PC=0x${cpu.getState().pc.toString(16)} ${dumpAtStr()} ` +
+        `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
     },
   });
 
@@ -176,6 +223,16 @@ function runExe(exePath, args = '', inputScenario = {}) {
   for (let i = 0; i < 256; i++) wr(cmdAddress + i, 0);
   wr(cmdAddress, cmdLength);
   for (let i = 0; i < args.length; i++) wr(cmdAddress + 1 + i, args.charCodeAt(i));
+  // Real DSS's PSP continues past the cmdline text with the full path this
+  // .EXE was launched from (used by lib/win0/loader.c's own APPINFO-free app
+  // directory resolution: `psp + psp[0] + 3`, see the SprinTalk port plan).
+  // Optional -- most scenarios don't need it and the 3-byte gap stays zero.
+  if (scenario.pspPath) {
+    const pathBytes = Buffer.from(scenario.pspPath, 'ascii');
+    const pathAddress = (cmdAddress + cmdLength + 3) & 0xffff;
+    for (let i = 0; i < pathBytes.length; i++) wr(pathAddress + i, pathBytes[i]);
+    wr(pathAddress + pathBytes.length, 0);
+  }
 
   let state = cpu.getState();
   state.pc = entry; state.sp = stack; state.ix = cmdAddress;
@@ -217,16 +274,39 @@ function runExe(exePath, args = '', inputScenario = {}) {
   let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0;
   let fileReadCalls = 0, fileWriteCalls = 0, totalWritten = 0, clockReads = 0, scanCount = 0;
 
+  // ---- PRELOAD: leave the .EXE file itself open, positioned right after the
+  // loader, with its handle at psp[-3] (CLP_FM) -- exactly what a real DSS
+  // EXEC does for a two-stage EXE. loader.c reads both from IX (== cmdAddress
+  // here, per the existing PSP setup above).
+  if (loaderSize > 0) {
+    const handle = nextHandle++;
+    openFiles.set(handle, { name: '<SELF>', data: Buffer.from(exe), offset: headerSize + loaderSize });
+    wr((cmdAddress - 3) & 0xffff, handle);
+  }
+
   // ---- paged memory allocation (GETMEM/FREEMEM/SETWIN1-3) ----
+  // Real DSS hands out a BLOCK ID (1..255, BIOS EMM_FN2), which is NOT a
+  // physical page number: only SETWIN (block, index) understands one, while
+  // the window ports #82/#A2/#C2/#E2 take physical pages. Programs that cache
+  // a page for later raw OUTs must read it back (inp(port) after a SETWIN, or
+  // BIOS EMM_FN4) -- see lib/win0/loader.c and libman's _L_CALL.
+  //
+  // By default this model keeps block id == first physical page, which is
+  // convenient but silently forgives that confusion. scenario.distinctBlockIds
+  // numbers block ids from a separate space so a raw OUT of a block id maps a
+  // page that was never allocated and the program fails loudly, as on hardware.
   let nextBank = 16;
-  const allocations = new Map(); // base bank id -> page count
-  const allocatedBank = (bank) => {
-    for (const [base, count] of allocations) if (bank >= base && bank < base + count) return true;
-    return false;
+  let nextBlockId = 200;
+  const allocations = new Map(); // block id -> [physical pages]
+  const blockPage = (block, index) => {
+    const pages = allocations.get(block);
+    if (!pages) throw new Error(`SETWIN of unknown block id ${block}`);
+    if (index >= pages.length) throw new Error(`SETWIN page ${index} past block ${block} (${pages.length} pages)`);
+    return pages[index];
   };
 
   const dssEvents = [];
-  let stdout = '', exitCode = null, steps = 0, minimumSp = stack, logicalMs = 0;
+  let stdout = '', exitCode = null, steps = 0, minimumSp = stack, logicalMs = 0, stopHits = 0;
   let pagesFreedBeforeExit = true;
   const pcTrace = [];
 
@@ -342,11 +422,22 @@ function runExe(exePath, args = '', inputScenario = {}) {
       }
       case 0x31: { // SCANKEY: ZF=1 no key; else A=E=ascii, D=scan, B=modifiers
         scanCount++;
-        if (scenario.key && scanCount === (scenario.keyAtScan || 1)) {
-          if (scenario.key === 'escape') { s.b = 0; s.d = 1; s.e = 0x1b; }
-          else if (scenario.key === 'ctrl-c') { s.b = 0x20; s.d = 0xac; s.e = 0; }
-          else throw new Error(`unknown simulated key ${scenario.key}`);
-          s.a = s.e; s.flags.Z = 0; setCarry(s, false); return ret(s);
+        if (keyQueue.length && scanCount >= (scenario.keyAtScan || 1)) {
+          loadKeyRegs(s, keyQueue.shift());
+          s.flags.Z = 0; setCarry(s, false); return ret(s);
+        }
+        s.a = 0; s.b = 0; s.d = 0; s.e = 0; s.flags.Z = 1; setCarry(s, false); return ret(s);
+      }
+      case 0x37: { // TESTKEY: same registers as SCANKEY, but does NOT consume.
+        // Interactive DSS apps peek with #37 and only pop with #31 once they
+        // know a key is there (see the Sprinter SDK's dss_testkey/dss_scankey
+        // and SprinTalk's main loop), so a harness without this stops any such
+        // program dead at its first idle poll.
+        scanCount++;              // a peek is a poll: a program that only ever
+                                  // peeks while idle must still reach keyAtScan
+        if (keyQueue.length && scanCount >= (scenario.keyAtScan || 1)) {
+          loadKeyRegs(s, keyQueue[0]);
+          s.flags.Z = 0; setCarry(s, false); return ret(s);
         }
         s.a = 0; s.b = 0; s.d = 0; s.e = 0; s.flags.Z = 1; setCarry(s, false); return ret(s);
       }
@@ -355,25 +446,32 @@ function runExe(exePath, args = '', inputScenario = {}) {
       }
       case 0x38: { // SETWIN: A=block, B=index, H=window*0x40
         const windowIndex = (s.h >> 6) & 3;
-        const page = s.a + s.b;
-        if (!allocatedBank(page)) throw new Error(`SETWIN of unallocated page ${page}`);
-        win[windowIndex] = page; setCarry(s, false); return ret(s);
+        const page = blockPage(s.a, s.b);
+        win[windowIndex] = page; setCarry(s, false);
+        if (scenario.traceDss) dssEvents.push(`SETWIN${windowIndex} <- ${page}`);
+        return ret(s);
       }
       case 0x39:
       case 0x3a:
       case 0x3b: { // SETWIN1/2/3 shortcuts
         const windowIndex = fn - 0x38;
-        const page = s.a + s.b;
-        if (!allocatedBank(page)) throw new Error(`SETWIN${windowIndex} of unallocated page ${page}`);
-        win[windowIndex] = page; setCarry(s, false); return ret(s);
+        const page = blockPage(s.a, s.b);
+        win[windowIndex] = page; setCarry(s, false);
+        if (scenario.traceDss) dssEvents.push(`SETWIN${windowIndex} <- ${page}`);
+        return ret(s);
       }
-      case 0x3d: { // GETMEM: B = page count -> A = base bank id
+      case 0x3d: { // GETMEM: B = page count -> A = block id
         const count = s.b || 1;
         const base = nextBank; nextBank += count;
-        allocations.set(base, count);
-        setCarry(s, false); s.a = base; return ret(s);
+        const pages = Array.from({ length: count }, (_, i) => base + i);
+        const block = scenario.distinctBlockIds ? nextBlockId++ : base;
+        allocations.set(block, pages);
+        setCarry(s, false); s.a = block;
+        if (scenario.traceDss) dssEvents.push(`GETMEM ${count} -> block ${block} (pages ${pages.join(',')})`);
+        return ret(s);
       }
       case 0x3e: { // FREEMEM
+        if (scenario.traceDss) dssEvents.push(`FREEMEM ${s.a}`);
         if (!allocations.delete(s.a)) throw new Error(`FREEMEM of unknown block ${s.a}`);
         setCarry(s, false); return ret(s);
       }
@@ -418,6 +516,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
         if (s.b === 2) { writeCstr((s.h << 8) | s.l, `${scenario.appDir || 'C:\\NET'}\\APP.EXE`); setCarry(s, false); return ret(s); }
         throw new Error(`unknown APPINFO subfunction ${s.b}`);
       }
+      case 0x52: setCarry(s, false); return ret(s); // GOTOXY: no screen to model, stub ok
+      case 0x56: setCarry(s, false); return ret(s); // CLEAR: no screen to model, stub ok
       case 0x5b: stdout += String.fromCharCode(s.a); setCarry(s, false); return ret(s);
       case 0x5c: stdout += cstr((s.h << 8) | s.l); setCarry(s, false); return ret(s);
       default: throw new Error(`unknown DSS call 0x${fn.toString(16)}`);
@@ -435,19 +535,38 @@ function runExe(exePath, args = '', inputScenario = {}) {
       s.sp = (s.sp + 2) & 0xffff; s.pc = lo | (hi << 8); cpu.setState(s);
     };
     if (fn === 0xc4) { // EMM_FN4: A=block_id, B=index -> A=phys page
-      s.a = (s.a + s.b) & 0xff;
+      // Must go through the allocation table, exactly like SETWIN: this is
+      // the other half of "a block id is not a page". UNETRTL.DLL's own INIT
+      // GETMEMs a page and then EMM_FN4s it before OUTing to port 0xE2, so
+      // returning block+index here handed it a number no window can take.
+      s.a = blockPage(s.a, s.b);
       retB(); return;
     }
-    throw new Error(`unknown BIOS call 0x${fn.toString(16)}`);
+    throw new Error(`unknown BIOS call 0x${fn.toString(16)} return-to=0x${(rd(s.sp) | (rd((s.sp + 1) & 0xffff) << 8)).toString(16)} ${dumpAtStr()} ` +
+      `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
   };
 
   try {
     const limit = scenario.stepLimit || 200_000_000;
     for (;;) {
       const st0 = cpu.getState();
+      // Test-only observation/injection at actual assembled instruction boundaries.
+      scenario.cpuProbes?.[st0.pc]?.({ state: st0, read: rd, card, win, logicalMs });
       minimumSp = Math.min(minimumSp, st0.sp);
-      if (scenario.stopPc !== undefined && st0.pc === scenario.stopPc) {
+      if (scenario.stopPc !== undefined && st0.pc === scenario.stopPc &&
+          (scenario.stopWin0 === undefined || win[0] === scenario.stopWin0) &&
+          (!scenario.stopWin || win[scenario.stopWin[0]] === scenario.stopWin[1]) &&
+          (++stopHits >= (scenario.stopHit || 1))) {
+        // scenario.dumpAt: {label: address} -- read as a 16-bit LE word at
+        // stop time, for ad-hoc inspection of specific globals (debugging
+        // aid; a thrown stopPc otherwise only reports registers/PC trace).
+        const at = Object.entries(scenario.dumpAt || {})
+          .map(([k, a]) => `${k}=0x${(rd(a) | (rd((a + 1) & 0xffff) << 8)).toString(16)}`).join(' ');
         throw new Error(`stop PC=${st0.pc.toString(16)} SP=${st0.sp.toString(16)} A=${st0.a.toString(16)} ` +
+          `HL=${st0.h.toString(16)}${st0.l.toString(16).padStart(2, '0')} ` +
+          `DE=${st0.d.toString(16)}${st0.e.toString(16).padStart(2, '0')} ` +
+          `BC=${st0.b.toString(16)}${st0.c.toString(16).padStart(2, '0')} ` +
+          `win=${win.map((v) => v.toString(16)).join(',')} ${at} ` +
           `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
       }
       if (scenario.strictPc && st0.pc !== 0x0008 && st0.pc !== 0x0010 && st0.pc < loadAddress
@@ -485,7 +604,17 @@ function runExe(exePath, args = '', inputScenario = {}) {
       }
     }
   } catch (error) {
-    if (!error || !error.dssExit) throw error;
+    if (!error || !error.dssExit) {
+      // Preserve whatever the program printed/did before a genuine crash --
+      // the thrown Error otherwise loses it, which makes diagnosing "why"
+      // much harder than it needs to be (see e.g. the win0 migration's own
+      // debugging session for this harness).
+      if (error && typeof error === 'object') {
+        error.partialOutput = stdout;
+        error.partialDssEvents = dssEvents;
+      }
+      throw error;
+    }
   }
 
   return {

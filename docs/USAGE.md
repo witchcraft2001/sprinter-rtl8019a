@@ -44,3 +44,10 @@ use `ISAPROBE.EXE` with the procedures in `ISAPROBE.TXT`.
 For driver-level details, NIC register descriptions, and MAME
 network setup see `sprinter_rtl8019_soft.md` and
 `docs/MAME_NETWORK.md` in the source tree.
+
+Developer floppy diagnostic: `UNETTEST -r SLICE HOST PORT` verifies a full
+8192-byte HTTP body against the supplied host response server. `SLICE=0`
+is blocking, `25` uses SENDSLICE. Exit 0 requires exact content, CRC32 and
+EOF without LOST; exit 3 reports transport/content failure, 1 usage,
+2 DLL/load/hardware failure, 4 missing network configuration.
+See UNETRTL.TXT for the response format and host helper.
