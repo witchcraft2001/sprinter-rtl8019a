@@ -13,39 +13,86 @@ notes for MAME network setup are in `docs/MAME_NETWORK.md`.
 
 The release archive contains the supported end-user utilities:
 
-- `PING` (with `-t/-n/-l/-i/-w` Windows-style flags), `TFTP`,
-  `NTP`, and `NSLOOKUP`.
-- `NETCFG`, `IFUP` (static + DHCP), `WGET` (HTTP/1.0),
-  `FTP` (passive mode, work in progress), `TELNET` (ANSI/VT100,
-  Zmodem and Ymodem).
+- Setup and diagnostics: `NETCFG`, `IFUP` (static + DHCP),
+  `NICINFO`, `ISAPROBE`, `NICEEP`.
+- Network clients: `PING` (with `-t/-n/-l/-i/-w` Windows-style
+  flags), `NSLOOKUP`, `NTP` (sets the DSS clock), `TFTP`
+  (GET/PUT with RFC 2348 blksize), `WGET` (HTTP/1.0 with redirects
+  and `-r` resume), `FTP` (passive mode; download, upload, `LIST`
+  and `NLST`), `TELNET` (ANSI/VT100 with Zmodem, Ymodem and
+  Ymodem-G).
 
-Stage 11 adds `UNETRTL.DLL`, a loadable library that exposes the
+The staged NIC bring-up diagnostics (`HELLO`, `NICRAM`, `NICLB`,
+`NICTX`, `NICRX`, `NICMODE`, `ARP`, `UDPTEST`, the `DL*` throughput
+probes and `UNETTEST`) are built and copied to the floppy image but
+stay out of the release archive; see `tools/artifacts.sh`.
+
+`UNETRTL.DLL` is a loadable library (libman 1.3 / L1) that exposes the
 stack to other DSS programs through the same numbered API the
 Sprinter Wi-Fi kit implements, so one consumer binary can drive
-either card.  The ready-built DLL is committed at the repository root
-and ships in both release formats; its L1 header includes the full
-human-readable package tag. See `docs/UNETRTL.md`.
+either card.  It covers TCP (connect, listen, blocking and
+non-blocking send), UDP, DNS resolution and ping across two
+independent channels.  The ready-built DLL is committed at the
+repository root and ships in both release formats; its L1 header
+includes the full human-readable package tag. See `docs/UNETRTL.md`
+and `docs/UNET_API_RU.md`.
+
+A host-side test harness runs the real built `.EXE` files under a
+Z80 / DSS / ISA / RTL8019AS model, with no emulator boot, via
+`make test-host`.  It is a mandatory step of every code change; see
+`docs/HARNESS.md`.
 
 ## Supported cards
 
-Developed against Realtek RTL8019AS, but the driver is plain
-NE2000/DP8390 and other clones work.  A **UMC UM9003AF** is verified end
-to end on real hardware (NICINFO / NICRAM / NICLB / NICTX / NICRX all
-pass, and FTP and WGET download files).  Two settings are needed for it,
-both in `NET.CFG`:
+The driver is a plain NE2000 / DP8390 implementation, so it is not tied
+to the Realtek part it was developed against.  These four ISA-8 cards
+are verified end to end on a real Sprinter:
+
+| Card                        | Controller | Media     | `NET.CFG` |
+|-----------------------------|------------|-----------|-----------|
+| P/N 142091-401              | RTL8019AS  | RJ45, BNC | none      |
+| CUBIK x86 ISA LAN+USB       | RTL8019AS  | RJ45      | none      |
+| RTL8019AS combo, green PCB  | RTL8019AS  | RJ45, BNC | none      |
+| UMC UM9003AF ver 1.0        | UM9003AF   | RJ45, BNC | `RTL_HW`  |
+
+Realtek P/N 142091-401, in the slot it was developed on:
+
+![RTL8019AS 142091-401 in a Sprinter ISA slot](docs/img/card-rtl8019as-142091-installed.jpg)
+
+CUBIK x86 ISA LAN+USB, a current-production board (the USB half is
+unrelated to this kit and needs its own driver):
+
+![CUBIK x86 ISA LAN+USB](docs/img/card-cubik-isa-lan-usb.jpg)
+
+RTL8019AS combo card, green PCB:
+
+![RTL8019AS combo card with RJ45 and BNC connectors](docs/img/card-rtl8019as-bnc.jpg)
+
+UMC UM9003AF ver 1.0:
+
+![UMC UM9003AF ISA network card](docs/img/card-umc-um9003af.jpg)
+
+### Cards without the Realtek ID
+
+The I/O base auto-scan walks both ISA slots and all sixteen jumperless
+bases from `0x200` to `0x3E0`, but it demands the Realtek 8019 ID `Pp`
+on page 0 before it claims a base, because a floating or mirrored ISA
+window can otherwise pass the register probe.  The UM9003AF answers
+`20 01`, so it must be pinned:
 
 ```
-RTL_HW=0/#300      pin slot + I/O base: the card has no Realtek 8019 ID
-                   (its page-0 ID reads 20 01), so the auto-scan will
-                   not accept it
+RTL_HW=0/#300
 ```
 
-`RTL_RESET=SOFT` is no longer needed for it.  The NE2000 board reset
-port at `BASE+0x1F` stalls the ISA bus cycle on this card and freezes
-the machine, so the driver reads the chip ID first and pulses that port
-only for a card that identifies as a genuine Realtek.  `NETCFG -i`
-reports `[W03] non-Realtek clone: board reset port skipped` when it
-takes the safe path.  See `HOWTO.md` for the explicit overrides.
+The digits are the ISA slot (`0` or `1`) and the hex I/O base.  A pinned
+base skips the signature check and accepts any responding NE2000 core,
+so the same applies to any other clone.
+
+`RTL_RESET` is not needed.  The driver reads the chip ID and pulses the
+NE2000 board reset port at `BASE+0x1F` only for a genuine Realtek; that
+port stalls the ISA bus cycle on this card and would freeze the machine.
+`docs/HOWTO.md` covers the explicit overrides, and `docs/ISAPROBE.md`
+what to do when a card is not found at all.
 
 ## Installing on Sprinter DSS
 
@@ -58,8 +105,11 @@ sample config:
 REN NETSMPL.CFG NET.CFG
 ```
 
-Then edit `NET.CFG` for your local network (`RTL_IOBASE`, `IP`, `NETMASK`,
-`GATEWAY`, ...).
+Then edit `NET.CFG` for your local network.  The keys are `RTL_HW`
+(ISA slot and I/O base as `S/#HHH`), `RTL_IRQ`, `RTL_RESET`, `RTL_MAC`,
+`IP` (a literal address or the keyword `DHCP`), `NETMASK`, `GATEWAY`,
+`DNS1`, `DNS2`, `TZ` and `NTP`.  The template documents each one
+inline; every key is optional except `IP`.
 
 Run `NETCFG -i`, then `IFUP`, and use `PING` to verify connectivity.
 For hardware troubleshooting, `NICINFO`, `ISAPROBE` and `NICEEP` are
@@ -71,14 +121,20 @@ without a DOS machine and the vendor's setup utility.
 ## Build
 
 Requires `sjasmplus` in `PATH`. `make package` additionally needs `zip`;
-`make image` additionally needs `mtools` (`mformat`, `mcopy`).
+`make image` additionally needs `mtools` (`mformat`, `mcopy`);
+`make test-host` needs `node`.
 
 ```
 make build      # assemble src/apps/*.asm into build/*.EXE
+make test-host  # run the host-side EXE harness suites
 make package    # produce distr/sprinter-rtl8019a.zip
 make image      # produce distr/sprinter-rtl8019a.img (FAT12 floppy)
 make clean      # remove build/ and the two distr artifacts
 ```
+
+The normal development cycle is `make test-host package image`, because
+the MAME test stand boots from the floppy image and a fresh `.EXE` in
+`build/` is invisible until the image is rebuilt.
 
 Direct sjasmplus invocation for a single source:
 
@@ -345,10 +401,13 @@ src/include/      shared includes (DSS, Sprinter, RTL8019AS constants, macros,
 src/lib/          reusable driver and stack modules
 src/dll/          libman 1.3 / L1 loadable libraries (UNETRTL.DLL)
 src/apps/         utility entry points
-config/           NET.CFG.sample
+config/           NETSMPL.CFG configuration template
 docs/             user docs (shipped) and developer docs (not shipped)
+docs/img/         card photos for this README (not shipped)
+docs/evidence/    dated hardware / MAME acceptance records
 examples/         DSS batch files and host-side helpers
 tools/            build / package / image scripts and dev helpers
+tools/exe-harness/  host-side Z80 / DSS / RTL8019AS test harness
 build/            generated EXE outputs (ignored)
 distr/            generated zip and floppy image (ignored)
 ```
