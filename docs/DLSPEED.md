@@ -50,7 +50,10 @@ KB/s, `Integrity: OK`, and `RESULT OK`.
 
 DLSPEED requests four TCP MSS blocks (2144 bytes) per public `RECV`. This is
 intentional: it verifies that UNETRTL ends the call with a cumulative ACK
-after three segments and leaves the fourth segment for the next call.
+after three segments and leaves the fourth segment for the next call. Since
+UNETRTL 0.3.2, the next call sends a window update before waiting, reopening
+the transient caller capacity to the 2680-byte cap instead of leaving the peer
+permanently throttled to the 536-byte durable queue.
 
 ## DLL versus direct A/B test
 

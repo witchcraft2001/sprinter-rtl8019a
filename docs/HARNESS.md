@@ -223,3 +223,19 @@ Trace output appends one JSON line per low-level probe. The old 18084-byte
 0.3.1 passes. The socket helper has its own fragmented-request/EOF tests
 in `tools/dev/test_unettest_response_server.py`, included in `make test-host`.
 MAME/physical-card and original SNC/WebDAV acceptance remain separate.
+
+## UNETRTL receive-window throughput regression (0.3.2)
+
+The DLL probe also drives both TCP channels through 12000-byte deterministic
+streams using repeated blocking 2048-byte RECV calls. Its peer obeys the
+cumulative ACK and advertised window exactly. The test checks the complete
+byte stream, zero LOST reports, and a same-ACK wire update from the 536-byte
+durable window at the end of one call to 2584 bytes at the start of the next.
+This distinguishes the fixed path from 0.3.1, which delivered only one
+536-byte MSS per public call after the first window closed.
+
+A fault-injected transmit failure on that opening window update must produce
+NERR_HW with DE=0 and IX=0, preserve a RECV/LASTERR diagnostic, restore the
+caller's receive scope, and leave ISA closed. Existing vectors continue to
+cover foreign-channel capacity (0/536 only), pre-ACK payload and FIN, overlap
+retransmission, failed final ACK, and relocation of the DLL into WIN1 or WIN2.

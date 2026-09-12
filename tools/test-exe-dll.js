@@ -454,6 +454,118 @@ function checkProbe(r) {
   checkProbe(r);
 }
 
+{ // A blocking RECV lends its caller buffer to the selected channel's
+  // advertised window.  The final ACK deliberately retracts that transient
+  // capacity to the durable 536-byte queue; the next active RECV must publish
+  // the newly available 2048-byte caller buffer before it waits for data.
+  // Exercise both channels with a peer that sends no farther than the current
+  // cumulative ACK + window edge.  Without the opening update each call can
+  // advance by only one MSS and neither stream completes in this call budget.
+  const streams = {
+    8080: Buffer.from(Array.from({ length: 12000 }, (_, i) => (i * 17 + 3) & 255)),
+    8081: Buffer.from(Array.from({ length: 12000 }, (_, i) => (i * 29 + 11) & 255)),
+  };
+  const flow = new Map();
+  const setup = peer(({ card, seg, t, emit }) => {
+    let f = flow.get(t.serverPort);
+    if (seg.payload.length && !f) {
+      f = { base: t.serverSeq, acked: 0, sent: 0, bytes: streams[t.serverPort] };
+      flow.set(t.serverPort, f);
+      emit({ flags: 16 }, 1);       // settle the client's request SEND
+    }
+    if (!f) return;
+    const acked = (seg.ack - f.base) >>> 0;
+    if (acked <= f.bytes.length && acked > f.acked) f.acked = acked;
+    const edge = Math.min(f.bytes.length, f.acked + seg.window);
+    const delay = 1;
+    while (f.sent < edge) {
+      const size = Math.min(536, edge - f.sent);
+      const last = f.sent + size === f.bytes.length;
+      card.schedule(delay, buildTcpSegment(t, {
+        flags: 16 | 8 | (last ? 1 : 0),
+        seq: (f.base + f.sent) >>> 0,
+        ack: t.clientNext,
+        payload: Array.from(f.bytes.subarray(f.sent, f.sent + size)),
+      }));
+      f.sent += size;
+    }
+  });
+  const callsPerChannel = 10;
+  const commands = [init, connect(), connect(1), send(),
+    ...Array.from({ length: callsPerChannel }, () => recv(2048)),
+    send(1),
+    ...Array.from({ length: callsPerChannel }, () => recv(2048, 1)),
+    close(0), close(1)];
+  const r = probe(commands, dllScenario(), setup);
+  const firstRecv = 4;
+  const secondRecv = firstRecv + callsPerChannel + 1;
+  const got0 = Buffer.concat(r.results.slice(firstRecv, firstRecv + callsPerChannel).map(v => v.data));
+  const got1 = Buffer.concat(r.results.slice(secondRecv, secondRecv + callsPerChannel).map(v => v.data));
+  assert.deepStrictEqual(got0, streams[8080]);
+  assert.deepStrictEqual(got1, streams[8081]);
+  for (const result of [
+    ...r.results.slice(firstRecv, firstRecv + callsPerChannel),
+    ...r.results.slice(secondRecv, secondRecv + callsPerChannel),
+  ]) assert.strictEqual(result.ix & 4, 0, 'long receive stream reported UNET_RXF_LOST');
+  const wire = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  for (const port of [8080, 8081]) {
+    const acks = wire.filter(v => v.dstPort === port && v.payload.length === 0);
+    const reopens = acks.filter((v, i) => v.window === 536
+      && acks[i + 1]?.ack === v.ack && acks[i + 1].window === 2584);
+    assert.ok(reopens.length >= 3,
+      `channel ${port}: next active RECV did not repeatedly reopen 536-byte window to 2584`);
+  }
+  checkProbe(r);
+}
+
+{ // While channel 0 owns a 2048-byte direct buffer, a 1460-byte segment for
+  // channel 1 may use only channel 1's durable 536-byte queue.  In particular,
+  // its ACK must advertise zero rather than borrowing channel 0's capacity.
+  let injected = false;
+  const r = probe([init, connect(), connect(1), recv(2048), recv(2048, 1), close(0), close(1)],
+    dllScenario(), peer(({ card, seg, sessions }) => {
+      const foreign = Object.values(sessions).find(v => v.serverPort === 8081);
+      if (!injected && foreign && seg.dstPort === 8080 && !seg.payload.length && seg.window === 2584) {
+        injected = true;
+        card.schedule(1, buildTcpSegment(foreign, {
+          flags: 24, seq: foreign.serverSeq, ack: foreign.clientNext, payload,
+        }));
+      }
+    }));
+  assert.strictEqual(r.results[3].de, 0);
+  assert.ok(r.results[3].ix & 8, 'selected channel did not report UNET_RXF_XCHAN');
+  assert.deepStrictEqual(r.results[4].data, payload.subarray(0, 536));
+  assert.strictEqual(r.results[3].ix & 4, 0);
+  assert.strictEqual(r.results[4].ix & 4, 0);
+  const wire = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  const foreignAcks = wire.filter(v => v.dstPort === 8081 && v.payload.length === 0);
+  assert.ok(foreignAcks.some(v => v.ack === 0x12345679 + 536 && v.window === 0));
+  assert.ok(foreignAcks.every(v => v.window <= 536),
+    'foreign channel borrowed the selected channel caller buffer');
+  checkProbe(r);
+}
+
+{ // The opening window update is a real NIC transmission.  Its failure
+  // returns the normal hardware error, keeps the diagnostic snapshot, closes
+  // ISA, and the public wrapper retracts the caller buffer before CLOSE.
+  const txError = { attempts: [] };
+  const open = connect();
+  open.after = ({ card }) => txError.attempts.push(card.txAttempts + 1);
+  const r = probe([init, open, recv(2048), { fn: 16, de: 'BUFFER', ix: 72 }, close(0)],
+    dllScenario({ txError }), peer(() => {}));
+  assert.strictEqual(r.results[2].a, 1); // NERR_HW
+  assert.strictEqual(r.results[2].de, 0);
+  assert.strictEqual(r.results[2].ix, 0);
+  const diagEnd = r.results[3].data.indexOf(0);
+  const diag = r.results[3].data.subarray(0, diagEnd < 0 ? undefined : diagEnd).toString('ascii');
+  assert.match(diag, /st=RECV nerr=01/);
+  assert.match(diag, /tx=/);
+  const wire = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  assert.ok(wire.some(v => (v.flags & 1) && v.window === 536),
+    'failed RECV must not leave caller capacity advertised to CLOSE');
+  checkProbe(r);
+}
+
 { // A partially ACKed SEND times out. DE is the confirmed prefix, and
   // saved response bytes remain readable on the error path.
   let once = false;
@@ -494,7 +606,7 @@ function checkProbe(r) {
       once = true;
       emit({ flags: 16 });
       emit({ payload: bytes }, 2);
-      txError.attempts.push(card.txAttempts + 2); // pure-ACK reply, then RECV flush
+      txError.attempts.push(card.txAttempts + 3); // reply ACK, RECV window update, then flush
     }
   }));
   assert.deepStrictEqual(r.results[3].data, bytes);
@@ -504,11 +616,102 @@ function checkProbe(r) {
 
 { // Same ABI and receive sink after libman relocates the DLL into WIN2.
   const bytes = Buffer.from('window two final bytes');
+  let sent = false;
   const r = probe([init, connect(), send(), recv(), recv(), close(0)], dllScenario(), peer(({seg, emit}) => {
-    if (seg.payload.length) emit({ flags: 25, payload: bytes });
+    if (seg.payload.length) emit({ flags: 16 });
+    else if (!sent && seg.window === 2049) {
+      sent = true;
+      emit({ flags: 25, payload: bytes });
+    }
   }), 2);
   assert.deepStrictEqual(r.results[3].data, bytes);
   assert.strictEqual(r.results[4].a, 7);
+  const wire = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  assert.ok(wire.some(v => v.dstPort === 8080 && !v.payload.length && v.window === 2049),
+    'WIN2 relocation did not publish the 1513+536 active RECV window');
+  checkProbe(r);
+}
+
+for (const dllWindow of [1, 2]) { // SNC layout uses the DLL in WIN2.
+  const bytes = Buffer.alloc(8243);
+  Buffer.from('HTTP/1.1 207 Multi-Status\r\nContent-Length: 8192\r\n\r\n').copy(bytes);
+  for (let i = 51; i < bytes.length; i++) bytes[i] = (i - 51) & 255;
+  let flow;
+  const setup = peer(({ card, seg, t, emit }) => {
+    if (seg.payload.length && !flow) {
+      flow = { base: t.serverSeq, acked: 0, sent: 1460, oversize: true };
+      emit({ payload: bytes.subarray(0, 1460) }, 1);
+      return;
+    }
+    if (!flow) return;
+    const acked = (seg.ack - flow.base) >>> 0;
+    if (acked <= bytes.length && acked > flow.acked) flow.acked = acked;
+    if (flow.oversize && flow.acked) {
+      flow.sent = flow.acked;            // retransmit the unaccepted suffix
+      flow.oversize = false;
+    }
+    const edge = Math.min(bytes.length, flow.acked + seg.window);
+    while (flow.sent < edge) {
+      const size = Math.min(536, edge - flow.sent);
+      const last = flow.sent + size === bytes.length;
+      card.schedule(1, buildTcpSegment(t, {
+        flags: 16 | 8 | (last ? 1 : 0),
+        seq: (flow.base + flow.sent) >>> 0,
+        ack: t.clientNext,
+        payload: Array.from(bytes.subarray(flow.sent, flow.sent + size)),
+      }));
+      flow.sent += size;
+    }
+  });
+  const r = probe([init, connect(), send(),
+    ...Array.from({ length: 10 }, () => recv(2048)), close(0)],
+  dllScenario(), setup, dllWindow);
+  const got = Buffer.concat(r.results.slice(3, -1)
+    .filter(v => v.a === 0 || v.a === 7).map(v => v.data));
+  assert.deepStrictEqual(got, bytes, `DLL WIN${dllWindow}: WebDAV response was truncated`);
+  checkProbe(r);
+}
+
+for (const dllWindow of [1, 2]) { // OPTIONS close, then PROPFIND reconnect.
+  const options = Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+  const propfind = Buffer.alloc(8243);
+  Buffer.from('HTTP/1.1 207 Multi-Status\r\nContent-Length: 8192\r\n\r\n').copy(propfind);
+  for (let i = 51; i < propfind.length; i++) propfind[i] = (i - 51) & 255;
+  const flows = new Map();
+  let requestNo = 0;
+  const setup = peer(({ card, seg, t, emit }) => {
+    let flow = flows.get(t.clientPort);
+    if (seg.payload.length && !flow) {
+      const body = requestNo++ ? propfind : options;
+      flow = { base: t.serverSeq, acked: 0, sent: 0, body };
+      flows.set(t.clientPort, flow);
+    }
+    if (!flow) return;
+    const acked = (seg.ack - flow.base) >>> 0;
+    if (acked <= flow.body.length && acked > flow.acked) flow.acked = acked;
+    const edge = Math.min(flow.body.length, flow.acked + seg.window);
+    while (flow.sent < edge) {
+      const size = Math.min(536, edge - flow.sent);
+      const last = flow.sent + size === flow.body.length;
+      card.schedule(1, buildTcpSegment(t, {
+        flags: 16 | 8 | (last ? 1 : 0),
+        seq: (flow.base + flow.sent) >>> 0,
+        ack: t.clientNext,
+        payload: Array.from(flow.body.subarray(flow.sent, flow.sent + size)),
+      }));
+      flow.sent += size;
+    }
+  });
+  const r = probe([init,
+    connect(), send(), recv(2048), close(0),
+    connect(), send(), ...Array.from({ length: 10 }, () => recv(2048)), close(0)],
+  dllScenario(), setup, dllWindow);
+  assert.deepStrictEqual(r.results[3].data, options,
+    `DLL WIN${dllWindow}: OPTIONS response was truncated`);
+  const got = Buffer.concat(r.results.slice(7, -1)
+    .filter(v => v.a === 0 || v.a === 7).map(v => v.data));
+  assert.deepStrictEqual(got, propfind,
+    `DLL WIN${dllWindow}: PROPFIND response after reconnect was truncated`);
   checkProbe(r);
 }
 

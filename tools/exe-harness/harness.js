@@ -65,10 +65,20 @@ function runExe(exePath, args = '', inputScenario = {}) {
   let systemIsa = false, isaOpen = false, selectedSlot = 0;
   // Simulated keyboard input: `key` delivers one key, `keys` a sequence on
   // successive SCANKEY pops (SprinTalk needs two ESCs to quit, for one).
-  const keyQueue = scenario.keys ? [...scenario.keys] : (scenario.key ? [scenario.key] : []);
+  // An entry is a name ('escape', 'ctrl-c', 'enter', 'backspace', 'tab') or a
+  // literal string, which expands to one keypress per character -- so a test
+  // can type a command line and press Enter.
+  const NAMED_KEYS = {
+    escape: [0, 1, 0x1b], 'ctrl-c': [0x20, 0xac, 0], enter: [0, 0, 0x0d],
+    backspace: [0, 0, 0x08], tab: [0, 0x0f, 0x09],
+  };
+  const expandKey = (k) => (NAMED_KEYS[k] || k.length === 1 ? [k] : [...k]);
+  const keyQueue = (scenario.keys ? scenario.keys.flatMap(expandKey)
+    : (scenario.key ? [scenario.key] : []));
   const loadKeyRegs = (s, name) => {
-    if (name === 'escape') { s.b = 0; s.d = 1; s.e = 0x1b; }
-    else if (name === 'ctrl-c') { s.b = 0x20; s.d = 0xac; s.e = 0; }
+    const named = NAMED_KEYS[name];
+    if (named) { [s.b, s.d, s.e] = named; }
+    else if (typeof name === 'string' && name.length === 1) { s.b = 0; s.d = 0; s.e = name.charCodeAt(0); }
     else throw new Error(`unknown simulated key ${name}`);
     s.a = s.e;
   };
@@ -272,7 +282,22 @@ function runExe(exePath, args = '', inputScenario = {}) {
   ]));
   const openFiles = new Map();
   let nextHandle = 4, envSetCount = 0, clockSecond = scenario.clockSecond || 0;
+  // scenario.keyIntervalScans: minimum keyboard polls between two delivered
+  // keys, i.e. a typing speed. Without it the queue empties as fast as the
+  // program polls, which for a program that drains its whole key buffer per
+  // pass means the entire script arrives in one iteration -- nothing like a
+  // person at a keyboard, and it starves whatever the test meant to observe
+  // between keystrokes. 0 (the default) keeps the old back-to-back behaviour.
+  let lastKeyScan = -1e9;
+  const keyReady = () => keyQueue.length
+    && scanCount >= (scenario.keyAtScan || 1)
+    && (scanCount - lastKeyScan) >= (scenario.keyIntervalScans || 0);
   let fileReadCalls = 0, fileWriteCalls = 0, totalWritten = 0, clockReads = 0, scanCount = 0;
+  // Input-latency profile: the Z80 cycle count at every keyboard peek. An
+  // interactive program polls the keyboard once per main-loop pass, so the
+  // gaps between consecutive entries ARE the worst-case time a keystroke can
+  // sit unserviced. Cheap enough to always collect.
+  const keyPollCycles = [];
 
   // ---- PRELOAD: leave the .EXE file itself open, positioned right after the
   // loader, with its handle at psp[-3] (CLP_FM) -- exactly what a real DSS
@@ -310,12 +335,17 @@ function runExe(exePath, args = '', inputScenario = {}) {
   let pagesFreedBeforeExit = true;
   const pcTrace = [];
 
+  // Per-function DSS call counts. Divided by keyPollCycles.length this is
+  // "syscalls per main-loop pass", the cheapest honest measure of how much
+  // work an interactive program repeats every iteration.
+  const dssCalls = {};
   const dss = () => {
     if (isaOpen) {
       const s0 = cpu.getState();
       throw new Error(`DSS call while ISA window is open (fn=0x${s0.c.toString(16)} return-to=0x${(rd(s0.sp) | (rd((s0.sp + 1) & 0xffff) << 8)).toString(16)})`);
     }
     const s = cpu.getState(), fn = s.c;
+    dssCalls[fn] = (dssCalls[fn] || 0) + 1;
     switch (fn) {
       case 0x02: s.a = 2; setCarry(s, false); return ret(s); // CURDISK -> C:
       case 0x0a:
@@ -422,7 +452,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
       }
       case 0x31: { // SCANKEY: ZF=1 no key; else A=E=ascii, D=scan, B=modifiers
         scanCount++;
-        if (keyQueue.length && scanCount >= (scenario.keyAtScan || 1)) {
+        if (keyReady()) {
+          lastKeyScan = scanCount;
           loadKeyRegs(s, keyQueue.shift());
           s.flags.Z = 0; setCarry(s, false); return ret(s);
         }
@@ -435,7 +466,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
         // program dead at its first idle poll.
         scanCount++;              // a peek is a poll: a program that only ever
                                   // peeks while idle must still reach keyAtScan
-        if (keyQueue.length && scanCount >= (scenario.keyAtScan || 1)) {
+        keyPollCycles.push(cycles);
+        if (keyReady()) {
           loadKeyRegs(s, keyQueue[0]);
           s.flags.Z = 0; setCarry(s, false); return ret(s);
         }
@@ -546,10 +578,65 @@ function runExe(exePath, args = '', inputScenario = {}) {
       `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
   };
 
+  // ---- 50 Hz IM1 timer interrupt (scenario.timerInterrupt) ----------------
+  // Off by default so existing scenarios keep their exact instruction
+  // streams. Real DSS drives the frame interrupt the whole time a program
+  // runs, and under the win0 layout EVERY one of them is routed through the
+  // program's own RST 0x38 trampoline (lib/win0/win0_rt.s) instead of
+  // landing straight in the system page -- which is the one interaction a
+  // pure software model otherwise never exercises. It matters most during a
+  // UNET DLL call: the DLL re-enables interrupts around its 1 ms pacing
+  // delay (TICK_AND_CHECK_KEY -> ISA_CLOSE -> DELAY_1MS), so a frame
+  // interrupt lands with WIN1 still holding the DLL.
+  //
+  // The handler itself is modelled, not executed: the system page holds no
+  // real DSS code here. It just returns like EI + RETI. It does NOT touch
+  // window 3, even though a DSS *call* is free to: the "map a page into
+  // WIN3, copy, restore" idiom is used by libman's own loader, by this
+  // kit's win0cold.asm and by SprinTalk's scrollback, none of which bracket
+  // it against interrupts -- so the frame handler has to hand window 3 back.
+  // timerInterrupt.clobberWin3 turns the pessimistic model on anyway.
+  // The clock is the Z80 cycle counter, not logicalMs: logicalMs only moves
+  // when the DELAY_1MS fast-forward fires, so a program busy in its own code
+  // would never see a tick. cyclesPerMs is the conversion the fast-forward
+  // uses to keep the two in step.
+  const timer = scenario.timerInterrupt
+    ? { ms: 20, cyclesPerMs: 3500, clobberWin3: false,
+        ...(scenario.timerInterrupt === true ? {} : scenario.timerInterrupt) }
+    : null;
+  let interruptsFired = 0, interruptsTaken = 0, cycles = 0;
+  // scenario.pcSample = N: bucket the program counter every N instructions.
+  // A statistical profile is the only practical way to ask "where does an
+  // interactive DSS program actually spend its main-loop time", since the
+  // cycle cost is spread over library code, the DLL and the RST trampolines.
+  // Key is `pc` for program code and `pc|0x10000` while the ISA window is
+  // open, which is exactly the time spent inside the network DLL.
+  const pcSamples = scenario.pcSample ? new Map() : null;
+  let sampleTick = 0;
+  let nextTickCycles = timer ? timer.ms * timer.cyclesPerMs : Infinity;
+  let scratchPage = 63;   // a real page, just not one this program mapped
+  if (timer) {
+    const s = cpu.getState();
+    s.imode = 1;          // DSS leaves the machine in IM 1; the core resets to IM 0
+    cpu.setState(s);
+  }
+
   try {
     const limit = scenario.stepLimit || 200_000_000;
     for (;;) {
+      if (timer && cycles >= nextTickCycles) {
+        nextTickCycles = cycles + timer.ms * timer.cyclesPerMs;
+        interruptsFired++;
+        const before = cpu.getState().pc;
+        cpu.interrupt(false, 0xff);
+        if (cpu.getState().pc !== before) interruptsTaken++;
+      }
       const st0 = cpu.getState();
+      if (pcSamples && ++sampleTick >= scenario.pcSample) {
+        sampleTick = 0;
+        const key = (st0.pc & 0xfff0) | (isaOpen ? 0x10000 : 0);
+        pcSamples.set(key, (pcSamples.get(key) || 0) + 1);
+      }
       // Test-only observation/injection at actual assembled instruction boundaries.
       scenario.cpuProbes?.[st0.pc]?.({ state: st0, read: rd, card, win, logicalMs });
       minimumSp = Math.min(minimumSp, st0.sp);
@@ -580,6 +667,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
         if (isaOpen) throw new Error(`DELAY_1MS executed with ISA window open at PC=${st0.pc.toString(16)}`);
         st0.b = 0; st0.c = 1; cpu.setState(st0);
         logicalMs++;
+        if (timer) cycles += timer.cyclesPerMs;
         card.currentMs = logicalMs;
         card.pumpScheduled();
       }
@@ -594,9 +682,18 @@ function runExe(exePath, args = '', inputScenario = {}) {
       // 0x0010 arrival as a service call produced false "BIOS/DSS call
       // while ISA window is open" throws for every cold-overlay dispatch.
       const pc = cpu.getState().pc;
-      if (pc === 0x0010 && win[0] === 0) dss();
-      else if (pc === 0x0008 && win[0] === 0) bios();
-      else cpu.run_instruction();
+      if (pc === 0x0010 && win[0] === 0) { dss(); cycles += 200; }
+      else if (pc === 0x0008 && win[0] === 0) { bios(); cycles += 200; }
+      else if (timer && pc === 0x0038 && win[0] === 0) {
+        // Modelled DSS frame handler: scribble on window 3 and RETI.
+        if (isaOpen) throw new Error('frame interrupt reached DSS with the ISA window open');
+        if (timer.clobberWin3) win[3] = scratchPage;
+        const s = cpu.getState();
+        s.pc = rd(s.sp) | (rd((s.sp + 1) & 0xffff) << 8);
+        s.sp = (s.sp + 2) & 0xffff;
+        s.iff1 = 1; s.iff2 = 1;        // the real handler EIs before its RETI
+        cpu.setState(s);
+      } else cycles += cpu.run_instruction() || 0;
 
       if (++steps > limit) {
         throw new Error(`step limit at PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} ` +
@@ -612,6 +709,9 @@ function runExe(exePath, args = '', inputScenario = {}) {
       if (error && typeof error === 'object') {
         error.partialOutput = stdout;
         error.partialDssEvents = dssEvents;
+        error.partialKeyPollCycles = keyPollCycles;
+        error.partialPcSamples = pcSamples;
+        error.partialDssCalls = dssCalls;
       }
       throw error;
     }
@@ -644,6 +744,11 @@ function runExe(exePath, args = '', inputScenario = {}) {
       ])),
     } : {}),
     steps,
+    keyPollCycles,
+    dssCalls,
+    pcSamples,
+    interruptsFired,
+    interruptsTaken,
     minimumSp,
     logicalMs,
     closedChipAccesses,

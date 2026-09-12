@@ -193,6 +193,17 @@ ability to receive payload, including stale-sequence and zero-window frames.
 A successful `SEND` always returns its full requested length. Final received
 bytes are delivered before closure or with `NERR_CLOSED`.
 
+Since 0.3.2, every active TCP `RECV` also sends a pure ACK before waiting for
+new data. This advertises the capacity lent by that call's buffer after the
+previous call retracted it. For example, an empty 536-byte pending queue plus
+a 2048-byte caller buffer advertises 2584 bytes; caller capacity of 2144 bytes
+or more reaches the 2680-byte cap. The final cumulative ACK still excludes the
+caller buffer, so no peer data is acknowledged against storage that disappears
+when the DLL returns. Between calls the window can therefore be 536 bytes, but
+the next active call reopens it before polling the NIC. If this opening ACK
+cannot be transmitted, `RECV` returns `NERR_HW`, `DE=0`, `IX=0`, preserves the
+driver diagnostic for `LASTERR`, and leaves the ISA window closed.
+
 All waits remain bounded. While SEND is suspended, RECV serves saved bytes
 from memory; the next active network operation publishes freed capacity.
 
@@ -368,7 +379,7 @@ the release archive and the floppy image, so a consumer can take the
 ready-built file without installing the assembler or libman.  Its L1
 header records the ABI line in the numeric version field and the full
 package revision in the 15-byte text tag, for example
-`UNETRTL v0.3.1`.
+`UNETRTL v0.3.2`.
 
 ## Complete early-response regression (0.3.1)
 
@@ -386,3 +397,14 @@ A socket helper guarantees these bytes, but cannot force TCP segmentation
 or guarantee a nonzero resume count. The host harness controls ACK/data/FIN
 geometry and delay deterministically. MAME/real-card and original SNC
 WebDAV acceptance require their own run and packet capture.
+
+## Receive-window throughput regression (0.3.2)
+
+The host DLL harness uses a cumulative-ACK/window-aware peer for two 12000-byte
+streams, one on each TCP channel. It issues repeated blocking `RECV` calls with
+2048-byte buffers, compares every byte, rejects any `LOST` flag, and checks the
+wire transition from the final 536-byte durable window to the next call's
+2584-byte active window. The same suite keeps the foreign-channel capacity
+checks, failed-ACK cases, payload/FIN ordering, retransmission, and WIN1/WIN2
+relocation coverage. A dedicated transmit fault on the opening ACK must return
+`NERR_HW` with preserved `LASTERR` state and a closed ISA window.

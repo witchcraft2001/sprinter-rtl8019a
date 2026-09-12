@@ -552,6 +552,26 @@ function respondTcp(frame, card, tcp) {
   if (session.state === 'syn-rcvd' && (seg.flags & TF_ACK) && seg.payload.length === 0) {
     session.state = 'established';
     session.serverSeq = (session.serverSeq + 1) >>> 0; // our SYN consumed one sequence number
+    // tcp.greeting: bytes the server pushes the moment the handshake closes,
+    // before the client has sent anything -- what every IRC server does with
+    // its "NOTICE AUTH :*** Looking up your hostname" banner. It makes the
+    // client's first SEND wait for its ACK while unsolicited peer data with a
+    // LOWER ack number arrives first, which is the full-duplex case a
+    // request/response peer never produces.
+    // greeting is one line or a list of them; greetingMs is the spacing, so a
+    // list models a server still talking while the client's own first lines
+    // are waiting for their ACKs.
+    const greetingLines = tcp.greeting ? [].concat(tcp.greeting) : [];
+    greetingLines.forEach((line, index) => {
+      const bytes = Buffer.from(line, 'latin1');
+      const seg2 = buildTcpSegment(session, {
+        flags: TF_PSH | TF_ACK, seq: session.serverSeq, ack: session.clientNext,
+        payload: Array.from(bytes),
+      });
+      session.serverSeq = (session.serverSeq + bytes.length) >>> 0;
+      card.generated.push(seg2);
+      card.schedule((tcp.greetingMs ?? 1) * (index + 1), seg2);
+    });
     return;
   }
 

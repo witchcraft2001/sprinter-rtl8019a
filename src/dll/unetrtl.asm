@@ -815,6 +815,14 @@ RECV_IMPL
 .no_closed_pending
 	LD	A,(ARG_CH)
 	LD	(RX_DIRECT_CH),A
+	; FLUSH_RECV_ACK closes the preceding call's transient caller-buffer
+	; window.  Publish this call's newly available capacity before waiting,
+	; otherwise a window-aware peer remains throttled to the durable 536-byte
+	; pending queue for the lifetime of the connection.
+	CALL	@ISA.ISA_OPEN
+	CALL	@TCP.SEND_DUP_ACK
+	JP	C,.open_window_fail
+	CALL	@ISA.ISA_CLOSE
 	LD	A,0xFF
 	LD	(FOREIGN_HINT),A
 	XOR	A
@@ -938,6 +946,9 @@ RECV_IMPL
 .hw
 	LD	A,NERR_HW
 	JR	.zero_return
+.open_window_fail
+	CALL	CAPTURE_AND_CLOSE
+	JR	.hw
 
 .return_drain
 	CALL	FLUSH_RECV_ACK
