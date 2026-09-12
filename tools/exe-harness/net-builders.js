@@ -384,9 +384,9 @@ function respondTftp(datagram, card, tftp) {
 // ---------------------------------------------------------------------
 // TCP (src/lib/tcp_lib.asm client, single session). Server-side state is
 // kept per client-port session on responders.tcp._sessions. Every client
-// build sends MSS=536 in its SYN, TTL=64, no DF, and (outside multichannel
-// UNETRTL builds) a fixed 2680-byte advertised window -- the peer does not
-// need to enforce flow control against a simulated, lossless link.
+// build sends its configured receive MSS in the SYN, TTL=64, and no DF.
+// Direct clients use MSS=1460/window=4380; multichannel UNETRTL uses
+// MSS=536 and computes its window from transient caller plus durable storage.
 // ---------------------------------------------------------------------
 const TF_FIN = 0x01, TF_SYN = 0x02, TF_RST = 0x04, TF_PSH = 0x08, TF_ACK = 0x10;
 
@@ -402,13 +402,15 @@ function parseTcpSegment(frame) {
   const dataOffset = (frame[tcpStart + 12] >> 4) * 4;
   const ipTotalLen = (frame[16] << 8) | frame[17];
   const segEnd = 14 + ipTotalLen;
+  const mss = dataOffset >= 24 && frame[tcpStart + 20] === 2 && frame[tcpStart + 21] === 4
+    ? (frame[tcpStart + 22] << 8) | frame[tcpStart + 23] : undefined;
   return {
     sourceMac: frame.slice(6, 12), destMac: frame.slice(0, 6),
     sourceIp: frame.slice(26, 30), destIp: frame.slice(30, 34),
     srcPort: (frame[tcpStart] << 8) | frame[tcpStart + 1],
     dstPort: (frame[tcpStart + 2] << 8) | frame[tcpStart + 3],
     seq: readU32BE(frame, tcpStart + 4), ack: readU32BE(frame, tcpStart + 8),
-    flags: frame[tcpStart + 13], window: (frame[tcpStart + 14] << 8) | frame[tcpStart + 15],
+    flags: frame[tcpStart + 13], window: (frame[tcpStart + 14] << 8) | frame[tcpStart + 15], mss,
     payload: Array.from(frame.slice(tcpStart + dataOffset, Math.max(segEnd, tcpStart + dataOffset))),
   };
 }
@@ -451,7 +453,9 @@ function buildHttpResponse(tcp) {
 }
 
 function tcpSendNextChunk(session, card, tcp) {
-  const mss = tcp.mss ?? 536;
+  // Segment server -> client data at the MSS advertised by the client SYN.
+  // A test may still force tcp.mss to exercise smaller or hostile geometry.
+  const mss = tcp.mss ?? session.clientMss ?? 536;
   if (session.sendOffset >= session.responseBytes.length) {
     if (!session.finSent) {
       session.finSent = true;
@@ -487,12 +491,13 @@ function tcpReliableNext(session, card, tcp, seg) {
   }
   if (!seg.window) return;
   let start = session.ackedOffset;
-  let size = Math.min(tcp.mss ?? 536, seg.window, total - start);
-  if (!session.responseStarted && tcp.oversizeFirst) size = Math.min(total, tcp.mss ?? 1460);
+  const peerMss = tcp.mss ?? session.clientMss ?? 536;
+  let size = Math.min(peerMss, seg.window, total - start);
+  if (!session.responseStarted && tcp.oversizeFirst) size = Math.min(total, peerMss);
   if (tcp.overlap && session.flightStart < start && start < session.flightEnd) {
     size += start - session.flightStart;
     start = session.flightStart;
-    size = Math.min(size, tcp.mss ?? 1460);
+    size = Math.min(size, peerMss);
   }
   const fin = start + size === total && (tcp.finWithData || !size);
   if (fin) session.finSent = true;
@@ -538,7 +543,7 @@ function respondTcp(frame, card, tcp) {
       clientMac: seg.sourceMac, clientIp: seg.sourceIp, clientPort: seg.srcPort,
       serverMac: tcp.mac || DEFAULT_SERVER_MAC, serverIp: seg.destIp, serverPort: seg.dstPort,
       state: 'syn-rcvd', serverSeq: isn, clientNext: (seg.seq + 1) >>> 0,
-      sendOffset: 0, finSent: false,
+      clientMss: seg.mss, sendOffset: 0, finSent: false,
     };
     const synAck = buildTcpSegment(session, { flags: TF_SYN | TF_ACK, seq: isn, ack: session.clientNext, mss: tcp.mss ?? 536 });
     card.generated.push(synAck);

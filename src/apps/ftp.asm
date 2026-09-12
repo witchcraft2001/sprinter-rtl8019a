@@ -1504,8 +1504,8 @@ APPEND_DATA
 	; Flush first.  Ack everything received BEFORE the long
 	; write pause: with no unacked data outstanding the server
 	; has nothing to retransmit while we are away, and whatever
-	; it sends meanwhile fits the advertised window (21 of 26
-	; ring pages).  Without this the delayed-ACK debt (up to 3
+	; it sends meanwhile fits the advertised window (18 of 25 usable
+	; ring pages). Without this the delayed-ACK debt
 	; segments) crossed the server's RTO during the pause --
 	; cwnd collapse + retransmit storms cut GET throughput and
 	; could snowball into a recv timeout.  Best-effort: a TX
@@ -2213,7 +2213,7 @@ DOTS_FLAG	EQU CTRL_PORT + 2		; 1 (1 if -d was given)
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
-FTP_PUT_CHUNK	  EQU 536		; one TCP MSS per STOR send
+FTP_PUT_CHUNK	  EQU 536		; one reliable outbound chunk per STOR send
 
 
 MSG_BANNER	DB "RTL8019AS FTP v",PACKAGE_VERSION,0

@@ -315,7 +315,7 @@ TCP_CTX_SIZE		EQU 38		; 0x26: TCP_STATE .. TCP_RX_DATA_LEN+1
 ; Literal for relocatable DLL builds; never derive this from addresses.
 TCP_BSS_SIZE		EQU 57		; 0x39 bytes
 
-; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + MSS(536)
+; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + 536-byte send chunk
 ; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF
 ; region to at least this.
 TCP_MAX_FRAME		EQU 600

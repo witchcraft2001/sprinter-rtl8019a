@@ -48,12 +48,16 @@ reported RTC second is rejected as too short.
 Successful output includes the exact byte count, elapsed seconds, B/s or
 KB/s, `Integrity: OK`, and `RESULT OK`.
 
-DLSPEED requests four TCP MSS blocks (2144 bytes) per public `RECV`. This is
-intentional: it verifies that UNETRTL ends the call with a cumulative ACK
-after three segments and leaves the fourth segment for the next call. Since
-UNETRTL 0.3.2, the next call sends a window update before waiting, reopening
-the transient caller capacity to the 2680-byte cap instead of leaving the peer
-permanently throttled to the 536-byte durable queue.
+DLSPEED offers 2144 caller bytes per public `RECV`. Together with UNETRTL's
+536-byte durable queue this reaches the 2680-byte active-window cap. Version
+0.3.7 keeps the DLL receive MSS at 536: the caller buffer is exactly four
+segments and the durable queue is a fifth segment. This avoids the stop/start
+receive-window cycle measured with DLL MSS 1460 in 0.3.6. Direct clients still
+advertise MSS 1460. Outbound SEND chunks remain 536 bytes. Arbitrary positive
+caller sizes are valid; a segment
+crossing the caller boundary is acknowledged only after its fitting prefix and
+up to 536 bytes of tail are saved. The caller's original timeout is used only
+while waiting for the first byte; further reads use a bounded two-tick wait.
 
 ## DLL versus direct A/B test
 
@@ -62,7 +66,9 @@ stack directly and parses from the driver's RX buffer. `DLDIRCP.EXE` is the
 same direct build but first copies every payload byte to a caller-style
 buffer. Both use the same reliable TCP, request/parser and saved STOP.
 
-Run both against the same 4 MiB server, preferably alternating their order:
+Run all controls against the exact same URL and server process, preferably
+alternating their order. Changing between `192.168.1.36:8080` and
+`192.168.7.1:18081` also changes the host interface/path and is not an EXE A/B.
 
 ```
 DLSPEED  http://192.168.1.36:8080/test.bin

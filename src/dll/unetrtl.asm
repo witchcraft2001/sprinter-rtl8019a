@@ -797,20 +797,19 @@ RECV_IMPL
 	LD	A,H
 	OR	L
 	JP	Z,.return_drain
-	; Preserve the legacy low-latency contract: data already buffered in
-	; pend is the first available block, so return it immediately instead
-	; of waiting up to the caller's IY for another segment.  Fresh NIC data
-	; still uses the multi-segment nonblocking drain below.
-	LD	HL,(COPY_LEN)
-	LD	A,H
-	OR	L
-	JP	NZ,.return_drain
 	; A FIN seen last time with trailing data already delivered.
 	LD	A,(ARG_CH)
 	CALL	CLOSED_ADDR_A
 	LD	A,(HL)
 	OR	A
 	JR	Z,.no_closed_pending
+	; A saved FIN belongs after every byte already queued for this channel.
+	; If this call copied the last pending tail, return those bytes now and
+	; report CLOSED only on the following call.
+	LD	HL,(COPY_LEN)
+	LD	A,H
+	OR	L
+	JP	NZ,.return_drain
 	JP	.report_closed
 .no_closed_pending
 	LD	A,(ARG_CH)
@@ -827,8 +826,17 @@ RECV_IMPL
 	LD	(FOREIGN_HINT),A
 	XOR	A
 	LD	(@MAIN.CANCELLED),A
-	; IY = 0 would be read by tcp_lib as "use the 30 s default", so
-	; clamp it: the ABI means "poll, do not block".
+	; Pending data already satisfied the blocking part of this call.  Allow
+	; two ticks for the peer to answer the window update, then keep filling
+	; with one-tick polls; never wait the caller's full timeout after returning
+	; saved bytes.  Otherwise the first TCP.RECV may use IY.  IY=0 means poll
+	; in the public ABI but tcp_lib reads zero as its 30 s default, so clamp
+	; that path to 1.
+	LD	HL,(COPY_LEN)
+	LD	A,H
+	OR	L
+	LD	HL,2
+	JR	NZ,.have_to
 	LD	HL,(ARG_IY)
 	LD	A,H
 	OR	L
@@ -845,9 +853,11 @@ RECV_IMPL
 	CALL	@TCP.RECV			; -> HL=data, BC=len
 	JR	C,.rx_err_open
 	CALL	@ISA.ISA_CLOSE
-	; All calls after the first are deliberately one-tick polls.  A
-	; caller's original IY is consumed only by the first TCP.RECV.
-	LD	HL,1
+	; All calls after the first use a short two-tick coalescing wait.  This
+	; lets the next RTL8019AS frame arrive after the preceding one without
+	; turning a partly filled public buffer into another long blocking read.
+	; A caller's original IY is consumed only by the first TCP.RECV.
+	LD	HL,2
 	LD	(@TCP.RECV_TIMEOUT),HL
 	; A segment carrying FIN is the end of the stream even when its data
 	; fitted exactly.  STORE_TCP_PAYLOAD has already delivered the bytes.
@@ -858,14 +868,11 @@ RECV_IMPL
 	LD	A,H
 	OR	L
 	JP	Z,.return_drain
-	; Three MSS segments are the measured optimum on RTL8019AS.  End this
-	; public call at that boundary even when the caller offered more room;
-	; FLUSH_RECV_ACK emits the cumulative ACK and the next call resumes at
-	; the following segment still queued in the NIC ring.
-	LD	A,(@TCP.RECV_UNACKED)
-	CP	0x83
-	JR	C,.drain_loop
-	JP	.return_drain
+	; Keep draining short polls until the caller buffer is full or no
+	; frame is immediately available.  STORE_TCP_PAYLOAD splits a crossing
+	; segment: the fitting prefix goes to the caller and the acknowledged
+	; tail goes to the durable pending queue before this loop can return.
+	JP	.drain_loop
 .mark_fin
 	LD	A,(ARG_CH)
 	CALL	CLOSED_ADDR_A

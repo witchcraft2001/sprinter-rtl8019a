@@ -14,9 +14,10 @@
 ;
 ; Design choices:
 ;   - one session.
-;   - MSS 536 announced; advertised window 2680 = 5 * MSS (a
-;     full in-flight window must fit the 8-bit-mode RX ring
-;     with slack to spare, see TCP_RECV_WIN_HI).
+;   - direct clients announce receive MSS 1460 and advertise
+;     4380 = 3 * MSS. UNETRTL keeps receive MSS 536 because its
+;     synchronous caller buffer is transient and its durable queue is
+;     exactly one 536-byte segment; its window is computed at runtime.
 ;   - sequence numbers stored big-endian on disk to match
 ;     the wire format; arithmetic is done by reading bytes
 ;     manually (no native 32-bit ops on Z80).
@@ -90,52 +91,49 @@ ACK_WAIT_IDLE		EQU 0
 ACK_WAIT_ACTIVE		EQU 1
 ACK_WAIT_RX_PENDING	EQU 2
 
-; Receive window advertised in every outgoing SYN/ACK/DATA segment.
-; Must fit the chip's RX ring: with the 8-bit-mode ring (PSTART
-; 0x46, PSTOP 0x60) usable capacity is ~25 pages = 6.4 KB, and one
-; full MSS=536 segment costs 3 pages (590 B frame + 4 B RX header).
-; 3.5 KB caps the peer at ~7 in-flight segments = 21 pages, leaving
-; 4 pages of headroom for broadcasts and drain latency.  Advertising
-; more (the old 8 KB was sized for the pre-PSTOP-fix 14.5 KB ring)
-; makes every server burst overflow the ring; overflow recovery then
-; flushes ALL queued frames, amplifying one loss into a stall.
-; Advertised receive window vs the RX ring, in 256-byte NIC pages:
-; the ring is 26 pages (0x46..0x5F) minus 1 for the BNRY!=CURR
-; empty-slot convention = 25 storable.  One MSS-536 frame occupies
-; 3 pages (14+40+536+4 = 594 bytes).  The peer may send a full
-; window in one burst while we are busy (disk flush, slow 8-bit
-; DMA drain), and RCR_AB adds every LAN broadcast on top, so the
-; window must leave real slack:
-;   3584 (old) -> 7 segments -> 21 pages, slack 4: overflowed on
-;   busy LANs / boards with slow ISA timing (mid-file stalls).
-;   2680 = 5 * MSS -> 15 pages, slack 10: a whole burst plus ten
-;   broadcast frames fit even during a flush pause.
-; Exactly 5 segments also meshes with TCP_ACK_THRESH = 4: the ACK
-; for segment 4 leaves while segment 5 is still in flight, so the
-; peer refills without a stop-and-go gap (a non-multiple-of-MSS
-; window such as 2048 = 3.8 MSS stalls the pipe on every window
-; exhaustion and cost 10-15 KB/s).  Throughput here is CPU/DMA-
-; bound per segment; RECOVER_OVERFLOW remains as the backstop.
-TCP_RECV_WIN_HI		EQU 0x0A		; 2680 = 0x0A78 (5 * MSS 536)
+; Receive geometry. Direct clients own their receive buffer for the whole
+; connection, so a full Ethernet MSS reduces per-frame DMA/poll/ACK work.
+; UNETRTL may borrow a caller buffer only until public RECV returns and has
+; one durable 536-byte pending slot. Keeping its MSS equal to that slot makes
+; 2048/2144-byte consumers expose four whole segments per active call and
+; avoids the zero-window stop/start regression seen with MSS 1460.
+	IFDEF UNET_DLL
+TCP_RECV_MSS_HI		EQU 0x02		; 536 = 0x0218
+TCP_RECV_MSS_LO		EQU 0x18
+	ELSE
+TCP_RECV_MSS_HI		EQU 0x05		; 1460 = 0x05B4
+TCP_RECV_MSS_LO		EQU 0xB4
+	ENDIF
+
+; Direct, single-session clients may keep three full frames in flight.
+; The byte-mode ring has 25 storable 256-byte pages; one maximum frame plus
+; its DP8390 header takes 6 pages, so three consume 18 and leave 7 pages for
+; broadcasts and drain latency. UNETRTL ignores this fixed value in its
+; builders and computes an honest caller+pending window capped at 2680.
+	IFDEF UNET_DLL
+TCP_RECV_WIN_HI		EQU 0x0A		; fallback/cap documentation: 2680
 TCP_RECV_WIN_LO		EQU 0x78
+	ELSE
+TCP_RECV_WIN_HI		EQU 0x11		; 4380 = 0x111C (3 * 1460)
+TCP_RECV_WIN_LO		EQU 0x1C
+	ENDIF
 
 ; Multichannel only: the honest window while an ACK is built for a
 ; FOREIGN channel's segment (see TCP_ADV_WIN_HI/LO in memmap.inc and
-; HANDLE_FOREIGN_FRAME in unetrtl.asm).  That channel is not selected,
-; so its only receive capacity is the single CH_PEND_SIZE slot -- one
-; MSS -- not the normal TCP_RECV_WIN_HI/LO this connection would
+; HANDLE_FOREIGN_FRAME in unetrtl.asm). That channel is not selected,
+; so its only receive capacity is the single 536-byte CH_PEND_SIZE slot,
+; not the normal TCP_RECV_WIN_HI/LO this connection would
 ; advertise while actively selected.
 TCP_FOREIGN_WIN_HI	EQU 0x02		; 536 = 0x0218 (one MSS, one pend slot)
 TCP_FOREIGN_WIN_LO	EQU 0x18
 
-; Delayed-ACK threshold (RFC 1122 allows up to 2 segments unacked).
-; We are slightly more aggressive (4) because the chip RX ring is
-; large and the link is local; we still flush an ACK immediately
-; whenever the ring drains, so the peer never waits for long.
+; ACK at least every second full-sized segment, as required by RFC 1122.
+; With the three-segment direct window this lets the peer refill while the
+; third frame is still in flight. An empty ring still flushes immediately.
 	IFDEF USE_TCP_MULTICHAN
 TCP_ACK_THRESH		EQU 1		; another channel's ring traffic must not defer us
 	ELSE
-TCP_ACK_THRESH		EQU 4
+TCP_ACK_THRESH		EQU 2
 	ENDIF
 
 ETH_TYPE_IPV4		EQU 0x0800
@@ -547,17 +545,19 @@ BUILD_SYN
 	INC	DE
 	LD	(DE),A
 	INC	DE
-	; MSS option: kind=2, len=4, value=536 (0x0218)
+	; MSS option: kind=2, len=4. Direct builds advertise 1460; UNETRTL
+	; advertises 536 to match its durable pending slot and synchronous
+	; caller-buffer lifetime. Outbound SEND chunking is independent.
 	LD	A,2
 	LD	(DE),A
 	INC	DE
 	LD	A,4
 	LD	(DE),A
 	INC	DE
-	LD	A,0x02
+	LD	A,TCP_RECV_MSS_HI
 	LD	(DE),A
 	INC	DE
-	LD	A,0x18
+	LD	A,TCP_RECV_MSS_LO
 	LD	(DE),A
 	INC	DE
 	; Compute IP checksum.
@@ -1491,7 +1491,7 @@ ADD32_BE_BC
 ; UNET saves peer data through its pre-ACK sink, including on AGAIN/error.
 ; Other reliable-send builds keep ACK_WAIT_RX_PENDING in RX_BUF until the
 ; caller drains it through RECV.
-;   In:  HL = data ptr, BC = length (1..MSS=536).
+;   In:  HL = data ptr, BC = length (1..outbound chunk size 536).
 ;   Out: CF=0 ok; CF=1 fail.
 ; ------------------------------------------------------
 SEND

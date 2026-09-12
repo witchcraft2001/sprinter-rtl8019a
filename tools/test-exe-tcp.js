@@ -8,6 +8,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { runExe } = require('./exe-harness/harness.js');
+const { parseTcpSegment } = require('./exe-harness/net-builders.js');
 const { count, caseCount, checkCleanup, checkCleanupClaimedPage } = require('./exe-harness/test-util.js');
 
 const root = path.resolve(__dirname, '..');
@@ -149,15 +150,25 @@ for (const missing of ['NET_IP', 'NET_MAC']) {
 // ---------------------------------------------------------------------
 for (const app of ['DLDIRECT', 'DLDIRCP']) {
   {
+    const body = Buffer.from(Array.from({ length: 4096 }, (_, i) => i & 255));
     const r = run(app, 'http://192.168.7.1/file.bin', {
-      environment: { ...NET_ENV }, responders: { arp: arpToServer, tcp: { body: '0123456789' } },
+      environment: { ...NET_ENV }, responders: { arp: arpToServer, tcp: { body } },
     });
     assert.strictEqual(r.exitCode, 0);
     assert.match(r.output, new RegExp(`${app} v`));
     assert.match(r.output, /Connecting to 192\.168\.7\.1:80/);
-    assert.match(r.output, /Received: 10 bytes/);
+    assert.match(r.output, /Received: 4096 bytes/);
     assert.match(r.output, /Integrity: OK/);
     assert.match(r.output, /RESULT OK/);
+    const sent = r.transmittedFrames
+      .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+    const syn = sent.find(v => v.flags === 2);
+    assert.strictEqual(syn?.mss, 1460, `${app} did not advertise receive MSS 1460`);
+    assert.strictEqual(syn?.window, 4380, `${app} did not advertise the three-MSS receive window`);
+    const received = r.generatedFrames
+      .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+    assert.ok(received.some(v => v.payload.length === 1460),
+      `${app} was not exercised with a full 1460-byte receive segment`);
     count();
   }
   { // HTTP/1.1 request includes a non-default port in the Host header

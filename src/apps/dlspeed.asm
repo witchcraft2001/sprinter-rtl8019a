@@ -17,8 +17,8 @@ PORT_SIZE	EQU 8
 PATH_SIZE	EQU 192
 REQ_SIZE	EQU 384
 HEADER_SIZE	EQU 512
-; Deliberately exceed the DLL's three-MSS cumulative-ACK group by one MSS.
-; This exercises the intermediate ACK while retaining one public RECV call.
+; Four receive-MSS units; together with the DLL's one-MSS durable queue this
+; exposes the complete 2680-byte receive-window cap without partial segments.
 RECV_SIZE	EQU 2144
 RECV_TIMEOUT	EQU 7000
 ALIGN_TIMEOUT	EQU 2500

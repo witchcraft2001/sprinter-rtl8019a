@@ -101,7 +101,7 @@ LISTEN | ASYNCSEND`, ABI `0x0100`.
 
 | Capability   | State | Note |
 |--------------|-------|------|
-| `TCP`        | yes   | channels 0 and 1; `SEND` chunks at the 536-byte MSS |
+| `TCP`        | yes   | channels 0 and 1; receive MSS 536, outbound `SEND` chunks 536 bytes |
 | `UDP`        | yes   | connected UDP, payload up to the standard 1472-byte MTU |
 | `RESOLVE`    | yes   | software DNS; `NERR_NOTSUP` only if `NETINIT` could not reload the DLL's own file (see below) |
 | `PING`       | yes   | software ICMP echo |
@@ -167,7 +167,7 @@ which card it got.  None of them changes the calling convention.
 
 ## Bounded TCP retransmission
 
-`UNETRTL.DLL` splits TCP payloads at the 536-byte MSS and sends them
+`UNETRTL.DLL` splits outbound TCP payloads into 536-byte chunks and sends them
 stop-and-wait: each segment must receive its cumulative ACK before the
 next segment is sent.  A missing data segment or ACK is retried with the
 same TCP sequence number, up to four transmissions with a one-second ACK
@@ -196,13 +196,30 @@ bytes are delivered before closure or with `NERR_CLOSED`.
 Since 0.3.2, every active TCP `RECV` also sends a pure ACK before waiting for
 new data. This advertises the capacity lent by that call's buffer after the
 previous call retracted it. For example, an empty 536-byte pending queue plus
-a 2048-byte caller buffer advertises 2584 bytes; caller capacity of 2144 bytes
-or more reaches the 2680-byte cap. The final cumulative ACK still excludes the
-caller buffer, so no peer data is acknowledged against storage that disappears
+a 2048-byte caller buffer advertises 2584 bytes; a caller capacity of 2144
+bytes or more reaches the 2680-byte cap. The final cumulative ACK still
+excludes the caller buffer, so no peer data is acknowledged against storage that disappears
 when the DLL returns. Between calls the window can therefore be 536 bytes, but
 the next active call reopens it before polling the NIC. If this opening ACK
 cannot be transmitted, `RECV` returns `NERR_HW`, `DE=0`, `IX=0`, preserves the
 driver diagnostic for `LASTERR`, and leaves the ISA window closed.
+
+Since 0.3.3, an active `RECV` is capacity-driven and continues bounded short
+polls until the caller buffer is full, no next frame arrives within two ticks,
+or FIN is reached. When a segment crosses the caller boundary, the fitting
+prefix is copied directly and the tail is committed to the 536-byte pending
+queue before ACK. A following call coalesces that tail with new data. If FIN
+was already saved, pending bytes are returned before CLOSED.
+
+Version 0.3.4 experimented with receive MSS 512 and window 2560 to align SNC's
+2048-byte buffer. Version 0.3.5 restored MSS 536/window 2680. Version 0.3.6
+tested Ethernet receive MSS 1460, but that geometry regressed the synchronous
+DLL path: after each public RECV returns, only the 536-byte durable queue
+remains valid, and the next 2048/2144-byte transient caller window is too short
+to sustain a whole-number 1460-byte pipeline. Version 0.3.7 therefore keeps
+UNETRTL receive and outbound chunks at 536 bytes. Direct clients, whose buffer
+survives for the connection, retain MSS 1460/window 4380. Arbitrary positive
+DLL RECV sizes remain covered by the pending-tail/retransmission path.
 
 All waits remain bounded. While SEND is suspended, RECV serves saved bytes
 from memory; the next active network operation publishes freed capacity.
@@ -220,7 +237,7 @@ the caller's `IY`, then drains already available segments with one-tick polls
 until the caller buffer is full or the ring is empty.  Data is copied directly
 to the caller buffer; only a final partial segment is retained in the existing
 per-channel pending slot.  Thus a single TCP `RECV` may return more than the
-536-byte MSS while preserving the same ABI and queue limits.  The drain
+536-byte pending-queue size while preserving the same ABI and queue limits. The drain
 coalesces its cumulative ACK into one scoped flush; ordinary receive, `SEND`
 and foreign-channel processing keep their immediate-ACK behavior.  If that
 flush fails after bytes were delivered, those bytes are still returned and
@@ -336,7 +353,9 @@ original wait.  A foreign UDP datagram remains protected at the ring head
 until its owner is read.  `STATUS` reports `UNET_ST_RXPEND`, and `RECV` flag
 bit 3 reports `UNET_RXF_XCHAN`, when the other channel needs service.
 
-There is one deferred TCP segment per channel, up to the 536-byte MSS.
+There is one 536-byte deferred TCP queue per channel. A larger incoming segment
+is accepted only as far as caller space plus that queue permit; an unaccepted
+suffix is not acknowledged and is recovered by overlap-aware retransmission.
 Applications should follow the normal UNET rule: service `RXPEND`/`XCHAN`
 promptly and do not issue more work on a channel whose receive queue is
 already pending.
@@ -379,7 +398,7 @@ the release archive and the floppy image, so a consumer can take the
 ready-built file without installing the assembler or libman.  Its L1
 header records the ABI line in the numeric version field and the full
 package revision in the 15-byte text tag, for example
-`UNETRTL v0.3.2`.
+`UNETRTL v0.3.7`.
 
 ## Complete early-response regression (0.3.1)
 
@@ -398,13 +417,14 @@ or guarantee a nonzero resume count. The host harness controls ACK/data/FIN
 geometry and delay deterministically. MAME/real-card and original SNC
 WebDAV acceptance require their own run and packet capture.
 
-## Receive-window throughput regression (0.3.2)
+## Receive-window throughput regressions (0.3.2--0.3.7)
 
 The host DLL harness uses a cumulative-ACK/window-aware peer for two 12000-byte
 streams, one on each TCP channel. It issues repeated blocking `RECV` calls with
-2048-byte buffers, compares every byte, rejects any `LOST` flag, and checks the
-wire transition from the final 536-byte durable window to the next call's
-2584-byte active window. The same suite keeps the foreign-channel capacity
-checks, failed-ACK cases, payload/FIN ordering, retransmission, and WIN1/WIN2
-relocation coverage. A dedicated transmit fault on the opening ACK must return
-`NERR_HW` with preserved `LASTERR` state and a closed ISA window.
+2048-byte buffers, compares every byte, requires every non-final result to be
+exactly 2048 bytes, rejects any `LOST` flag, and checks the wire transition
+from the final durable window to the next call's larger active window. The
+same suite keeps the foreign-channel capacity checks, failed-ACK cases,
+payload/FIN ordering, retransmission, and WIN1/WIN2 relocation coverage. A
+dedicated transmit fault on the opening ACK must return `NERR_HW` with
+preserved `LASTERR` state and a closed ISA window.

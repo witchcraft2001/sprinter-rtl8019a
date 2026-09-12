@@ -458,9 +458,13 @@ function checkProbe(r) {
   // advertised window.  The final ACK deliberately retracts that transient
   // capacity to the durable 536-byte queue; the next active RECV must publish
   // the newly available 2048-byte caller buffer before it waits for data.
-  // Exercise both channels with a peer that sends no farther than the current
-  // cumulative ACK + window edge.  Without the opening update each call can
-  // advance by only one MSS and neither stream completes in this call budget.
+  // A segment crossing the caller boundary is split between caller and pending storage;
+  // the next call consumes that tail and continues nonblocking instead of
+  // returning a tiny fragment.  Every non-final result must therefore fill
+  // all 2048 bytes offered by the consumer.
+  // Exercise both channels with a peer that obeys receive MSS 536 and sends no
+  // farther than the current cumulative ACK + window edge. Without the opening
+  // update neither stream can fill a caller buffer per call in this budget.
   const streams = {
     8080: Buffer.from(Array.from({ length: 12000 }, (_, i) => (i * 17 + 3) & 255)),
     8081: Buffer.from(Array.from({ length: 12000 }, (_, i) => (i * 29 + 11) & 255)),
@@ -490,7 +494,7 @@ function checkProbe(r) {
       f.sent += size;
     }
   });
-  const callsPerChannel = 10;
+  const callsPerChannel = Math.ceil(streams[8080].length / 2048);
   const commands = [init, connect(), connect(1), send(),
     ...Array.from({ length: callsPerChannel }, () => recv(2048)),
     send(1),
@@ -503,17 +507,26 @@ function checkProbe(r) {
   const got1 = Buffer.concat(r.results.slice(secondRecv, secondRecv + callsPerChannel).map(v => v.data));
   assert.deepStrictEqual(got0, streams[8080]);
   assert.deepStrictEqual(got1, streams[8081]);
-  for (const result of [
-    ...r.results.slice(firstRecv, firstRecv + callsPerChannel),
-    ...r.results.slice(secondRecv, secondRecv + callsPerChannel),
-  ]) assert.strictEqual(result.ix & 4, 0, 'long receive stream reported UNET_RXF_LOST');
+  for (const results of [
+    r.results.slice(firstRecv, firstRecv + callsPerChannel),
+    r.results.slice(secondRecv, secondRecv + callsPerChannel),
+  ]) {
+    for (let i = 0; i < results.length; i++) {
+      const expected = Math.min(2048, streams[8080].length - i * 2048);
+      assert.strictEqual(results[i].data.length, expected,
+        `RECV ${i} returned ${results[i].data.length} bytes instead of filling ${expected}`);
+      assert.strictEqual(results[i].ix & 4, 0, 'long receive stream reported UNET_RXF_LOST');
+    }
+  }
   const wire = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
   for (const port of [8080, 8081]) {
+    assert.strictEqual(wire.find(v => v.dstPort === port && v.flags === 2)?.mss, 536,
+      `channel ${port}: UNETRTL did not advertise receive MSS 536`);
     const acks = wire.filter(v => v.dstPort === port && v.payload.length === 0);
-    const reopens = acks.filter((v, i) => v.window === 536
-      && acks[i + 1]?.ack === v.ack && acks[i + 1].window === 2584);
+    const reopens = acks.filter((v, i) => acks[i + 1]?.ack === v.ack
+      && acks[i + 1].window > v.window);
     assert.ok(reopens.length >= 3,
-      `channel ${port}: next active RECV did not repeatedly reopen 536-byte window to 2584`);
+      `channel ${port}: next active RECV did not repeatedly reopen its durable window`);
   }
   checkProbe(r);
 }
@@ -539,9 +552,11 @@ function checkProbe(r) {
   assert.strictEqual(r.results[4].ix & 4, 0);
   const wire = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
   const foreignAcks = wire.filter(v => v.dstPort === 8081 && v.payload.length === 0);
-  assert.ok(foreignAcks.some(v => v.ack === 0x12345679 + 536 && v.window === 0));
-  assert.ok(foreignAcks.every(v => v.window <= 536),
+  const foreignStoreAck = foreignAcks.find(v => v.ack === 0x12345679 + 536);
+  assert.strictEqual(foreignStoreAck?.window, 0,
     'foreign channel borrowed the selected channel caller buffer');
+  assert.ok(foreignAcks.some(v => v.ack === foreignStoreAck.ack && v.window > 536),
+    'channel did not publish its own caller buffer when it became selected');
   checkProbe(r);
 }
 

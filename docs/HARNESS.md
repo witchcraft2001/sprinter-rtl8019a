@@ -224,15 +224,23 @@ Trace output appends one JSON line per low-level probe. The old 18084-byte
 in `tools/dev/test_unettest_response_server.py`, included in `make test-host`.
 MAME/physical-card and original SNC/WebDAV acceptance remain separate.
 
-## UNETRTL receive-window throughput regression (0.3.2)
+## UNETRTL receive-window throughput regressions (0.3.2--0.3.7)
 
 The DLL probe also drives both TCP channels through 12000-byte deterministic
-streams using repeated blocking 2048-byte RECV calls. Its peer obeys the
-cumulative ACK and advertised window exactly. The test checks the complete
-byte stream, zero LOST reports, and a same-ACK wire update from the 536-byte
-durable window at the end of one call to 2584 bytes at the start of the next.
-This distinguishes the fixed path from 0.3.1, which delivered only one
-536-byte MSS per public call after the first window closed.
+streams using repeated blocking 2048-byte RECV calls. Its peer obeys receive
+MSS 536, the cumulative ACK and advertised window exactly. The test checks the
+complete byte stream, zero LOST reports, receive MSS 536 in each SYN, a full 2048-byte
+result for every non-final call, and a same-ACK wire update from the durable
+window at the end of one call to the larger active window at the start of the
+next. A segment crossing the caller boundary is split between caller and
+pending storage before ACK. Separate oversized-segment vectors exercise the
+same rule. The 0.3.4
+experiment advertised MSS 512/window 2560 to align a 2048-byte application
+buffer, but was retired in 0.3.5: it increased per-segment CPU/DMA overhead and
+tuned TCP framing to one consumer's buffer size. Version 0.3.6 tried Ethernet
+receive MSS 1460 while retaining the 536-byte durable queue, but real MAME
+throughput exposed a stop/start regression in the synchronous DLL window.
+Version 0.3.7 restores DLL receive MSS 536; direct clients keep MSS 1460.
 
 A fault-injected transmit failure on that opening window update must produce
 NERR_HW with DE=0 and IX=0, preserve a RECV/LASTERR diagnostic, restore the
