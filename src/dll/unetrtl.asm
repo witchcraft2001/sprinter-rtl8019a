@@ -217,6 +217,7 @@ BSS_ICMP	EQU 0x01F6		; 0x010 icmp_lib
 BSS_OUR_IP	EQU 0x0206		; 4
 BSS_OUR_MAC	EQU 0x020A		; 6
 BSS_CANCELLED	EQU 0x0210		; 1
+BSS_LASTERR_FROZEN EQU 0x0211		; 1: LASTERR_BUF holds a failed call's frozen line
 BSS_LASTERR	EQU 0x0212		; 0x048 formatted diagnostic line
 BSS_TX_BUF	EQU 0x025A		; 0x140 320 = RESOLVE_MAX_FRAME (largest whole-built frame)
 BSS_RX_HDR	EQU 0x039A		; 4     NE2000 RX ring header
@@ -1612,7 +1613,14 @@ F_LASTERR
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
 	JP	C,RET_PARAM
-	CALL	BUILD_LASTERR
+	; Once a call has failed, the buffer holds that call's frozen line
+	; (RET_A) and is returned as is.  Until then every LASTERR builds a
+	; fresh line from live state, so a consumer polling it on a healthy
+	; DLL sees the current stage rather than an empty string or the line
+	; of its own first poll.
+	LD	A,(LASTERR_FROZEN)
+	OR	A
+	CALL	Z,BUILD_LASTERR
 	LD	HL,LASTERR_BUF
 	LD	DE,(ARG_DE)
 	LD	BC,(ARG_IX)
@@ -1742,6 +1750,27 @@ F_NOTSUP
 RET_A						; A already set
 	LD	(LAST_NERR),A
 	OR	A
+	RET	Z
+	; Freeze the COMPLETE diagnostic at the moment of failure, which is
+	; what docs/UNETRTL.md promises.  Only the tx bytes were captured;
+	; stage, nerr, the TCP reason and the resolver reason were read live
+	; by BUILD_LASTERR, so ANY later call -- a successful one included --
+	; rewrote them and handed the consumer a mixed snapshot (a drained
+	; RECV after a failed SEND turned "st=SEND nerr=07 tcp=08" into
+	; "st=RECV nerr=00").  Formatting here is off the hot path: it runs
+	; on error returns only and touches no hardware.  BUILD_LASTERR
+	; clobbers the scratch registers, but several callers set their DE/IX
+	; return values before jumping here.
+	PUSH	AF
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	CALL	BUILD_LASTERR
+	POP	HL
+	POP	DE
+	POP	BC
+	POP	AF
+	LD	(LASTERR_FROZEN),A		; A = nerr, non-zero here; flags untouched
 	RET
 RET_PARAM
 	LD	A,NERR_PARAM
@@ -2427,6 +2456,15 @@ MAP_TCP_FAIL
 ; the NIC transmitted locally, but the cumulative peer ACK did not
 ; arrive after the bounded retransmits.  Report that as NERR_SEND,
 ; while retaining the hardware/cancel distinctions above.
+;
+; A peer FIN during that ACK wait is NOT that class and must not share
+; the RST mapping below: the server may have answered (an HTTP 4xx that
+; refuses the body it is still being sent) and then closed.  Those bytes
+; are already queued by STORE_TCP_PAYLOAD and the deferred-close marker
+; is already set by PEER_CLOSED, so this path only names the outcome --
+; releasing the channel or clearing the queue here would destroy exactly
+; the response the caller has to read.  RECV drains it and returns the
+; final NERR_CLOSED, which is what releases the channel.
 ; ------------------------------------------------------
 MAP_TCP_SEND_FAIL
 	LD	A,(TCP_LAST_FAIL)
@@ -2434,9 +2472,14 @@ MAP_TCP_SEND_FAIL
 	JR	Z,.cancel
 	CP	@TCP.F_SEND
 	JR	Z,.hw
+	CP	@TCP.F_CLOSED
+	JR	Z,.peer_fin
 	CP	@TCP.F_RST
 	JR	Z,.closed
 	LD	A,NERR_SEND
+	JP	RET_A
+.peer_fin
+	LD	A,NERR_CLOSED
 	JP	RET_A
 .closed
 	CALL	RELEASE_OR_REARM
@@ -2870,6 +2913,7 @@ QUEUE_LEN	EQU ARG_PORT
 DIAG_TX		EQU SEND_DONE
 
 LASTERR_BUF	EQU DLL_BSS + BSS_LASTERR
+LASTERR_FROZEN	EQU DLL_BSS + BSS_LASTERR_FROZEN	; 0 until the first failed call
 	; Parameter block for WIN0COLD.RUN (src/include/coldctx.inc): the
 	; four hot pointers every cold RESOLVE/DNS/ARP/ICMP function reuses
 	; (TX_BUF/OUR_MAC/OUR_IP/CHECKSUM).  Fixed for the DLL instance's
@@ -2905,4 +2949,5 @@ COLD_CTX	EQU DLL_BSS + BSS_COLD_CTX
 ; The whole L1 image is a 32-byte header, this code image, and one
 ; relocation bit per code byte.  0x38C7 is the exact largest code image
 ; for which 32 + size + ceil(size/8) still fits libman's 16 KiB window.
+	DISPLAY "DLL image free bytes: ", /D, DLL_IMAGE_ORIGIN + 0x38C7 - $
 	ASSERT $ <= DLL_IMAGE_ORIGIN + 0x38C7

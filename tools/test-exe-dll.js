@@ -329,7 +329,7 @@ for (const mss of [536, 1460]) {
 }
 
 // Deterministic packet geometry and public ABI failure paths.
-const { probe } = require('./exe-harness/unet-probe');
+const { probe, BIGPAY_LEN } = require('./exe-harness/unet-probe');
 const { parseTcpSegment, buildTcpSegment, respond } = require('./exe-harness/net-builders');
 const init = { fn: 3 };
 const connect = (a = 0) => ({ fn: 5, a, de: 'HOST', ix: a ? 'PORT2' : 'PORT' });
@@ -728,6 +728,122 @@ for (const dllWindow of [1, 2]) { // OPTIONS close, then PROPFIND reconnect.
   assert.deepStrictEqual(got, propfind,
     `DLL WIN${dllWindow}: PROPFIND response after reconnect was truncated`);
   checkProbe(r);
+}
+
+// Ordered client payload as it reached the wire, retransmissions dropped.
+function sentStream(r) {
+  const segments = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  const chunks = [];
+  let next = null;
+  for (const s of segments) {
+    if (!s.payload.length) continue;
+    if (next === null) next = s.seq;
+    if (s.seq !== next) continue;               // retransmission of an older segment
+    assert.ok(s.payload.length <= 536, 'outbound segment exceeded the 536-byte MSS');
+    chunks.push(Buffer.from(s.payload));
+    next = (next + s.payload.length) >>> 0;
+  }
+  return Buffer.concat(chunks);
+}
+const bigSend = (a = 0) => ({ fn: 6, a, de: 'BIGPAY', ix: BIGPAY_LEN });
+const lasterr = () => ({ fn: 16, de: 'BUFFER', ix: 72 });
+const sendslice = ms => ({ fn: 17, a: 3, de: ms });
+const expectedBig = (r, blocks) => Buffer.from(Array.from({ length: blocks * BIGPAY_LEN },
+  (_, i) => (r.symbols.BIGPAY + i % BIGPAY_LEN) & 255));
+function diagLine(result) {
+  const end = result.data.indexOf(0);
+  return result.data.subarray(0, end < 0 ? undefined : end).toString('ascii');
+}
+
+{ // Until the first failure LASTERR follows live state on EVERY call: a
+  // healthy poll must not freeze its own line (a first-byte "buffer is
+  // non-empty" guard did exactly that), while a failure freezes the line
+  // and a later successful call leaves it alone.
+  const r = probe([init, lasterr(), connect(), lasterr(), { fn: 6, a: 1, de: 'PAYLOAD', ix: 7 },
+    lasterr(), close(0), lasterr()], dllScenario(), peer(() => {}));
+  assert.match(diagLine(r.results[1]), /st=NETINIT nerr=00/);
+  assert.match(diagLine(r.results[3]), /st=CONNECT nerr=00/, 'a healthy LASTERR poll froze its own first line');
+  assert.strictEqual(r.results[4].a, 11);       // NERR_STATE: channel 1 was never opened
+  assert.match(diagLine(r.results[5]), /st=SEND nerr=0B/);
+  assert.strictEqual(r.results[6].a, 0);
+  assert.match(diagLine(r.results[7]), /st=SEND nerr=0B/, 'a successful CLOSE overwrote the frozen line');
+  checkProbe(r);
+}
+
+for (const dllWindow of [1, 2]) { // SNC loads the DLL into WIN2.
+  { // A long PUT: 20 public SENDs above the MSS with SENDSLICE armed. Every
+    // byte reaches the wire once, in sequence, in 536-byte segments, and the
+    // final response is readable.
+    const BLOCKS = 20;
+    const reply = Buffer.from('HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n');
+    // Progress is the unique cumulative range by TCP sequence, so a
+    // retransmission cannot count twice; the closing reply goes out once.
+    let base = null, received = 0, answered = false;
+    const r = probe([init, connect(), sendslice(25),
+      ...Array.from({ length: BLOCKS }, () => bigSend()), recv(), recv(), close(0)],
+    dllScenario(), peer(({ seg, emit }) => {
+      if (!seg.payload.length) return;
+      if (base === null) base = seg.seq;
+      received = Math.max(received, ((seg.seq - base) >>> 0) + seg.payload.length);
+      if (received < BLOCKS * BIGPAY_LEN) emit({ flags: 16 });
+      else if (!answered) { answered = true; emit({ flags: 25, payload: reply }); }
+    }), dllWindow);
+    assert.strictEqual(r.results[2].a, 0, 'SETOPT SENDSLICE refused: the slice never armed');
+    const sends = r.results.slice(3, 3 + BLOCKS);
+    assert.ok(sends.every(v => v.a === 0 && v.de === BIGPAY_LEN),
+      `WIN${dllWindow}: a block of the long PUT did not complete: ${JSON.stringify(sends)}`);
+    assert.deepStrictEqual(sentStream(r), expectedBig(r, BLOCKS),
+      `WIN${dllWindow}: the long PUT corrupted the stream`);
+    assert.deepStrictEqual(r.results[3 + BLOCKS].data, reply);
+    assert.strictEqual(r.results[4 + BLOCKS].a, 7);   // NERR_CLOSED after the response
+    checkProbe(r);
+  }
+  { // The peer refuses the body it is still being sent: an HTTP status and
+    // FIN arrive in one segment while SEND waits for an ACK that will never
+    // cover its chunk. This must report the close, not a generic send
+    // failure, must not discard the response, and must leave a LASTERR that
+    // still describes the SEND after an unrelated call has succeeded.
+    const reply = Buffer.from('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n');
+    let once = false;
+    // LASTERR is read only AFTER the successful drain, so the assertion
+    // cannot pass on a live rebuild: that would report the drain's own
+    // st=RECV nerr=00. It is this run's first LASTERR call, so nothing can
+    // have cached the line either.
+    const r = probe([init, connect(), send(), recv(), lasterr(), recv(), close(0)],
+      dllScenario(), peer(({ seg, emit }) => {
+        if (seg.payload.length && !once) {
+          once = true;
+          emit({ flags: 25, ack: (seg.seq + 3) >>> 0, payload: reply });
+        }
+      }), dllWindow);
+    assert.strictEqual(r.results[2].a, 7);        // NERR_CLOSED, never NERR_SEND
+    assert.strictEqual(r.results[2].de, 3);       // cumulatively acknowledged prefix
+    assert.strictEqual(r.results[3].a, 0);
+    assert.deepStrictEqual(r.results[3].data, reply);
+    assert.match(diagLine(r.results[4]), /st=SEND nerr=07 tcp=08/,
+      `WIN${dllWindow}: the successful drain overwrote the failure diagnostic`);
+    assert.strictEqual(r.results[5].a, 7);
+    assert.strictEqual(r.results[5].de, 0);
+    checkProbe(r);
+  }
+  { // Same refusal with the response and the FIN in separate segments.
+    const reply = Buffer.from('HTTP/1.1 507 Insufficient Storage\r\n\r\n');
+    let once = false;
+    const r = probe([init, connect(), bigSend(), lasterr(), recv(), recv(), close(0)],
+      dllScenario(), peer(({ seg, t, emit }) => {
+        if (seg.payload.length && !once) {
+          once = true;
+          emit({ ack: (seg.seq + 3) >>> 0, payload: reply });
+          emit({ flags: 17, seq: (t.serverSeq + reply.length) >>> 0, ack: (seg.seq + 3) >>> 0 }, 2);
+        }
+      }), dllWindow);
+    assert.strictEqual(r.results[2].a, 7);
+    assert.strictEqual(r.results[2].de, 3);
+    assert.match(diagLine(r.results[3]), /st=SEND nerr=07 tcp=08/);
+    assert.deepStrictEqual(r.results[4].data, reply);
+    assert.strictEqual(r.results[5].a, 7);
+    checkProbe(r);
+  }
 }
 
 console.log(`Actual DSS EXE DLL harness: ${caseCount()} UNETTEST checks passed`);

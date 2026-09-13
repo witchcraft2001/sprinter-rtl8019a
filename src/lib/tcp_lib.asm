@@ -34,7 +34,9 @@
 ;                     TCP_LAST_FAIL holds reason.
 ;
 ;   TCP.LAST_FAIL  byte; 0 none, 1 send, 2 recv timeout,
-;                  3 RST, 4 unexpected segment, 5 cancel.
+;                  3 RST, 4 unexpected segment, 5 cancel,
+;                  6 foreign channel, 7 slice expired,
+;                  8 peer FIN (UNET_DLL builds only).
 ;
 ; Caller responsibilities:
 ;   - NIC initialised, OUR_IP/OUR_MAC populated.
@@ -170,6 +172,15 @@ F_BAD_SEG		EQU 4
 F_CANCEL		EQU 5
 F_OTHER			EQU 6	; head packet belongs to another UNET channel
 F_AGAIN			EQU 7	; USE_TCP_ASYNCSEND: silent for one slice, budget remains
+F_CLOSED		EQU 8	; UNET_DLL: RECV returned on a peer FIN (orderly close).
+				; Every other CF=1 exit of RECV assigns its own reason,
+				; so leaving this one unassigned made the FIN inherit
+				; whatever the previous operation left behind -- an ACK
+				; wait inside SEND then read F_NONE and reported a
+				; generic send failure for an orderly close.  The
+				; payload that FIN carried is already queued by
+				; STORE_TCP_PAYLOAD, so the reason must stay distinct
+				; from F_RST: the caller has data left to drain.
 
 
 ; ------------------------------------------------------
@@ -2155,6 +2166,14 @@ RECV
 	OR	A
 	RET
 .PEER_FIN
+	IFDEF UNET_DLL
+	; Stand-alone apps classify this return by TCP_STATE == ST_CLOSE_WAIT
+	; and keep their historical LAST_FAIL values untouched; the DLL needs
+	; a reason code because its SEND wait cannot ask "was the FIN mine?"
+	; by state alone (the state survives the call that observed it).
+	LD	A,F_CLOSED
+	LD	(TCP_LAST_FAIL),A
+	ENDIF
 	SCF
 	RET
 .SEQ_MISMATCH

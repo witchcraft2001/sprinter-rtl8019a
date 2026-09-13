@@ -208,6 +208,26 @@ placement runs the DLL relocated into WIN2 with its consumer in WIN1.
 An ACK-bearing RST also verifies that SEND returns `NERR_CLOSED` with `DE`
 equal to the cumulative progress acknowledged before closure.
 
+Three vectors, run in both DLL placements, cover outgoing segmentation and
+the orderly close of a peer that answers before it consumes the body. A long
+PUT of twenty public 1200-byte SENDs with `SENDSLICE` armed, from the probe's
+`BIGPAY` block (byte at address `a` is `a & 255`, so the wire is reproducible
+in JavaScript from the symbol alone), must reach the wire once, in sequence,
+in segments no larger than the 536-byte MSS. A response plus FIN that
+acknowledges only part of the outstanding chunk -- in one segment and in two
+-- must return `NERR_CLOSED` with `DE` equal to the acknowledged prefix, then
+reproduce the response byte-for-byte through `RECV`, and only then report
+`NERR_CLOSED` again. Before 0.3.8 those two returned `NERR_SEND` with
+`tcp=00`.
+
+Both also read `LASTERR` and require `st=SEND nerr=07 tcp=08`, one
+immediately after the failing call and one only after the response has been
+drained. The deferred check is what pins the 0.3.8 diagnostic freeze: with
+the line rebuilt from live state it reports the drain's own
+`st=RECV nerr=00`. It is deliberately that run's first `LASTERR` call --
+an earlier call would have to be answered from live state and could mask
+the check.
+
 Read-only CPU snapshots at assembled SEND/RECV/sink boundaries contain
 receive sequence, send ACK, window, ACK wait state, accepted length, both
 pending lengths and LOST. Public return records contain A/DE/IX, and wire

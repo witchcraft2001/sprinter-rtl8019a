@@ -159,7 +159,17 @@ which card it got.  None of them changes the calling convention.
   `tcp` and `res` the TCP and resolver failure codes, and `tx` the
   transmit stage plus ISR/TSR/CR.  The values are captured at the
   moment of failure, so `LASTERR` never reports a chip that has since
-  recovered.  Unlike earlier builds, this string does not carry a raw
+  recovered.  Since 0.3.8 that is true of the whole line: every error
+  return formats it there and then, and later calls -- successful ones
+  included -- leave it alone.  Before 0.3.8 only `tx` was captured and
+  the rest was read live, so draining a response after a failed `SEND`
+  turned `st=SEND nerr=07` into the drain's own `st=RECV nerr=00`.
+  A consumer may therefore run its recovery (reading whatever the peer
+  queued, closing the channel) before asking for the diagnostic.  The
+  line is replaced only by the next failed call, whichever function
+  that is.  Until the first failure `LASTERR` formats live state on
+  every call, so polling it on a healthy link returns a current line
+  rather than nothing.  Unlike earlier builds, this string does not carry a raw
   `CR ISR DCR RCR TCR IMR PSTART PSTOP BNRY CURR` register dump (image
   budget, made room for `LISTEN`); a consumer that needs those reads
   them the same way every stand-alone utility does, via its own
@@ -173,6 +183,25 @@ next segment is sent.  A missing data segment or ACK is retried with the
 same TCP sequence number, up to four transmissions with a one-second ACK
 wait per attempt.  Exhaustion returns `NERR_SEND`; `DE` still reports the
 bytes confirmed, including a partial ACK of the failing chunk.
+
+Since 0.3.8, a peer FIN that arrives during that ACK wait **and leaves the
+current chunk unacknowledged** is reported as `NERR_CLOSED`, not `NERR_SEND`.
+A server may answer before it has consumed the body it is still being sent --
+an HTTP `4xx` refusing a WebDAV `PUT`, for example -- and then close.  Those
+response bytes are already saved by the receive sink, so `SEND` only names
+the outcome: it does not release the channel or clear the queue.  `DE` is the
+acknowledged prefix, the following `RECV` calls return the response, and the
+`RECV` after the last byte returns `NERR_CLOSED` and releases the channel.
+
+A FIN whose ACK *does* cover the whole chunk is not an error at all: that
+`SEND` succeeds with its full length, the remaining chunks of the same call
+are still sent to the half-closed peer, and the close surfaces on the next
+`RECV` exactly as it always has.  A peer RST keeps its old mapping, which
+does discard the queue.
+
+`LASTERR` reports `tcp=08` for the FIN case (`F_CLOSED`); before 0.3.8 the
+FIN left no reason at all, so the pair read `nerr=05 tcp=00` and no consumer
+could tell a refusal from a dead peer.
 
 Since 0.3.1, every received TCP payload is saved BEFORE advancing the receive
 sequence or sending its ACK. During public `RECV`, bytes go to the caller
@@ -398,7 +427,7 @@ the release archive and the floppy image, so a consumer can take the
 ready-built file without installing the assembler or libman.  Its L1
 header records the ABI line in the numeric version field and the full
 package revision in the 15-byte text tag, for example
-`UNETRTL v0.3.7`.
+`UNETRTL v0.3.8`.
 
 ## Complete early-response regression (0.3.1)
 

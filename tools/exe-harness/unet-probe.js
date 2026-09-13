@@ -7,6 +7,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { runExe } = require('./harness');
 const root = path.resolve(__dirname, '../..');
+const BIGPAY_LEN = 1200;                       // > MSS: forces 536/536/128 chunking
 function symbols(file) {
   return Object.fromEntries(fs.readFileSync(file, 'utf8').trim().split('\n').flatMap(line => {
     const m = line.match(/^(\S+): EQU 0x([0-9A-F]+)/i);
@@ -53,6 +54,12 @@ HOST DB "192.168.7.1",0
 PORT DB "8080",0
 PORT2 DB "8081",0
 PAYLOAD DB "request"
+; Multi-segment SEND source: byte at address a is a & 255, so the expected
+; stream is reproducible in JS from the BIGPAY symbol alone.
+BIGPAY
+ DUP ${BIGPAY_LEN}
+ DB $ & 255
+ EDUP
  INCLUDE "libman13.asm"
  ASSERT $ < 0xA000
 HANDLE EQU 0xA000
@@ -98,7 +105,7 @@ BUFFER EQU 0xA100
     });
     const r = runExe(path.join(tmp, 'probe.EXE'), '', { ...scenario, cpuProbes });
     if (process.env.UNET_TRACE) fs.appendFileSync(process.env.UNET_TRACE, JSON.stringify({ dllWindow, events, results, transmittedFrames: r.transmittedFrames }) + '\n');
-    return { ...r, events, results };
+    return { ...r, events, results, symbols: syms };
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 }
-module.exports = { probe };
+module.exports = { probe, BIGPAY_LEN };
