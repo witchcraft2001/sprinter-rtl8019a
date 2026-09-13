@@ -54,6 +54,13 @@ RTL_TSR_OFF	EQU RTL_TPSR_OFF	; R: Transmit Status
 RTL_NCR_OFF	EQU RTL_TBCR0_OFF	; R: Number of Collisions
 RTL_FIFO_OFF	EQU RTL_TBCR1_OFF	; R: receive FIFO diagnostic byte
 RTL_RSR_OFF	EQU RTL_RCR_OFF		; R: Receive Status
+; Error tally counters.  8-bit, CLEARED BY READING, and the only
+; record of frames the receiver threw away: a CRC/alignment reject
+; never enters the ring, so CURR does not move and the driver sees
+; nothing at all.  ISR.CNT latches when one of them sets its MSB.
+RTL_CNTR0_OFF	EQU RTL_TCR_OFF		; R: frame alignment error tally
+RTL_CNTR1_OFF	EQU RTL_DCR_OFF		; R: CRC error tally
+RTL_CNTR2_OFF	EQU RTL_IMR_OFF		; R: missed packet tally
 
 ; Page 0 ID-register aliases (read-only on RTL8019AS).
 RTL_ID0_OFF	EQU RTL_RBCR0_OFF

@@ -882,6 +882,55 @@ SNAPSHOT_REGS
 REG_SNAPSHOT	EQU RTL_REG_SNAPSHOT	; 10 bytes in runtime BSS
 REG_SNAPSHOT_LEN EQU 10
 
+	IFDEF USE_RTL_SNAPSHOT_TALLY
+; ------------------------------------------------------
+; SNAPSHOT_TALLY: capture the three error tally counters
+; plus RSR, then clear the ISR.CNT latch.
+;
+; Why this exists: a frame rejected by the receiver (bad
+; CRC, bad alignment) or dropped for want of ring space is
+; discarded WITHOUT advancing CURR, so it leaves no trace
+; anywhere the driver can see -- a wait loop just reports
+; "nothing arrived".  These counters are the only evidence
+; that distinguishes "the peer never answered" from "the
+; answer arrived and the NIC threw it away".
+;
+; The counters are CLEARED BY READING, so consecutive calls
+; yield a per-interval delta rather than a run total; a
+; caller that samples once per operation can attribute the
+; errors to that operation.  ISR.CNT is cleared with them
+; (write-1-to-clear, other latched bits unaffected) so the
+; next overflow is meaningful too -- in particular the OVW
+; latch survives, which RING_HAS_PACKET's drain-first
+; recovery contract depends on.
+;
+; RSR is the status of the LAST STORED frame, not a counter:
+; it is only meaningful when something was received, and it
+; is not cleared by reading.
+;
+; In:  HL = 4-byte destination (CNTR0, CNTR1, CNTR2, RSR).
+;      ISA window OPEN, as for every other driver primitive.
+; Out: HL advanced past the 4 bytes.  Trashes A, IX.
+; ------------------------------------------------------
+SNAPSHOT_TALLY
+	LD	IX,(RTL_BASE_PTR)
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	A,(IX+RTL_CNTR0_OFF)
+	LD	(HL),A
+	INC	HL
+	LD	A,(IX+RTL_CNTR1_OFF)
+	LD	(HL),A
+	INC	HL
+	LD	A,(IX+RTL_CNTR2_OFF)
+	LD	(HL),A
+	INC	HL
+	LD	A,(IX+RTL_RSR_OFF)
+	LD	(HL),A
+	INC	HL
+	LD	(IX+RTL_ISR_OFF),ISR_CNT	; write-1-to-clear, CNT only
+	RET
+	ENDIF
+
 
 ; ------------------------------------------------------
 ; DMA_READ: remote DMA read of BC bytes from packet-RAM

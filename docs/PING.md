@@ -18,7 +18,7 @@ PING /?
 | `-n N`   | Number of echo requests (default 4, max 255).          |
 | `-l N`   | Payload size in bytes (default 32, max 255).           |
 | `-i TTL` | IP TTL on outgoing requests (default 64).              |
-| `-w MS`  | Per-reply wait timeout in milliseconds (default 1000). |
+| `-w MS`  | Per-reply wait timeout in milliseconds (default 4000). |
 | `target` | Destination IPv4 or hostname.                          |
 
 `-t` and `-n` are mutually compatible: when `-t` is supplied, the
@@ -88,6 +88,38 @@ On the affected physical card, v0.2.10 measured stable
 `C0=08>08 C3=70>70 NCR=00`: UTP stayed selected but FUDUP remained enabled.
 A changed `C0` would instead indicate TP/CX auto-detect switching away from
 UTP while the frame is sent.
+
+## The `NIC` line: what the card threw away
+
+Every timeout ends with the card's own error account:
+
+```text
+ NIC fae=00 crc=02 mpc=00 rsr=21
+```
+
+These are the page-0 tally counters (`CNTR0`/`CNTR1`/`CNTR2`) plus `RSR`.
+They answer the question the rest of the dump cannot.  `(rx=0 frames)` with
+an unchanged `CURR` proves only that nothing was *stored*: a frame the
+receiver rejects is discarded before it reaches the ring, so it moves no
+pointer and leaves no trace anywhere else.
+
+| Field | Meaning when non-zero                                            |
+|-------|------------------------------------------------------------------|
+| `fae` | Frame alignment errors -- damaged frames on the wire.            |
+| `crc` | CRC errors -- same class: cable, port, duplex, marginal PHY.     |
+| `mpc` | Missed packets -- no ring space, or the receiver was halted.     |
+| `rsr` | Receive status of the last *stored* frame (not a counter).       |
+
+So `fae`/`crc` non-zero means the reply may well have arrived and been
+dropped on the floor by the PHY; `mpc` non-zero points at this driver
+rather than the network; all-zero says the NIC genuinely saw nothing and
+the loss is upstream of this machine.
+
+The counters are cleared by reading, and PING samples them at the end of
+*every* echo -- successful ones included.  The printed figures therefore
+cover the lost echo's wait alone, not the whole run.  `ISR` bit 5 (`CNT`)
+is cleared with them, so a later `ISR=20` means a counter overflowed
+again rather than at some forgotten point during startup.
 
 The `-b` switch changes only the Ethernet destination to
 `FF:FF:FF:FF:FF:FF`; the target IPv4 address and ICMP packet remain intact.

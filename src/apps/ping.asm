@@ -46,13 +46,20 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_WAIT_PTX
 	DEFINE USE_RTL_RING_HAS_PACKET
 	DEFINE USE_RTL_READ_PACKET
+	DEFINE USE_RTL_SNAPSHOT_TALLY		; error counters for the loss dump
 	DEFINE USE_ARP_BUILD_REQUEST
 	DEFINE USE_NETENV
 	DEFINE USE_CMDL
 	DEFINE USE_RESOLVE
 
 ARP_TIMEOUT_MS	EQU 3000		; ARP reply budget (ms)
-ICMP_TIMEOUT_MS	EQU 1000		; per-echo reply budget (ms, default Windows -w)
+; Per-echo reply budget, in TICK_AND_CHECK_KEY passes.  4000 matches the
+; Windows "ping" default (-w); the earlier 1000 was documented as that
+; default and was not -- it made this utility declare a loss four times
+; sooner than the PC the user compares it against.  Note that one pass is
+; DELAY_1MS + SCANKEY + the ISA close/open, i.e. somewhat MORE than 1 ms,
+; so the real budget errs on the generous side.
+ICMP_TIMEOUT_MS	EQU 4000		; per-echo reply budget
 PING_GAP_MS	EQU 1000		; interval between echo requests
 SCAN_C		EQU 0xAC		; DSS scancode for the C key (observed)
 
@@ -119,7 +126,7 @@ START
 	CALL	@CMDL.IS_HELP
 	JP	NC,SHOW_HELP
 
-	; Defaults: count=4 send, payload=32, TTL=64, timeout=1000ms,
+	; Defaults: count=4 send, payload=32, TTL=64, timeout=ICMP_TIMEOUT_MS,
 	; forever=off, diagnostic L2 broadcast=off.
 	LD	A,4
 	LD	(COUNT),A
@@ -127,7 +134,7 @@ START
 	LD	(PAYLOAD_LEN),A
 	LD	A,64
 	LD	(TTL_VAL),A
-	LD	HL,1000
+	LD	HL,ICMP_TIMEOUT_MS	; was a hardcoded 1000 ignoring the EQU
 	LD	(TIMEOUT_MS_VAL),HL
 	XOR	A
 	LD	(FOREVER),A
@@ -335,6 +342,11 @@ START
 	LD	(SEQ_LO),A
 	XOR	A
 	LD	(SEQ_HI),A
+	; Prime the NIC error counters: they are read-and-clear, so this
+	; discards whatever accumulated during reset/ARP and makes the
+	; first echo's sample a clean per-echo delta.
+	LD	HL,TALLY_SNAP
+	CALL	@RTL.SNAPSHOT_TALLY
 
 PING_LOOP
 	; Stop condition: -t -> never; otherwise SENT < COUNT.
@@ -387,6 +399,12 @@ PING_LOOP
 	LD	(TIMEOUT_MS_LEFT),HL
 	CALL	WAIT_FOR_ICMP_REPLY
 	JR	C,.TIMED_OUT
+
+	; Sample-and-clear the error counters on the success path too, so the
+	; figures printed after a LOST echo cover that echo's wait alone
+	; instead of everything since the program started.
+	LD	HL,TALLY_SNAP
+	CALL	@RTL.SNAPSHOT_TALLY
 
 	; "Reply from X.X.X.X: bytes=N time=Nms TTL=...".
 	CALL	@ISA.ISA_CLOSE
@@ -446,6 +464,11 @@ PING_LOOP
 	OR	A
 	JR	NZ,PING_LOOP_END
 	CALL	@RTL.SNAPSHOT_REGS
+	; Error counters for THIS echo's wait (read-and-clear; last sampled
+	; when the previous echo ended).  They are the only place a frame the
+	; NIC rejected shows up at all -- see PRINT_TALLY_DUMP.
+	LD	HL,TALLY_SNAP
+	CALL	@RTL.SNAPSHOT_TALLY
 	CALL	@ISA.ISA_CLOSE
 	PRINT	MSG_TIMED_OUT		; "Request timed out."
 	PRINT	MSG_RX_PRE		; "  (rx="
@@ -463,6 +486,7 @@ PING_LOOP
 	; chip is alive, the RX ring is advancing (CURR vs BNRY) and whether
 	; OVW (ISR bit 4) fired.
 	CALL	PRINT_REG_DUMP
+	CALL	PRINT_TALLY_DUMP
 	CALL	@ISA.ISA_OPEN
 
 .NEXT_SEQ
@@ -1546,6 +1570,56 @@ PRINT_REG_DUMP
 	PRINT LINE_END
 	RET
 
+; ------------------------------------------------------
+; PRINT_TALLY_DUMP: the NIC's own account of what it threw
+; away during the lost echo.
+;
+; "(rx=0 frames)" plus an unmoved CURR proves only that the
+; ring stayed empty; it cannot distinguish a peer that never
+; answered from an answer the receiver rejected, because a
+; rejected frame is discarded before it is stored.  These
+; counters split the two cases:
+;   fae/crc non-zero -> the wire is damaging frames (cable,
+;                       port, duplex, marginal PHY): the
+;                       reply may well have arrived and been
+;                       dropped on the floor.
+;   mpc  non-zero    -> frames were lost for want of ring
+;                       space or with the receiver halted --
+;                       ours to fix, not the network's.
+;   all zero         -> the NIC saw nothing at all; the loss
+;                       is upstream of this machine.
+; ------------------------------------------------------
+PRINT_TALLY_DUMP
+	PRINT	MSG_TALLY
+	LD	HL,TALLY_NAMES		; same walk as PRINT_REG_DUMP
+	LD	DE,TALLY_SNAP
+	LD	B,4
+.LP
+	PUSH	BC,DE
+.NCHR
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	Z,.NDONE
+	CALL	PUTCHAR
+	JR	.NCHR
+.NDONE
+	POP	DE,BC
+	LD	A,(DE)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	INC	DE
+	DJNZ	.LP
+	PRINT LINE_END
+	RET
+
+TALLY_NAMES
+	DB "fae=",0			; CNTR0: frame alignment errors
+	DB "crc=",0			; CNTR1: CRC errors
+	DB "mpc=",0			; CNTR2: missed packets
+	DB "rsr=",0			; last stored frame's receive status
+
 REG_NAMES
 	DB "CR",0
 	DB "ISR",0
@@ -1580,7 +1654,7 @@ SEQ_HI		EQU APP_BSS_BASE + 34		; 1 byte
 CANCELLED	EQU APP_BSS_BASE + 35		; 1 byte (set by TICK_AND_CHECK_KEY)
 PAYLOAD_LEN	EQU APP_BSS_BASE + 36		; 1 byte (-l size, default 32)
 TTL_VAL		EQU APP_BSS_BASE + 37		; 1 byte (-i TTL, default 64)
-TIMEOUT_MS_VAL	EQU APP_BSS_BASE + 38		; 2 bytes (-w ms, default 1000)
+TIMEOUT_MS_VAL	EQU APP_BSS_BASE + 38		; 2 bytes (-w ms, ICMP_TIMEOUT_MS)
 FOREVER		EQU APP_BSS_BASE + 40		; 1 byte (1 if -t set)
 TARGET_HOST_PTR	EQU APP_BSS_BASE + 41		; 2 bytes (-> argv token)
 RX_SEEN		EQU APP_BSS_BASE + 43		; 1 byte (diag: frames read per wait)
@@ -1597,6 +1671,7 @@ ARP_REPLIED	EQU APP_BSS_BASE + 66		; 1 byte
 FORCE_BCAST	EQU APP_BSS_BASE + 67		; 1 byte (-b diagnostic mode)
 FORCE_MCAST	EQU APP_BSS_BASE + 68		; 1 byte (-m diagnostic mode)
 REINIT_TX	EQU APP_BSS_BASE + 69		; 1 byte (-r reset/reinit before ICMP)
+TALLY_SNAP	EQU APP_BSS_BASE + 70		; 4 bytes: CNTR0, CNTR1, CNTR2, RSR
 ; Private copy of the common driver's TX capture.  Keep it away from the
 ; compact command/RX state above; total size is 4+2+42+2+6 = 56 bytes.
 ICMP_TX_STAGE	EQU APP_BSS_BASE + 128		; stage, ISR, TSR, CR
@@ -1671,6 +1746,7 @@ MSG_RECEIVED_EQ	DB ", Received = ",0
 MSG_LOST_EQ	DB ", Lost = ",0
 MSG_LOSS_END	DB ".",0
 MSG_REGS	DB "REGS ",0
+MSG_TALLY	DB " NIC ",0
 MSG_E_RESET	DB "[E60] RESET timeout",0
 MSG_E_SEND	DB "[E61] TX failed",0
 MSG_E_ARP	DB "[E62] ARP reply timeout",0
@@ -1689,7 +1765,7 @@ MSG_HELP
 	DB "  -n count  number of echo requests (default 4, max 255).",13,10
 	DB "  -l size   payload size in bytes (default 32, max 255).",13,10
 	DB "  -i TTL    IP TTL on outgoing requests (default 64).",13,10
-	DB "  -w ms     per-reply wait timeout (default 1000 ms).",13,10
+	DB "  -w ms     per-reply wait timeout (default 4000 ms).",13,10
 	DB "  target    destination IPv4 (e.g. 192.168.7.1).",13,10,0
 LINE_END	DB 13,10,0
 
