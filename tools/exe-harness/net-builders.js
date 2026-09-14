@@ -784,7 +784,34 @@ function respondTcp(frame, card, tcp) {
   }
 
   if (!session) return;
-  if (seg.flags & TF_RST) { session.state = 'closed'; return; }
+  if (seg.flags & TF_RST) {
+    // A hardened (RFC 5961) peer honours a RST only at exactly RCV.NXT;
+    // anything else in the window earns a challenge ACK and nothing more.
+    // Record every RST either way so a test can assert which sequence
+    // numbers the client reset at.
+    (session.resets = session.resets || []).push(seg.seq >>> 0);
+    if (seg.seq === session.clientNext) { session.state = 'closed'; session.aborted = true; }
+    return;
+  }
+  if (seg.flags & TF_FIN) {
+    session.finsSeen = (session.finsSeen || 0) + 1;
+    // Only an in-sequence FIN is end-of-stream. Below RCV.NXT it is an old
+    // duplicate; above it, it leaves a hole and the peer keeps waiting for
+    // the missing bytes -- which is precisely the failure a rewound close
+    // produces, so the model has to reproduce both.
+    if (seg.seq === session.clientNext) {
+      session.eof = true;
+      session.clientNext = (seg.seq + seg.payload.length + 1) >>> 0;
+    }
+    // dropFinAcks: swallow the first N acknowledgements so a test can check
+    // that the client retransmits its FIN instead of assuming delivery.
+    if ((session.finsSeen || 0) > (tcp.dropFinAcks ?? 0)) {
+      const finAck = buildTcpSegment(session, { flags: TF_ACK, seq: session.serverSeq, ack: session.clientNext });
+      card.generated.push(finAck);
+      card.schedule(tcp.afterMs ?? 1, finAck);
+    }
+    return;
+  }
 
   if (session.state === 'syn-rcvd' && (seg.flags & TF_ACK) && seg.payload.length === 0) {
     session.state = 'established';

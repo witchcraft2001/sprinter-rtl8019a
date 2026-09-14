@@ -89,6 +89,15 @@ SYN_TIMEOUT_MS		EQU 1700
 SEND_ATTEMPTS		EQU 4
 SEND_ACK_TIMEOUT_MS	EQU 1000
 
+; Orderly close (UNET_DLL): a FIN that only reached the NIC proves
+; nothing -- if it is lost, the peer keeps the connection, and whatever
+; request it carries, open until its own idle timeout.  Wait for the
+; peer to acknowledge our FIN, retransmitting it a bounded number of
+; times.  Three 500 ms attempts cost nothing on a healthy LAN (the ACK
+; arrives in about a millisecond) and cap a dead peer at 1.5 s.
+CLOSE_ATTEMPTS		EQU 3
+CLOSE_ACK_TIMEOUT_MS	EQU 500
+
 ACK_WAIT_IDLE		EQU 0
 ACK_WAIT_ACTIVE		EQU 1
 ACK_WAIT_RX_PENDING	EQU 2
@@ -326,8 +335,7 @@ OPEN
 	; Mirror to SND_UNA.
 	LD	HL,TCP_SND_NXT
 	LD	DE,TCP_SND_UNA
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	ENDIF
 	; RCV_NXT will be set after SYN+ACK arrives; zero for now.
 	XOR	A
@@ -345,14 +353,9 @@ OPEN
 
 	; Build SYN frame (24-byte TCP header with MSS option).
 	CALL	BUILD_SYN
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	CALL	@RTL.SEND_FRAME
+	CALL	XMIT_TX_BUF
 	JR	NC,.SENT
-	LD	A,F_SEND
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_SEND
 .SENT
 
 	; Wait for SYN+ACK matching our (remote_ip, remote_port,
@@ -397,21 +400,15 @@ OPEN
 	; Capture peer ISN -> RCV_NXT, then +1 (SYN).
 	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4	; seq BE
 	LD	DE,TCP_RCV_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	DE,TCP_RCV_NXT
 	CALL	INC_SEQ32
 
 	; Build & send pure ACK to complete the handshake.
 	CALL	BUILD_ACK
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	CALL	@RTL.SEND_FRAME
+	CALL	XMIT_TX_BUF
 	JR	NC,.ACK_OK
-	LD	A,F_SEND
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_SEND
 .ACK_OK
 	LD	A,ST_ESTAB
 	LD	(TCP_STATE),A
@@ -419,9 +416,7 @@ OPEN
 	RET
 .BAD
 	LD	A,F_BAD_SEG
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .TRIES	DB 0
 
 
@@ -449,6 +444,53 @@ INC_SEQ32
 	POP	DE
 	POP	HL
 	RET
+
+
+; ------------------------------------------------------
+; FAIL_SEND / FAIL_A: record a failure reason and return CF=1.  Image-
+; budget helper for the "LD A,F_x / LD (TCP_LAST_FAIL),A / SCF / RET"
+; tail that ended 21 routines; FAIL_SEND is the RTL.SEND_FRAME case,
+; which alone accounted for six of them.
+; ------------------------------------------------------
+FAIL_SEND
+	LD	A,F_SEND
+FAIL_A
+	LD	(TCP_LAST_FAIL),A
+	SCF
+	RET
+
+; ------------------------------------------------------
+; COPY_SEQ32: copy the 4-byte big-endian sequence number at (HL) to
+; (DE).  Image-budget helper -- the two-instruction form stood at 26
+; call sites; contract is LDIR's own, so HL/DE advance past the field
+; and BC comes back zero.
+; ------------------------------------------------------
+COPY_SEQ32
+	LD	BC,4
+	LDIR
+	RET
+
+; ------------------------------------------------------
+; XMIT_TX_BUF: put the frame BUILD_* just assembled in TX_BUF on the
+; wire.  Image-budget helper: this exact three-instruction sequence
+; stood at nine call sites.  CF/A are RTL.SEND_FRAME's.
+; ------------------------------------------------------
+XMIT_TX_BUF
+	LD	HL,@MAIN.TX_BUF
+	LD	BC,(TCP_TX_LEN)
+	JP	@RTL.SEND_FRAME
+
+; ------------------------------------------------------
+; COMMIT_RX: release the NIC ring slot holding the frame just read or
+; peeked through MAIN.RX_HDR.  Same image-budget rationale; ten sites.
+; Guarded like every other COMMIT_PACKET reference: the peek/commit
+; split exists only in builds that pull USE_RTL_PEEK_PACKET.
+; ------------------------------------------------------
+	IFDEF	USE_RTL_PEEK_PACKET
+COMMIT_RX
+	LD	HL,@MAIN.RX_HDR
+	JP	@RTL.COMMIT_PACKET
+	ENDIF
 
 
 	IFDEF	UNET_DLL
@@ -479,8 +521,7 @@ BUILD_TCP_PORTS_SEQ
 	LD	(DE),A
 	INC	DE
 	LD	HL,TCP_SND_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	RET
 	ENDIF
 
@@ -537,8 +578,7 @@ BUILD_SYN
 	INC	DE
 	; seq (BE)
 	LD	HL,TCP_SND_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	ENDIF
 	; ack = 0 (not yet acking anything), or TCP_RCV_NXT for a
 	; SYNACK_ENTRY reply (peer's seq+1, already set by the caller).
@@ -547,8 +587,7 @@ BUILD_SYN
 	OR	A
 	JR	Z,.ACK_ZERO
 	LD	HL,TCP_RCV_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	JR	.ACK_DONE
 .ACK_ZERO
 	ENDIF
@@ -655,9 +694,7 @@ WRITE_RX_WINDOW
 
 SEND_DUP_ACK
 	CALL	BUILD_ACK
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	JP	@RTL.SEND_FRAME
+	JP	XMIT_TX_BUF
 
 
 ; ------------------------------------------------------
@@ -686,13 +723,11 @@ BUILD_ACK
 	INC	DE
 	; seq
 	LD	HL,TCP_SND_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	ENDIF
 	; ack
 	LD	HL,TCP_RCV_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	; data offset = 5 << 4 = 0x50
 	LD	A,0x50
 	LD	(DE),A
@@ -810,11 +845,9 @@ BUILD_ETH_IP
 	LD	(DE),A			; csum lo placeholder
 	INC	DE
 	LD	HL,@MAIN.OUR_IP
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	HL,TCP_REMOTE_IP
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	; DE now points at TCP header start.
 	RET
 .TCP_SEG_LEN	DW 0
@@ -1055,9 +1088,7 @@ WAIT_SYN_ACK
 	OR	L
 	JP	NZ,.LP
 	LD	A,F_TIMEOUT
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .HAVE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
@@ -1085,19 +1116,15 @@ WAIT_SYN_ACK
 	OR	A
 	JP	Z,.TICK			; consumed: charge the budget, see RECV
 	LD	A,F_OTHER
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .COMMIT_OTHER
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	IFDEF USE_ARP_ANSWER
 	CALL	@ARP.ANSWER_REQUEST
 	ENDIF
 	JP	.TICK
 .COMMIT_PEER
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	JR	.PEER_SEG
 	ELSE
 	JR	C,.PEER_SEG
@@ -1127,14 +1154,10 @@ WAIT_SYN_ACK
 	RET
 .RST
 	LD	A,F_RST
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .CANCEL
 	LD	A,F_CANCEL
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 
 
 ; ------------------------------------------------------
@@ -1230,8 +1253,7 @@ GEN_ISN
 	PUSH	HL
 	LD	HL,TCP_SND_NXT
 	LD	DE,TCP_SND_UNA
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	POP	HL
 	RET
 
@@ -1353,24 +1375,21 @@ LISTEN_POLL
 	RET	C
 	JP	.TICK
 .GOT_SYN
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	LD	HL,@MAIN.RX_BUF + 6			; Ethernet src MAC
 	LD	DE,TCP_REMOTE_MAC
 	LD	BC,6
 	LDIR
 	LD	HL,@MAIN.RX_BUF + 14 + 12		; IP src
 	LD	DE,TCP_REMOTE_IP
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 0	; TCP src port
 	LD	DE,TCP_REMOTE_PORT_HI
 	LD	BC,2
 	LDIR
 	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 4	; seq (BE)
 	LD	DE,TCP_RCV_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	DE,TCP_RCV_NXT
 	CALL	INC_SEQ32
 	CALL	GEN_ISN			; SND_NXT = SND_UNA = ISN
@@ -1383,18 +1402,13 @@ LISTEN_POLL
 	CALL	INC_SEQ32
 .SEND_SYNACK
 	CALL	BUILD_SYN.SYNACK_ENTRY
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	CALL	@RTL.SEND_FRAME
+	CALL	XMIT_TX_BUF
 	JR	C,.SYNACK_FAIL
 	LD	A,ST_SYN_RCVD
 	LD	(TCP_STATE),A
 	JP	.TICK
 .SYNACK_FAIL
-	LD	A,F_SEND
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_SEND
 .RCVD
 	; -- ST_SYN_RCVD: wait for the final ACK from the SAME peer.  A
 	; duplicate SYN (the peer never saw our SYN+ACK) re-sends the
@@ -1410,8 +1424,7 @@ LISTEN_POLL
 	LD	B,A
 	AND	TF_RST
 	JR	Z,.CHK_ACK
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	LD	A,ST_LISTEN
 	LD	(TCP_STATE),A
 	JP	.TICK
@@ -1428,8 +1441,7 @@ LISTEN_POLL
 	LD	A,B
 	AND	TF_SYN
 	JR	Z,.DROP
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	JP	.SEND_SYNACK
 .HAS_ACK
 	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 8		; ack BE
@@ -1465,8 +1477,7 @@ LISTEN_POLL
 	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)
 	AND	TF_FIN
 	JR	NZ,.ACCEPTED
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 .ACCEPTED
 	; Our SYN consumed one sequence number: advance SND_NXT to ISN+1
 	; (SND_UNA is already there, see .GOT_SYN) so the first byte we
@@ -1478,14 +1489,11 @@ LISTEN_POLL
 	LD	A,1
 	RET
 .DROP
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	JP	.TICK
 .CANCEL
 	LD	A,F_CANCEL
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 ; Shared by both ST_LISTEN and ST_SYN_RCVD's "not ours" exit: queue
 ; or drop a frame belonging to the other channel, matching
 ; WAIT_SYN_ACK's multichan etiquette.
@@ -1498,12 +1506,9 @@ LISTEN_POLL
 	OR	A
 	JR	Z,.HF_OK
 	LD	A,F_OTHER
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .HF_COMMIT
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	CALL	@ARP.ANSWER_REQUEST
 .HF_OK
 	OR	A
@@ -1562,19 +1567,15 @@ SEND
 	CP	ACK_WAIT_RX_PENDING
 	JR	NZ,.READY
 	LD	A,F_BAD_SEG
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .READY
 	; Save the first sequence and calculate the cumulative ACK target.
 	LD	HL,TCP_SND_NXT
 	LD	DE,TCP_SEND_SEQ
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	HL,TCP_SEND_SEQ
 	LD	DE,TCP_ACK_WAIT_TARGET
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	BC,(.SAVE_LEN)
 	LD	DE,TCP_ACK_WAIT_TARGET
 	CALL	ADD32_BE_BC
@@ -1614,18 +1615,13 @@ SEND
 	LD	BC,54
 	CALL	@RTL.SEND_FRAME_SG
 	ELSE
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	CALL	@RTL.SEND_FRAME
+	CALL	XMIT_TX_BUF
 	ENDIF
 	JR	NC,.WAIT_ACK
 	CALL	.RESTORE_SEQ
 	XOR	A
 	LD	(TCP_ACK_WAIT_STATE),A
-	LD	A,F_SEND
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_SEND
 .WAIT_ACK
 	LD	A,ACK_WAIT_ACTIVE
 	LD	(TCP_ACK_WAIT_STATE),A
@@ -1705,9 +1701,7 @@ SEND
 	; burning a retry or retransmitting.  SEND_RESUME re-enters
 	; .WAIT_ACK directly for this same outstanding segment.
 	LD	A,F_AGAIN
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .ATTEMPT_EXHAUSTED
 	ENDIF
 	LD	A,(TCP_SEND_RETRY_LEFT)
@@ -1725,15 +1719,17 @@ SEND
 	; failure.  A caller that elects to
 	; retry the same application write will therefore fill the same
 	; TCP sequence hole rather than creating an unrecoverable new one.
+	IFNDEF UNET_DLL
 	CALL	.RESTORE_SEQ
+	ENDIF
 	LD	A,F_TIMEOUT
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .FATAL
 	; RST/cancel/ACK-transmit failures terminate the attempt.  Restore
 	; the unacknowledged sequence for a consistent local state.
+	IFNDEF UNET_DLL
 	CALL	.RESTORE_SEQ
+	ENDIF
 	SCF
 	RET
 .UNACKED_DATA
@@ -1748,9 +1744,7 @@ SEND
 	LD	(TCP_ACK_WAIT_STATE),A
 	CALL	.RESTORE_SEQ
 	LD	A,F_BAD_SEG
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 	ENDIF
 .RESTORE_SEQ
 	IFDEF UNET_DLL
@@ -1760,38 +1754,27 @@ SEND
 	LD	HL,TCP_SEND_SEQ
 .COPY_SEQ
 	LD	DE,TCP_SND_NXT
-	LD	BC,4
-	LDIR
-	RET
+	JP	COPY_SEQ32
 	ELSE
 	LD	HL,TCP_SEND_SEQ
 	LD	DE,TCP_SND_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	HL,TCP_SEND_SEQ
 	LD	DE,TCP_SND_UNA
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	RET
 	ENDIF
 .RESTORE_TARGET
 	LD	HL,TCP_ACK_WAIT_TARGET
 	LD	DE,TCP_SND_NXT
-	LD	BC,4
-	LDIR
-	RET
+	JP	COPY_SEQ32
 	ELSE
 	; Compact legacy path for size-constrained stand-alone clients.
 	; UNETRTL defines USE_TCP_RELIABLE_SEND and does not use this path.
 	CALL	BUILD_DATA
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	CALL	@RTL.SEND_FRAME
+	CALL	XMIT_TX_BUF
 	JR	NC,.BEST_EFFORT_OK
-	LD	A,F_SEND
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_SEND
 .BEST_EFFORT_OK
 	LD	BC,(.SAVE_LEN)
 	LD	DE,TCP_SND_NXT
@@ -1830,12 +1813,27 @@ SEND_RESUME
 ; ACK_TARGET_MATCH: ZF=1 when SND_UNA reached the target of
 ; the active SEND.  Preserves all registers and CF is irrelevant.
 ; ------------------------------------------------------
+	IFDEF UNET_DLL
+; ------------------------------------------------------
+; SND_UNA_IS_NXT: ZF=1 when nothing we transmitted is still
+; unacknowledged.  The standard TCP invariant, and CLOSE's test for
+; whether an orderly FIN is meaningful at all.  Same contract as
+; ACK_TARGET_MATCH below: all registers preserved, CF irrelevant.
+; ------------------------------------------------------
+SND_UNA_IS_NXT
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	LD	DE,TCP_SND_NXT
+	JR	ACK_TARGET_MATCH.CMP
+	ENDIF
 ACK_TARGET_MATCH
 	PUSH	BC
 	PUSH	DE
 	PUSH	HL
-	LD	HL,TCP_SND_UNA
 	LD	DE,TCP_ACK_WAIT_TARGET
+.CMP
+	LD	HL,TCP_SND_UNA
 	LD	B,4
 .LP
 	LD	A,(DE)
@@ -1878,8 +1876,7 @@ UPDATE_SEND_ACK
 	RET	M
 	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 8
 	LD	DE,TCP_SND_UNA
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	RET
 .ACK_DIFF
 	LD	B,4
@@ -1947,9 +1944,7 @@ RECV
 	JP	.LP
 .TIMED_OUT
 	LD	A,F_TIMEOUT
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .HAVE
 	LD	HL,@MAIN.RX_HDR
 	LD	DE,@MAIN.RX_BUF
@@ -1987,15 +1982,13 @@ RECV
 	SCF
 	RET
 .COMMIT_OTHER
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	IFDEF USE_ARP_ANSWER
 	CALL	@ARP.ANSWER_REQUEST	; see WAIT_SYN_ACK for rationale
 	ENDIF
 	JP	.TICK
 .COMMIT_PEER
-	LD	HL,@MAIN.RX_HDR
-	CALL	@RTL.COMMIT_PACKET
+	CALL	COMMIT_RX
 	JR	.PEER_SEG
 	ELSE
 	JR	C,.PEER_SEG
@@ -2019,9 +2012,7 @@ RECV
 	AND	TF_RST
 	JR	Z,.NO_RST
 	LD	A,F_RST
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .NO_RST
 	; Segment geometry first: the sequence classification below
 	; needs the payload length to recognise a retransmit that
@@ -2073,8 +2064,7 @@ RECV
 	JR	Z,.NO_ACK
 	LD	HL,@MAIN.RX_BUF + 14 + IP_HDR_LEN + 8	; ack BE
 	LD	DE,TCP_SND_UNA
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 .NO_ACK
 	ENDIF
 	; Publish the (possibly trimmed) payload.
@@ -2152,9 +2142,7 @@ RECV
 		; transmit failure preserve the complete debt byte so the DLL
 		; can retry its cumulative ACK on the next public RECV.
 		CALL	BUILD_ACK
-		LD	HL,@MAIN.TX_BUF
-		LD	BC,(TCP_TX_LEN)
-		CALL	@RTL.SEND_FRAME
+		CALL	XMIT_TX_BUF
 		JR	C,.ACK_SEND_FAIL
 		LD	A,(RECV_UNACKED)
 		AND	0x80
@@ -2166,10 +2154,7 @@ RECV
 		; into a flushable 0x81 instead of silently losing the retry.
 		LD	HL,RECV_UNACKED
 		INC	(HL)
-		LD	A,F_SEND
-		LD	(TCP_LAST_FAIL),A
-		SCF
-	RET
+		JP	FAIL_SEND
 .AOK
 	; Decide return.
 	;   FIN-with-or-without-data -> CF=1 (caller drains
@@ -2309,9 +2294,7 @@ RECV
 		; even inside a scoped drain.  Restore bit 7 afterwards so the
 		; public caller can flush the remaining cumulative debt at exit.
 		CALL	BUILD_ACK
-		LD	HL,@MAIN.TX_BUF
-		LD	BC,(TCP_TX_LEN)
-		CALL	@RTL.SEND_FRAME		; best-effort; the next copy re-triggers
+		CALL	XMIT_TX_BUF		; best-effort; the next copy re-triggers
 		JP	C,.TICK			; retain the complete scoped ACK debt
 		LD	A,(RECV_UNACKED)
 		AND	0x80
@@ -2325,9 +2308,7 @@ RECV
 	ENDIF
 .CANCEL
 	LD	A,F_CANCEL
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
+	JP	FAIL_A
 .FLAGS		DB 0
 .DATA_OFFSET	DB 0
 .SEG_PTR	DW 0		; payload ptr/length of the segment being
@@ -2369,33 +2350,178 @@ CLOSE
 	OR	A			; already closed
 	RET
 .NEED_CLOSE
+	IFDEF UNET_DLL
+	; Bytes we transmitted are still unacknowledged (SND_UNA !=
+	; SND_NXT): a SEND was cancelled, or gave up, while its segment was
+	; in flight, so whether the peer accepted it is unknowable from
+	; here.  RFC 1122 4.2.2.13 calls that an ABORT, not an orderly
+	; close, and FIN really is the wrong tool: sent at SND_UNA it is an
+	; old duplicate if the peer took the segment, sent at SND_NXT it is
+	; an out-of-order segment the peer queues without ever reaching
+	; end-of-stream if it did not.  Either way the peer keeps waiting
+	; for the rest of a request body that will never come, holding
+	; whatever resource that request locked.  RST is accepted at
+	; exactly one sequence number -- the peer's RCV_NXT -- and both
+	; candidates for it are known here, so send one at each.
+	CALL	SND_UNA_IS_NXT
+	JR	NZ,.ABORT
+	LD	A,TF_FIN | TF_ACK
+	ENDIF
 	; Send FIN+ACK.
 	CALL	BUILD_FIN
-	LD	HL,@MAIN.TX_BUF
-	LD	BC,(TCP_TX_LEN)
-	CALL	@RTL.SEND_FRAME
-	JR	NC,.FIN_OK
-	LD	A,F_SEND
-	LD	(TCP_LAST_FAIL),A
-	SCF
-	RET
-.FIN_OK
+	CALL	XMIT_TX_BUF
+	JR	C,.XMIT_FAIL
 	; Our FIN consumes 1 sequence number.
 	LD	DE,TCP_SND_NXT
 	CALL	INC_SEQ32
+	IFDEF UNET_DLL
+	; AWAIT_FIN_ACK owns the rest of the teardown: it waits for the
+	; peer to acknowledge this FIN, retransmits while it does not, and
+	; ends the session either way -- returning CF=1 when every attempt
+	; went unanswered, so CLOSE never reports a clean close on the
+	; strength of a FIN that merely reached the NIC.
+	;
+	; The old code went straight to CLOSED here, skipping any post-FIN
+	; wait, because the drain it replaced read and DISCARDED ring
+	; packets for ~3 s -- including packets belonging to the OTHER
+	; session (FTP's "226 Transfer complete" on the control connection
+	; arriving while the data connection was closing).  AWAIT_FIN_ACK
+	; waits through RECV instead, which hands foreign frames to
+	; HANDLE_FOREIGN_FRAME to be queued rather than dropped, so the
+	; wait is safe to have back.  Builds without the multichannel
+	; queues keep the one-shot teardown below.
 	LD	A,ST_LAST_ACK
 	LD	(TCP_STATE),A
-	; Skip the post-FIN drain.  We used to read+discard ring
-	; packets for ~3 sec to wait for the peer's final ACK, but
-	; that also discarded packets belonging to OTHER sessions
-	; (e.g. FTP's "226 Transfer complete" on the control conn
-	; arriving while we were closing the data conn).  The peer
-	; will retransmit if our FIN is in flight; not draining is
-	; fine for a one-shot teardown.
+	JP	AWAIT_FIN_ACK
+	ELSE
 	LD	A,ST_CLOSED
 	LD	(TCP_STATE),A
 	OR	A
 	RET
+	ENDIF
+.XMIT_FAIL
+	JP	FAIL_SEND
+	IFDEF UNET_DLL
+.ABORT
+	; RST at SND_NXT first: TCP_SND_NXT is the source BUILD_FIN reads,
+	; and the rewind below overwrites it with SND_UNA for the second.
+	; Both transmissions are accounted for.  Only one of the two
+	; sequence numbers is the peer's RCV_NXT, and which one it is is
+	; exactly what cannot be known here, so a RST that never left the
+	; NIC may well have been the one that would have been honoured --
+	; report it rather than let the survivor vouch for both.
+	CALL	.RST_AT_NXT
+	PUSH	AF			; first RST's CF
+	CALL	SEND.RESTORE_SEQ	; SND_NXT := SND_UNA
+	CALL	.RST_AT_NXT
+	LD	A,ST_CLOSED
+	LD	(TCP_STATE),A		; LD does not disturb CF
+	POP	BC			; C = flags pushed above
+	JR	C,.XMIT_FAIL
+	RR	C			; CF = the first RST's CF
+	RET	NC
+	JR	.XMIT_FAIL
+.RST_AT_NXT
+	LD	A,TF_RST | TF_ACK
+	CALL	BUILD_FIN
+	JP	XMIT_TX_BUF
+
+
+; ------------------------------------------------------
+; AWAIT_FIN_ACK (UNET_DLL): wait for the peer to acknowledge the FIN
+; CLOSE just sent, retransmitting it up to CLOSE_ATTEMPTS times.
+; RTL.SEND_FRAME only proves the NIC transmitted; a FIN lost on the
+; wire leaves the peer holding the connection open, so the one-shot
+; close used to report success while the server still waited for the
+; rest of a request body.
+;
+; The wait runs through RECV so a frame belonging to the OTHER channel
+; is queued by HANDLE_FOREIGN_FRAME instead of discarded.  On entry
+; SND_NXT is already past the FIN, so SND_UNA == SND_NXT is exactly
+; "our FIN was acknowledged" -- and SND_UNA is the FIN's own sequence
+; number until then, which is what a retransmit rebuilds from.
+;
+; The session ends here whatever happens -- there is no local state
+; left to retry from -- but the outcome is reported: CF=1 (LAST_FAIL =
+; F_TIMEOUT) means every attempt was met with silence, i.e. the peer
+; was never confirmed to have been told, and whatever the connection
+; was holding stays held until its own idle timeout.  An RST, a peer
+; FIN carrying the ACK, or the user cancelling all end the wait early
+; and count as an answer: the peer is demonstrably alive and has seen
+; our traffic.
+; ------------------------------------------------------
+AWAIT_FIN_ACK
+	; Arm the same cumulative-ACK wait SEND uses, so RECV returns the
+	; moment the ACK lands instead of sitting out the full timeout on
+	; every healthy close: the FIN's target is SND_NXT, already past it.
+	LD	HL,TCP_SND_NXT
+	LD	DE,TCP_ACK_WAIT_TARGET
+	CALL	COPY_SEQ32
+	LD	A,ACK_WAIT_ACTIVE
+	LD	(TCP_ACK_WAIT_STATE),A
+	LD	A,CLOSE_ATTEMPTS
+.ARM
+	LD	(.LEFT),A
+	LD	HL,CLOSE_ACK_TIMEOUT_MS
+	LD	(RECV_TIMEOUT),HL
+	CALL	RECV
+	CALL	ACK_TARGET_MATCH
+	JR	Z,.ANSWERED		; FIN acknowledged
+	LD	A,(TCP_LAST_FAIL)
+	CP	F_TIMEOUT
+	JR	Z,.SILENT
+	; The peer answered: an RST, a FIN of its own, or a segment whose
+	; ACK does not cover ours yet.  It is alive and has seen our
+	; traffic, so retransmitting into that is pointless.
+	;
+	; F_CANCEL and F_OTHER (5, 6) are the exceptions -- there the wait
+	; stopped for a LOCAL reason and the peer said nothing at all.
+	; F_CANCEL is the likely one: a consumer that armed CANCELKEYS and
+	; whose user just cancelled a transfer still has that keypress in
+	; the DSS buffer when it calls CLOSE, so the very first tick of
+	; the wait ends it.  Calling that a confirmed close would report
+	; success for a teardown the peer never saw, which is exactly the
+	; failure this routine exists to make visible.
+	CP	F_CANCEL
+	JR	C,.ANSWERED
+	CP	F_AGAIN
+	JR	C,.UNANSWERED
+.ANSWERED
+	OR	A
+	JR	.GONE
+.SILENT
+	LD	A,0
+.LEFT	EQU $-1
+	DEC	A
+	JR	NZ,.RETRANSMIT
+.UNANSWERED
+	SCF			; TCP_LAST_FAIL names which of the two it was
+.GONE
+	; End the session on both outcomes, preserving the verdict across
+	; the writes.  The ACK wait is disarmed here rather than in CLOSE
+	; so that every exit clears it exactly once.
+	PUSH	AF
+	XOR	A
+	LD	(TCP_ACK_WAIT_STATE),A
+	LD	A,ST_CLOSED
+	LD	(TCP_STATE),A
+	POP	AF
+	RET
+.RETRANSMIT
+	PUSH	AF
+	; SND_UNA still holds the FIN's own sequence number -- rebuild from
+	; it, then put SND_NXT back.  UPDATE_SEND_ACK discards any ACK
+	; NEWER than SND_NXT, so leaving SND_NXT rewound to the FIN makes
+	; the very acknowledgement this loop waits for unrecognisable.
+	CALL	SEND.RESTORE_SEQ
+	LD	A,TF_FIN | TF_ACK
+	CALL	BUILD_FIN
+	CALL	XMIT_TX_BUF
+	LD	DE,TCP_SND_NXT
+	CALL	INC_SEQ32
+	POP	AF
+	JR	.ARM
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -2424,11 +2550,9 @@ BUILD_DATA
 	LD	(DE),A
 	INC	DE
 	LD	HL,TCP_SND_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	HL,TCP_RCV_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	A,0x50			; data offset = 5 (20 bytes)
 	LD	(DE),A
 	INC	DE
@@ -2480,9 +2604,15 @@ BUILD_DATA
 
 
 ; ------------------------------------------------------
-; BUILD_FIN: TCP FIN+ACK segment (no payload).
+; BUILD_FIN: TCP FIN+ACK segment (no payload), built at TCP_SND_NXT.
+; UNET_DLL: A = the TCP flag byte, so the same builder emits CLOSE's
+; orderly FIN+ACK and its RST+ACK abort (the two differ in one bit and
+; nothing else).  Other builds always emit FIN+ACK and ignore A.
 ; ------------------------------------------------------
 BUILD_FIN
+	IFDEF	UNET_DLL
+	LD	(.FLAGS),A
+	ENDIF
 	LD	BC,20
 	CALL	BUILD_ETH_IP
 	IFDEF	UNET_DLL
@@ -2501,16 +2631,17 @@ BUILD_FIN
 	LD	(DE),A
 	INC	DE
 	LD	HL,TCP_SND_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	ENDIF
 	LD	HL,TCP_RCV_NXT
-	LD	BC,4
-	LDIR
+	CALL	COPY_SEQ32
 	LD	A,0x50
 	LD	(DE),A
 	INC	DE
 	LD	A,TF_FIN | TF_ACK
+	IFDEF	UNET_DLL
+.FLAGS	EQU $-1				; caller's flag byte, see header
+	ENDIF
 	LD	(DE),A
 	INC	DE
 	IFDEF UNET_DLL

@@ -203,6 +203,60 @@ does discard the queue.
 FIN left no reason at all, so the pair read `nerr=05 tcp=00` and no consumer
 could tell a refusal from a dead peer.
 
+## Closing a channel
+
+Since 0.3.10, `CLOSE` tells the peer the connection is over in a way it can
+actually act on, and reports whether it managed to.
+
+When the send stream is fully acknowledged, `CLOSE` sends `FIN+ACK` and waits
+for the peer to acknowledge it, retransmitting the FIN up to three times with
+a 500 ms wait each.  On a healthy link the acknowledgement arrives in about a
+millisecond and the close costs nothing measurable; a peer that has gone away
+caps the call at 1.5 s.  The wait runs through the normal receive path, so a
+segment for the OTHER channel arriving mid-close is queued, not discarded --
+the case that made the pre-0.3.8 blind drain unusable (FTP's `226 Transfer
+complete` on the control connection while the data connection was closing).
+
+When a `SEND` ended with bytes transmitted but unacknowledged -- it was
+cancelled, or it exhausted its retries -- whether the peer took those bytes is
+unknowable from this side, and a FIN is wrong either way: at the low sequence
+number it is an old duplicate the peer ignores, at the high one it is an
+out-of-order segment that never reaches end-of-stream.  Both leave the peer
+waiting for the rest of a request body that is never coming, holding whatever
+that request locked -- which is how a cancelled WebDAV `PUT` used to produce
+`HTTP 423 Locked` on the retry.  `CLOSE` therefore **aborts** such a
+connection per RFC 1122 4.2.2.13, sending `RST+ACK` at both candidate
+sequence numbers, since an RFC 5961 peer honours a reset only at exactly its
+`RCV.NXT`.
+
+`CLOSE` reports what the peer can be known to have learned:
+
+| Return | Meaning |
+| --- | --- |
+| `NERR_OK` | the peer acknowledged the FIN, answered it, or reset us |
+| `NERR_TIMEOUT` | the FIN went out (up to three times) and was met with silence |
+| `NERR_CANCEL` | the user ended the wait before any answer arrived |
+| `NERR_HW` | a FIN or RST never reached the wire at all |
+
+`NERR_CANCEL` is worth handling separately from `NERR_TIMEOUT` by a consumer
+that armed `UNET_OPT_CANCELKEYS`: the Esc that cancelled a transfer is still
+in the DSS keyboard buffer when the `CLOSE` that follows runs, so the first
+tick of the FIN wait consumes it and the close returns immediately.  Nothing
+was confirmed in that case either -- clear the key, or accept that the peer
+may not have been told.
+
+Both RST transmissions of an abort are accounted for, not just the last:
+only one of the two sequence numbers is the peer's `RCV.NXT`, and which one
+cannot be known here, so a reset that never left the NIC may well have been
+the one that would have been honoured.
+
+`NETDONE` reports the same, naming whichever channel failed.  The channel is
+released locally in every case -- there is no state left to retry from -- but
+a consumer that must know the peer was told can now see that it was not, and
+`LASTERR` carries the underlying TCP reason.  `CLOSE` stays idempotent, and a
+close against an unreachable peer costs the full 1.5 s before reporting
+`NERR_TIMEOUT`.
+
 Since 0.3.1, every received TCP payload is saved BEFORE advancing the receive
 sequence or sending its ACK. During public `RECV`, bytes go to the caller
 and then to its pending queue. During `SEND` or foreign-channel processing,

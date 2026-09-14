@@ -759,8 +759,13 @@ function diagLine(result) {
   // healthy poll must not freeze its own line (a first-byte "buffer is
   // non-empty" guard did exactly that), while a failure freezes the line
   // and a later successful call leaves it alone.
+  // The peer has to acknowledge the FIN: an unacknowledged close is itself a
+  // failure now, and this case needs the final CLOSE to succeed.
   const r = probe([init, lasterr(), connect(), lasterr(), { fn: 6, a: 1, de: 'PAYLOAD', ix: 7 },
-    lasterr(), close(0), lasterr()], dllScenario(), peer(() => {}));
+    lasterr(), close(0), lasterr()], dllScenario(),
+    peer(({ seg, t, emit }) => {
+      if (seg.flags & 1) { t.clientNext = (seg.seq + 1) >>> 0; emit({ flags: 16 }); }
+    }));
   assert.match(diagLine(r.results[1]), /st=NETINIT nerr=00/);
   assert.match(diagLine(r.results[3]), /st=CONNECT nerr=00/, 'a healthy LASTERR poll froze its own first line');
   assert.strictEqual(r.results[4].a, 11);       // NERR_STATE: channel 1 was never opened
@@ -844,6 +849,174 @@ for (const dllWindow of [1, 2]) { // SNC loads the DLL into WIN2.
     assert.strictEqual(r.results[5].a, 7);
     checkProbe(r);
   }
+}
+
+// ---------------------------------------------------------------------
+// Close semantics on the wire.  Reported from the field (SNC WebDAV PUT):
+// a cancelled PUT was followed by HTTP 423 on the retry because the server
+// never learned the first request was over and kept its writer lock.
+// ---------------------------------------------------------------------
+const tcpOf = r => r.transmittedFrames
+  .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+
+{ // A segment that was transmitted but never acknowledged leaves delivery
+  // ambiguous: the peer's RCV.NXT is either still the segment's sequence
+  // (it never arrived) or one segment past it (it did).  A FIN is wrong at
+  // both -- an old duplicate at the first, an out-of-order segment that
+  // never reaches end-of-stream at the second -- so the peer would go on
+  // waiting for the rest of a body that is never coming.  CLOSE must abort
+  // with RST, and cover both candidates, because only an exact RCV.NXT
+  // match resets an RFC 5961 peer.
+  const r = probe([init, connect(), send(), close(0)], dllScenario(),
+    peer(() => {}));                        // peer acknowledges nothing
+  const sent = tcpOf(r);
+  const data = sent.find(v => v.payload.length === 7);
+  assert.ok(data, 'the probe never transmitted its payload');
+  assert.strictEqual(r.results[2].a, 5, 'SEND should have reported NERR_SEND');
+  assert.ok(!sent.some(v => v.flags & 1), 'an ambiguous close sent a FIN');
+  const rsts = sent.filter(v => v.flags & 4);
+  assert.deepStrictEqual(rsts.map(v => v.seq).sort(),
+    [data.seq, (data.seq + 7) >>> 0].sort(),
+    'RST did not cover both candidates for the peer RCV.NXT');
+  assert.strictEqual(r.results[3].a, 0, 'an abort that reached the wire reported a failure');
+  checkProbe(r);
+}
+
+{ // Only one of the two sequences is the peer's RCV.NXT, and which one it is
+  // is exactly what cannot be known here -- so a RST that never left the NIC
+  // may well have been the one that would have been honoured.  The other must
+  // still be attempted, and must not vouch for it.
+  const txError = { attempts: [] };
+  let payloads = 0;
+  const r = probe([init, connect(), send(), close(0)], dllScenario({ txError }),
+    peer(({ card, seg }) => {
+      // Nothing is acknowledged, so the payload goes out SEND_ATTEMPTS times
+      // and the transmit right after the last one is the abort's first RST.
+      if (seg.payload.length && ++payloads === 4) txError.attempts.push(card.txAttempts + 1);
+    }));
+  const rsts = tcpOf(r).filter(v => v.flags & 4);
+  assert.strictEqual(rsts.length, 1, 'the second RST was not attempted after the first failed');
+  assert.strictEqual(r.results[3].a, 1,
+    'CLOSE hid a RST that never went out (NERR_HW expected)');
+  checkProbe(r);
+}
+
+{ // Everything acknowledged: an orderly FIN, at the sequence right after
+  // the acknowledged data, and exactly one of them.
+  let fins = 0;
+  const r = probe([init, connect(), send(), close(0)], dllScenario(),
+    peer(({ seg, t, emit }) => {
+      if (seg.payload.length) { emit({ flags: 16 }); return; }
+      if (seg.flags & 1) { fins += 1; t.clientNext = (seg.seq + 1) >>> 0; emit({ flags: 16 }); }
+    }));
+  const sent = tcpOf(r);
+  const data = sent.find(v => v.payload.length === 7);
+  const fin = sent.find(v => v.flags & 1);
+  assert.strictEqual(fins, 1, 'an acknowledged FIN was retransmitted anyway');
+  assert.strictEqual(fin.seq, (data.seq + 7) >>> 0, 'FIN sent at the wrong sequence');
+  assert.ok(!sent.some(v => v.flags & 4), 'an orderly close sent a RST');
+  checkProbe(r);
+}
+
+{ // RTL.SEND_FRAME only proves the NIC transmitted.  Swallow the ACK of the
+  // first FIN and the close must retransmit it rather than assume delivery.
+  let fins = 0;
+  const r = probe([init, connect(), send(), close(0)], dllScenario(),
+    peer(({ seg, t, emit }) => {
+      if (seg.payload.length) { emit({ flags: 16 }); return; }
+      if (seg.flags & 1) {
+        fins += 1;
+        t.clientNext = (seg.seq + 1) >>> 0;
+        if (fins > 1) emit({ flags: 16 });      // acknowledge only the retransmit
+      }
+    }));
+  assert.strictEqual(fins, 2, 'a lost FIN was never retransmitted');
+  const fin = tcpOf(r).filter(v => v.flags & 1);
+  assert.strictEqual(fin[0].seq, fin[1].seq, 'the retransmitted FIN changed sequence');
+  assert.strictEqual(r.results[3].a, 0, 'an acknowledged FIN was reported as a failed close');
+  checkProbe(r);
+}
+
+{ // Every attempt met with silence.  The channel goes away regardless -- there
+  // is nothing left to retry from locally -- but reporting success would tell
+  // the consumer the peer had been informed when it had not, which is the
+  // residual form of the reported failure: a server still holding its writer
+  // lock after the client believes it closed cleanly.
+  let fins = 0;
+  const r = probe([init, connect(), send(), close(0)], dllScenario(),
+    peer(({ seg, emit }) => {
+      if (seg.payload.length) { emit({ flags: 16 }); return; }
+      if (seg.flags & 1) fins += 1;             // seen, never acknowledged
+    }));
+  assert.strictEqual(r.results[2].a, 0, 'SEND should have succeeded');
+  assert.strictEqual(fins, 3, 'the FIN was not retransmitted for the full attempt budget');
+  assert.strictEqual(r.results[3].a, 12,
+    'an unacknowledged FIN was reported as a clean close (NERR_TIMEOUT expected)');
+  checkProbe(r);
+}
+
+{ // A close whose FIN never reached the wire must stay visible in the return
+  // status.  The channel is released either way -- there is nothing left to
+  // retry from locally -- but reporting success would tell the consumer the
+  // peer had been informed when it had not.
+  const txError = { attempts: [] };
+  let sent = false, armed = false;
+  const r = probe([init, connect(), send(), close(0)], dllScenario({ txError }),
+    peer(({ card, seg, emit }) => {
+      if (seg.payload.length) { sent = true; emit({ flags: 16 }); return; }
+      // Once the send is confirmed the client flushes its cumulative ACK;
+      // the FIN is the very next transmit, so arm the failure on that one.
+      // (The handshake ACK looks identical, hence the `sent` guard.)
+      if (sent && seg.flags === 0x10 && !armed) { armed = true; txError.attempts.push(card.txAttempts + 1); }
+    }));
+  assert.strictEqual(r.results[2].a, 0, 'SEND should have succeeded');
+  assert.strictEqual(r.results[3].a, 1, 'CLOSE reported success for a FIN that never went out');
+  checkProbe(r);
+}
+
+{ // Esc during the FIN wait is not an answer from the peer.  A consumer that
+  // armed CANCELKEYS and whose user just cancelled a transfer still has that
+  // keypress in the DSS buffer when it calls CLOSE, so the very first tick of
+  // the wait ends it -- and calling that a clean close would report success
+  // for a teardown the peer never saw.  CANCELKEYS is armed only after the
+  // SEND so the key cannot be eaten by an earlier wait loop.
+  let fins = 0;
+  const r = probe([init, connect(), send(), { fn: 17, a: 1, de: 1 }, close(0)],
+    dllScenario({ keys: ['escape'] }),
+    peer(({ seg, emit }) => {
+      if (seg.payload.length) { emit({ flags: 16 }); return; }
+      if (seg.flags & 1) fins += 1;             // seen, never acknowledged
+    }));
+  assert.strictEqual(r.results[4].a, 8,
+    'a cancelled FIN wait was reported as a clean close (NERR_CANCEL expected)');
+  assert.strictEqual(fins, 1, 'the cancelled wait retransmitted anyway');
+  checkProbe(r);
+}
+
+{ // Closing one channel must not cost the other one a reply that arrives
+  // while the close is waiting for its FIN ACK.  This is the regression the
+  // old blind post-FIN drain caused (FTP's "226 Transfer complete" on the
+  // control connection, discarded while the data connection was closing).
+  let second, injected = false;
+  const bytes = Buffer.from('226 Transfer complete.\r\n');
+  const r = probe([init, connect(), connect(1), send(), close(0), recv(1513, 1), close(1)],
+    dllScenario(), peer(({ seg, t, sessions, card, emit }) => {
+      second = Object.values(sessions).find(v => v.serverPort === 8081);
+      if (seg.payload.length) { emit({ flags: 16 }); return; }
+      if ((seg.flags & 1) && seg.dstPort === 8080) {
+        t.clientNext = (seg.seq + 1) >>> 0;
+        if (!injected) {                      // arrives DURING the FIN wait
+          injected = true;
+          card.schedule(1, buildTcpSegment(second,
+            { flags: 24, seq: second.serverSeq, ack: second.clientNext, payload: bytes }));
+        }
+        emit({ flags: 16 }, 3);               // ACK the FIN only after that
+      }
+    }));
+  assert.strictEqual(r.results[4].a, 0, 'CLOSE of channel 0 failed');
+  assert.deepStrictEqual(r.results[5].data, bytes,
+    'the other channel lost a segment that arrived during the close');
+  checkProbe(r);
 }
 
 console.log(`Actual DSS EXE DLL harness: ${caseCount()} UNETTEST checks passed`);

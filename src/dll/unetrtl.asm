@@ -451,9 +451,7 @@ F_NETINIT
 	CALL	CAPTURE_AND_CLOSE		; snapshot, then close the window
 	LD	A,1
 	LD	(INITED),A
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .hw_fail
 	CALL	CAPTURE_AND_CLOSE
 	JP	RET_HW
@@ -467,8 +465,7 @@ F_CLOSE
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
 	CALL	CLOSE_CHANNEL
-	XOR	A
-	RET
+	JP	RET_A
 F_NETDONE
 	CALL	CHECK_ASYNC_PEND
 	JP	C,RET_BUSY
@@ -478,8 +475,7 @@ F_NETDONE
 	LD	A,0xFF
 	LD	(LISTEN_CH),A
 	CALL	CLOSE_LINK
-	XOR	A
-	RET
+	JP	RET_A
 
 ; ------------------------------------------------------
 ; Function 5 - CONNECT (TCP).
@@ -538,9 +534,7 @@ F_CONNECT
 	CALL	CAPTURE_AND_CLOSE
 	LD	A,1
 	CALL	SET_CH_STATE			; 1 = TCP
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .fail
 	CALL	CAPTURE_AND_CLOSE
 	JP	MAP_TCP_FAIL
@@ -651,9 +645,7 @@ F_SEND
 .done
 	CALL	@ISA.ISA_CLOSE
 	LD	DE,(SEND_DONE)
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .fail
 	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_AGAIN
@@ -702,9 +694,7 @@ F_SEND
 	JR	C,.udp_fail
 	CALL	@ISA.ISA_CLOSE
 	LD	DE,(ARG_IX)
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .udp_fail
 	CALL	CAPTURE_AND_CLOSE
 	LD	DE,0
@@ -771,9 +761,7 @@ RECV_IMPL
 	CALL	COPY_PENDING_ARG
 	CALL	BUILD_RECV_FLAGS
 	LD	DE,(COPY_LEN)
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .not_suspended
 	LD	A,(ARG_CH)
 	CALL	SELECT_CHANNEL
@@ -964,9 +952,7 @@ RECV_IMPL
 .return_drain_ok
 	CALL	BUILD_RECV_FLAGS
 	LD	DE,(COPY_LEN)
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .drain_ack_failed
 	LD	DE,(COPY_LEN)
 	LD	A,D
@@ -1004,9 +990,7 @@ RECV_IMPL
 .listen_idle
 	LD	DE,0
 	CALL	BUILD_RECV_FLAGS
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .listen_fail
 	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_CANCEL
@@ -1059,9 +1043,7 @@ RECV_IMPL
 	POP	IX
 .udp_ok
 	LD	DE,(UDPLIB_RX_LEN)
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .udp_err
 	CALL	CAPTURE_AND_CLOSE
 	LD	IX,0
@@ -1081,10 +1063,7 @@ RECV_IMPL
 	LD	A,NERR_PROTO
 	JP	RET_A
 .udp_cancel
-	XOR	A
-	LD	(@MAIN.CANCELLED),A
-	LD	A,NERR_CANCEL
-	JP	RET_A
+	JP	RET_CANCEL
 
 ; ------------------------------------------------------
 ; Scoped receive ACK support.
@@ -1396,9 +1375,7 @@ F_UDPOPEN
 	CALL	@UDP.OPEN
 	LD	A,2
 	CALL	SET_CH_STATE			; 2 = UDP
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 
 ; ------------------------------------------------------
 ; Function 11 - RESOLVE.
@@ -1440,9 +1417,7 @@ F_RESOLVE
 	LD	HL,TARGET_IP
 	LD	DE,(ARG_IX)
 	CALL	@UTIL.FORMAT_IPV4
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .fail
 	CALL	CAPTURE_AND_CLOSE
 	JP	MAP_RESOLVE_FAIL
@@ -1493,9 +1468,7 @@ F_PING
 	PUSH	DE
 	CALL	CAPTURE_AND_CLOSE
 	POP	DE
-	XOR	A
-	LD	(LAST_NERR),A
-	RET
+	JP	RET_OK
 .fail
 	CALL	CAPTURE_AND_CLOSE
 	LD	DE,0
@@ -1510,10 +1483,7 @@ F_PING
 	LD	A,NERR_HW
 	JP	RET_A
 .cancel
-	XOR	A
-	LD	(@MAIN.CANCELLED),A
-	LD	A,NERR_CANCEL
-	JP	RET_A
+	JP	RET_CANCEL
 
 ; ------------------------------------------------------
 ; Functions 13 / 14 - RXPAUSE / RXRESUME.
@@ -1789,6 +1759,19 @@ RET_HW
 	JR	RET_A
 RET_BUSY
 	LD	A,NERR_BUSY
+	JR	RET_A
+; The success tail of eleven operations.  Image-budget helper; preserves
+; DE and IX, which several of them return values in.
+RET_OK
+	XOR	A
+	LD	(LAST_NERR),A
+	RET
+; The cancel tail of five operations: consume the latched cancel so the
+; NEXT call does not inherit it, then report it.  Image-budget helper.
+RET_CANCEL
+	XOR	A
+	LD	(@MAIN.CANCELLED),A
+	LD	A,NERR_CANCEL
 	JR	RET_A
 
 ; ======================================================
@@ -2265,7 +2248,15 @@ RELEASE_OR_REARM
 	JP	SET_CH_STATE
 
 ; Close one selected channel.  Idempotent; pending bytes are discarded.
+; Out: A = NERR_OK, or NERR_HW when the FIN/RST never reached the wire,
+; or NERR_TIMEOUT when the FIN went out but the peer never acknowledged
+; it.  The channel is released in every case -- there is no local state
+; left to retry from -- but the caller has to be able to SEE that the
+; peer was not told, because a peer that never got the close keeps
+; whatever the connection was holding until its own idle timeout.
 CLOSE_CHANNEL
+	XOR	A
+	LD	(.err),A
 	CALL	GET_CH_STATE
 	AND	A
 	JR	Z,.clear
@@ -2278,6 +2269,29 @@ CLOSE_CHANNEL
 	JR	Z,.udp
 	CALL	@ISA.ISA_OPEN
 	CALL	@TCP.CLOSE
+	; The three ways a close fails call for three different answers:
+	; F_SEND is the NIC refusing to transmit (hardware), F_CANCEL is
+	; the user ending the FIN wait early, and F_TIMEOUT is a FIN that
+	; went out and drew no answer.  The last two both mean "the peer
+	; was not confirmed to have been told", but saying which is which
+	; matters: a cancel is instant and self-inflicted, a timeout cost
+	; 1.5 s and points at the link.  Latch the verdict into C first --
+	; the CP below needs the flags.
+	SBC	A,A				; CF -> 0xFF, else 0x00
+	LD	C,A
+	LD	A,(TCP_LAST_FAIL)
+	LD	B,A
+	CP	@TCP.F_CANCEL
+	LD	A,NERR_CANCEL
+	JR	Z,.status
+	LD	A,B
+	DEC	A				; F_SEND -> 0
+	LD	A,NERR_HW
+	JR	Z,.status
+	LD	A,NERR_TIMEOUT
+.status
+	AND	C				; a clean close masks the code away
+	LD	(.err),A
 	CALL	@ISA.ISA_CLOSE
 	JR	.clear
 .udp
@@ -2286,6 +2300,8 @@ CLOSE_CHANNEL
 	CALL	RELEASE_OR_REARM
 	LD	A,(ARG_CH)
 	CALL	PEND_CLEAR_A
+	LD	A,0
+.err	EQU $-1
 	RET
 
 ; Close every channel; leave the NIC initialised.
@@ -2295,11 +2311,23 @@ CLOSE_LINK
 	XOR	A
 	LD	(ARG_CH),A
 	CALL	CLOSE_CHANNEL
+	; On the stack, not in a register: closing the second channel runs
+	; the whole TCP engine, and every level of it uses BC.
+	PUSH	AF				; first channel's status
 	LD	A,1
 	LD	(ARG_CH),A
 	CALL	CLOSE_CHANNEL
+	POP	BC				; B = first channel's status
+	; Report whichever channel failed.  These are codes, not bit
+	; flags: OR-ing NERR_HW with NERR_TIMEOUT would invent NERR_BUSY.
+	OR	A
+	JR	NZ,.status
+	LD	A,B
+.status
+	LD	C,A
 	POP	AF
 	LD	(ARG_CH),A
+	LD	A,C
 	RET
 
 ; ------------------------------------------------------
@@ -2423,10 +2451,7 @@ MAP_RESOLVE_FAIL
 	LD	A,NERR_TIMEOUT
 	JP	RET_A
 .cancel
-	XOR	A
-	LD	(@MAIN.CANCELLED),A
-	LD	A,NERR_CANCEL
-	JP	RET_A
+	JP	RET_CANCEL
 
 ; ------------------------------------------------------
 ; MAP_TCP_FAIL: TCP.LAST_FAIL -> NERR_*.
@@ -2446,10 +2471,7 @@ MAP_TCP_FAIL
 	LD	A,NERR_HW
 	JP	RET_A
 .cancel
-	XOR	A
-	LD	(@MAIN.CANCELLED),A
-	LD	A,NERR_CANCEL
-	JP	RET_A
+	JP	RET_CANCEL
 
 ; ------------------------------------------------------
 ; MAP_TCP_SEND_FAIL: SEND has one additional failure class:
@@ -2491,10 +2513,7 @@ MAP_TCP_SEND_FAIL
 	LD	A,NERR_HW
 	JP	RET_A
 .cancel
-	XOR	A
-	LD	(@MAIN.CANCELLED),A
-	LD	A,NERR_CANCEL
-	JP	RET_A
+	JP	RET_CANCEL
 
 ; ------------------------------------------------------
 ; CAPTURE_DIAG: snapshot TX stage/ISR/NCR/TPSR state for LASTERR.
