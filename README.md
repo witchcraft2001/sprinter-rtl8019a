@@ -9,6 +9,17 @@ live in `sprinter_rtl8019_soft.md` (project specification). Repository
 guidelines and conventions are in `AGENTS.md` / `CLAUDE.md`. Developer
 notes for MAME network setup are in `docs/MAME_NETWORK.md`.
 
+## Attribution
+
+Sprinter RTL8019AS Network Kit project author:
+
+- Dmitry Mikhalchenkov, FidoNet: 2:5030/1997.10
+
+The driver, stack, utilities and DLL in this repository are original
+work.  The only imported component is the Z80 interpreter used by the
+host-side test harness, which never ships to end users; see
+`THIRD_PARTY.md`.
+
 ## Status
 
 The release archive contains the supported end-user utilities:

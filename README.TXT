@@ -161,3 +161,10 @@ Common ERRORLEVEL values:
 
 For full syntax and utility-specific status codes, read HOWTO.TXT and the
 matching <NAME>.TXT file.
+
+
+AUTHOR
+------
+
+  Package author: Dmitry Mikhalchenkov.
+  FidoNet: 2:5030/1997.10

@@ -51,3 +51,8 @@ is blocking, `25` uses SENDSLICE. Exit 0 requires exact content, CRC32 and
 EOF without LOST; exit 3 reports transport/content failure, 1 usage,
 2 DLL/load/hardware failure, 4 missing network configuration.
 See UNETRTL.TXT for the response format and host helper.
+
+## Author
+
+Sprinter RTL8019AS Network Kit -- Dmitry Mikhalchenkov,
+FidoNet: 2:5030/1997.10
