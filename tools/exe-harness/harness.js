@@ -339,6 +339,24 @@ function runExe(exePath, args = '', inputScenario = {}) {
   // "syscalls per main-loop pass", the cheapest honest measure of how much
   // work an interactive program repeats every iteration.
   const dssCalls = {};
+  // Wire time that passes while the CPU is busy inside a slow DSS service.
+  // Without this the model is unphysical: a DSS_WRITE of 8 KB to disk costs
+  // the real machine tens of milliseconds, during which the NIC keeps
+  // storing arriving frames into its own SRAM (the ISA window being closed
+  // is irrelevant -- reception is independent of CPU mapping). Modelling
+  // those calls as instantaneous meant the RX ring could never fill while
+  // the program was away, so the exact condition that stalls a bulk
+  // download on real hardware and in MAME -- peer streams into the
+  // advertised window while we are writing a flush buffer to disk -- was
+  // unreachable from the harness. scenario.diskWriteMs / consoleMs give
+  // those services a cost in wire time.
+  const advanceWireMs = (ms) => {
+    for (let i = 0; i < ms; i++) {
+      logicalMs++;
+      card.currentMs = logicalMs;
+      card.pumpScheduled();
+    }
+  };
   const dss = () => {
     if (isaOpen) {
       const s0 = cpu.getState();
@@ -411,6 +429,8 @@ function runExe(exePath, args = '', inputScenario = {}) {
         for (let i = 0; i < requested; i++) data[file.offset + i] = rd(source + i);
         file.data = data; file.offset = end; files.set(file.name, data); totalWritten += requested;
         if (scenario.traceDss) dssEvents.push(`WRITE ${file.name} ${requested}`);
+        // The disk write costs wire time: frames keep arriving meanwhile.
+        if (scenario.diskWriteMs) advanceWireMs(scenario.diskWriteMs);
         setCarry(s, false); return ret(s);
       }
       case 0x15: { // MOVE_FP: A=handle B=whence(0/1/2) HL:IX=offset(32-bit) -> HL:IX=pos

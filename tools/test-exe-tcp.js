@@ -164,7 +164,7 @@ for (const app of ['DLDIRECT', 'DLDIRCP']) {
       .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
     const syn = sent.find(v => v.flags === 2);
     assert.strictEqual(syn?.mss, 1460, `${app} did not advertise receive MSS 1460`);
-    assert.strictEqual(syn?.window, 4380, `${app} did not advertise the three-MSS receive window`);
+    assert.strictEqual(syn?.window, 2920, `${app} did not advertise the two-MSS receive window`);
     const received = r.generatedFrames
       .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
     assert.ok(received.some(v => v.payload.length === 1460),

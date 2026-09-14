@@ -385,8 +385,8 @@ function respondTftp(datagram, card, tftp) {
 // TCP (src/lib/tcp_lib.asm client, single session). Server-side state is
 // kept per client-port session on responders.tcp._sessions. Every client
 // build sends its configured receive MSS in the SYN, TTL=64, and no DF.
-// Direct clients use MSS=1460/window=4380; multichannel UNETRTL uses
-// MSS=536 and computes its window from transient caller plus durable storage.
+// Direct clients use MSS=1460/window=2920 (two segments); multichannel UNETRTL
+// uses MSS=536 and computes its window from transient caller plus durable storage.
 // ---------------------------------------------------------------------
 const TF_FIN = 0x01, TF_SYN = 0x02, TF_RST = 0x04, TF_PSH = 0x08, TF_ACK = 0x10;
 
@@ -520,6 +520,238 @@ function tcpReliableNext(session, card, tcp, seg) {
   session.responseStarted = true;
 }
 
+// streamAhead: a peer that behaves like a real bulk server (pyftpdlib, an
+// HTTP server) instead of the lock-step responders above. It keeps the
+// client's advertised window full -- on every ACK it emits as many MSS
+// segments as the window still admits, without waiting for each one to be
+// acknowledged. This is the only shape that can actually fill the NIC's
+// 26-page RX ring, which is what happens in the field whenever the client
+// stops draining for a while (a flush of the download buffer to disk).
+// Retransmission: segments the client never acknowledges are resent once
+// the RTO elapses with no forward progress, exactly as a real sender does.
+function tcpStreamAhead(session, card, tcp, seg) {
+  const total = session.responseBytes.length;
+  const mss = tcp.mss ?? session.clientMss ?? 536;
+  const window = tcp.ignoreWindow ? Infinity : (seg.window || 0);
+  if (session.sentOffset === undefined) { session.sentOffset = 0; session.ackedOffset = 0; }
+  const acked = (seg.ack - session.responseSeq) >>> 0;
+  if (acked <= total && acked > session.ackedOffset) {
+    session.ackedOffset = acked;
+    session.lastProgressMs = card.currentMs;
+    // Forward progress: anything still unacknowledged is in flight, not lost.
+    session.rtoPending = false;
+  }
+  if (session.ackedOffset >= total) {
+    if (!session.finSent) {
+      session.finSent = true;
+      const fin = buildTcpSegment(session, { flags: TF_FIN | TF_ACK, seq: (session.responseSeq + total) >>> 0, ack: session.clientNext });
+      card.generated.push(fin);
+      card.schedule(tcp.afterMs ?? 1, fin);
+    }
+    return;
+  }
+  // Fast retransmit: duplicate ACKs that do not advance mean the client is
+  // missing the segment at ackedOffset. Rewind and resend from there.
+  if (session.sentOffset > session.ackedOffset && seg.ack === session.lastAck) {
+    session.dupAcks = (session.dupAcks || 0) + 1;
+    if (session.dupAcks >= (tcp.dupAckRetransmit ?? 2)) { session.sentOffset = session.ackedOffset; session.dupAcks = 0; }
+  } else session.dupAcks = 0;
+  session.lastAck = seg.ack;
+  streamEmit(session, card, tcp, mss, window, total);
+}
+
+// Emit as many segments as the window admits, strictly in order: every
+// segment is scheduled after the previously scheduled one (session.nextMs),
+// so overlapping bursts triggered by successive ACKs can never deliver the
+// stream out of order -- a switched Ethernet path does not reorder one
+// sender's stream, and pretending otherwise tests a case that cannot happen.
+function streamEmit(session, card, tcp, mss, window, total) {
+  let emitted = 0;
+  const gap = tcp.segmentGapMs ?? 1;
+  while (session.sentOffset < total &&
+         (session.sentOffset - session.ackedOffset) + mss <= window &&
+         emitted < (tcp.maxBurst ?? 8)) {
+    const size = Math.min(mss, total - session.sentOffset);
+    const payload = Array.from(session.responseBytes.subarray(session.sentOffset, session.sentOffset + size));
+    const segOut = buildTcpSegment(session, {
+      flags: TF_PSH | TF_ACK, seq: (session.responseSeq + session.sentOffset) >>> 0,
+      ack: session.clientNext, payload,
+    });
+    session.sentOffset += size;
+    session.nextMs = Math.max((session.nextMs ?? 0), card.currentMs + (tcp.afterMs ?? 1)) + (emitted ? gap : 0);
+    card.generated.push(segOut);
+    card.schedule(session.nextMs - card.currentMs, segOut);
+    emitted++;
+  }
+  armRto(session, card, tcp, mss, window, total);
+}
+
+// Retransmission timeout: a real sender resends its oldest unacknowledged
+// segment when the RTO expires without forward progress, needing nothing
+// from the receiver. This is what rescues a transfer whenever the client
+// legitimately drops a segment (no room in the RX ring, an out-of-order
+// arrival it cannot buffer), so a model without it reports a permanent
+// deadlock where real hardware recovers a moment later.
+// Like a real sender (RFC 6298 / Linux), the timer backs off exponentially
+// while consecutive retransmissions go unacknowledged and resets as soon as
+// any progress is made; only a long run of CONSECUTIVE losses -- not a count
+// over the whole transfer -- makes the peer give up. A cap on the total used
+// to sit here and made the model peer fall silent part-way through any run
+// with more than 20 recoveries, which no server does.
+function armRto(session, card, tcp, mss, window, total) {
+  if (session.rtoArmed) return;
+  if (session.sentOffset <= session.ackedOffset) return;
+  session.rtoArmed = true;
+  const base = tcp.rtoMs ?? 200;
+  const atOffset = session.ackedOffset;
+  const backoff = session.backoff || 0;
+  const rto = Math.min(base * (1 << backoff), tcp.rtoMaxMs ?? 60000);
+  card.scheduleCallback(rto, () => {
+    session.rtoArmed = false;
+    if (session.ackedOffset > atOffset) { session.backoff = 0; armRto(session, card, tcp, mss, window, total); return; }
+    if (session.ackedOffset >= total) return;
+    session.retransmits = (session.retransmits || 0) + 1;
+    session.backoff = backoff + 1;
+    if (session.backoff > (tcp.maxRetransmits ?? 15)) return;
+    session.sentOffset = session.ackedOffset;   // go back to the last acked byte
+    session.nextMs = card.currentMs;
+    // RTO collapses the congestion window to one segment: only the oldest
+    // unacknowledged segment is resent, and the window refills once it is
+    // acknowledged. Re-emitting the whole window here doubled the ring
+    // pressure of every timeout, which real senders never do.
+    streamEmit(session, card, { ...tcp, maxBurst: 1 }, mss, window, total);
+  });
+}
+
+// ---------------------------------------------------------------------
+// FTP server: a passive-mode peer with TWO concurrent TCP sessions, which
+// is the shape no other responder here produces. FTP.EXE multiplexes a
+// control and a data connection through ONE set of TCP state variables
+// (SAVE_CTX/RESTORE_CTX), and while it is draining the data session every
+// control-session frame that arrives is filtered out and dropped. Nothing
+// else in the kit exercises that, so the whole class of two-session
+// interference bugs was invisible to the test suite.
+//
+// Control port 21 speaks the minimal dialogue FTP.EXE drives: greeting,
+// USER/PASS, TYPE, SIZE, PASV, RETR, QUIT. The data connection streams the
+// file with the same window-filling sender and RTO timer as streamAhead.
+// ---------------------------------------------------------------------
+function ftpReply(session, card, ftp, text) {
+  const bytes = Buffer.from(text + '\r\n', 'latin1');
+  const seg = buildTcpSegment(session, {
+    flags: TF_PSH | TF_ACK, seq: session.serverSeq, ack: session.clientNext,
+    payload: Array.from(bytes),
+  });
+  session.serverSeq = (session.serverSeq + bytes.length) >>> 0;
+  card.generated.push(seg);
+  card.schedule(ftp.afterMs ?? 1, seg);
+}
+
+function ftpStartData(card, ftp) {
+  const session = ftp._dataSession;
+  if (!session || !ftp._retrIssued || session.streaming) return;
+  session.streaming = true;
+  session.responseBytes = ftp._fileBytes;
+  session.responseSeq = session.serverSeq;
+  session.sentOffset = 0;
+  session.ackedOffset = 0;
+  streamEmit(session, card, ftp, ftp.mss ?? session.clientMss ?? 1460,
+    ftp.ignoreWindow ? Infinity : (session.lastWindow || 2920), session.responseBytes.length);
+}
+
+function respondFtp(frame, card, ftp) {
+  const seg = parseTcpSegment(frame);
+  if (!seg) return;
+  ftp._sessions = ftp._sessions || {};
+  ftp._fileBytes = ftp._fileBytes ||
+    (Buffer.isBuffer(ftp.file) ? ftp.file : Buffer.from(ftp.file ?? '', 'latin1'));
+  ftp._pasvPort = ftp._pasvPort ?? (ftp.pasvPort ?? 55797);
+  const isControl = seg.dstPort === (ftp.port ?? 21);
+  let session = ftp._sessions[seg.srcPort];
+
+  if (seg.flags === TF_SYN) {
+    const isn = (ftp.isn ?? 0x20000000) + (isControl ? 0 : 0x1000);
+    session = ftp._sessions[seg.srcPort] = {
+      clientMac: seg.sourceMac, clientIp: seg.sourceIp, clientPort: seg.srcPort,
+      serverMac: ftp.mac || DEFAULT_SERVER_MAC, serverIp: seg.destIp, serverPort: seg.dstPort,
+      serverSeq: isn, clientNext: (seg.seq + 1) >>> 0, clientMss: seg.mss,
+      control: isControl, state: 'syn-rcvd',
+    };
+    const synAck = buildTcpSegment(session, { flags: TF_SYN | TF_ACK, seq: isn, ack: session.clientNext, mss: ftp.mss ?? 1460 });
+    card.generated.push(synAck);
+    card.schedule(ftp.afterMs ?? 1, synAck);
+    return;
+  }
+  if (!session) return;
+  if (seg.flags & TF_RST) { session.state = 'closed'; return; }
+  session.lastWindow = seg.window;
+
+  if (session.state === 'syn-rcvd' && (seg.flags & TF_ACK) && !seg.payload.length) {
+    session.state = 'established';
+    session.serverSeq = (session.serverSeq + 1) >>> 0;
+    if (session.control) ftpReply(session, card, ftp, ftp.greeting ?? '220 harness FTP server ready.');
+    else { ftp._dataSession = session; ftpStartData(card, ftp); }
+    return;
+  }
+
+  if (!session.control) {
+    // Data connection: pure streaming, plus the 226 once the client has
+    // acknowledged everything (the server closes the data connection first).
+    if (session.streaming && !(seg.flags & TF_FIN)) {
+      tcpStreamAhead(session, card, ftp, seg);
+      if (session.finSent && !ftp._sent226 && session.ackedOffset >= session.responseBytes.length) {
+        ftp._sent226 = true;
+        const ctrl = Object.values(ftp._sessions).find((s) => s.control);
+        if (ctrl) ftpReply(ctrl, card, ftp, '226 Transfer complete.');
+      }
+    }
+    return;
+  }
+
+  // Control connection: parse whole command lines.
+  if (seg.payload.length) {
+    if (seg.seq === session.clientNext) {
+      session.clientNext = (seg.seq + seg.payload.length) >>> 0;
+      session.request = Buffer.concat([session.request || Buffer.alloc(0), Buffer.from(seg.payload)]);
+    }
+    const ack = buildTcpSegment(session, { flags: TF_ACK, seq: session.serverSeq, ack: session.clientNext });
+    card.generated.push(ack);
+    card.schedule(ftp.dataAckDelayMs ?? 1, ack);
+
+    let text = (session.request || Buffer.alloc(0)).toString('latin1');
+    while (text.includes('\r\n')) {
+      const line = text.slice(0, text.indexOf('\r\n'));
+      text = text.slice(text.indexOf('\r\n') + 2);
+      const verb = line.split(' ')[0].toUpperCase();
+      ftp.commands = ftp.commands || [];
+      ftp.commands.push(line);
+      if (verb === 'USER') ftpReply(session, card, ftp, '331 Guest login ok, send your email address as password.');
+      else if (verb === 'PASS') ftpReply(session, card, ftp, '230 Guest login ok, access restrictions apply.');
+      else if (verb === 'TYPE') ftpReply(session, card, ftp, '200 Type set to I.');
+      else if (verb === 'SIZE') ftpReply(session, card, ftp, `213 ${ftp._fileBytes.length}`);
+      else if (verb === 'PASV') {
+        const p = ftp._pasvPort, ip = session.serverIp;
+        ftpReply(session, card, ftp, `227 Entering Passive Mode (${ip[0]},${ip[1]},${ip[2]},${ip[3]},${p >> 8},${p & 255})`);
+      } else if (verb === 'RETR') {
+        ftpReply(session, card, ftp, `150 Opening BINARY mode data connection for '${line.slice(5)}' (${ftp._fileBytes.length} bytes).`);
+        ftp._retrIssued = true;
+        ftpStartData(card, ftp);
+      } else if (verb === 'LIST' || verb === 'NLST') {
+        // A listing is streamed over the same data connection; the client
+        // prints it straight to the console instead of writing a file.
+        ftp._fileBytes = Buffer.from(ftp.listing ??
+          '-rw-r--r--   1 root  wheel     2048 May  6 15:28 2k.bin\r\n' +
+          '-rw-r--r--   1 root  wheel   389579 May  6 15:28 im2.txt\r\n', 'latin1');
+        ftpReply(session, card, ftp, '150 Opening ASCII mode data connection for file list.');
+        ftp._retrIssued = true;
+        ftpStartData(card, ftp);
+      } else if (verb === 'QUIT') ftpReply(session, card, ftp, '221 Goodbye.');
+      else ftpReply(session, card, ftp, '200 ok.');
+    }
+    session.request = Buffer.from(text, 'latin1');
+  }
+}
+
 function respondTcp(frame, card, tcp) {
   const seg = parseTcpSegment(frame);
   if (!seg) return;
@@ -577,6 +809,24 @@ function respondTcp(frame, card, tcp) {
       card.generated.push(seg2);
       card.schedule((tcp.greetingMs ?? 1) * (index + 1), seg2);
     });
+    return;
+  }
+
+  if (tcp.streamAhead) {
+    if (seg.payload.length) {
+      if (seg.seq === session.clientNext) {
+        session.clientNext = (seg.seq + seg.payload.length) >>> 0;
+        session.request = Buffer.concat([session.request || Buffer.alloc(0), Buffer.from(seg.payload)]);
+      }
+      if (!session.responseBytes && session.request?.includes('\r\n\r\n')) {
+        session.responseBytes = buildHttpResponse(tcp);
+        session.responseSeq = session.serverSeq;
+      }
+      const ack = buildTcpSegment(session, { flags: TF_ACK, seq: session.serverSeq, ack: session.clientNext });
+      card.generated.push(ack);
+      card.schedule(tcp.dataAckDelayMs ?? 1, ack);
+    }
+    if (session.responseBytes && !(seg.flags & TF_FIN)) tcpStreamAhead(session, card, tcp, seg);
     return;
   }
 
@@ -646,6 +896,11 @@ function respond(frame, card, scenario) {
   // made it impossible to combine `tcp` with `dns` (or any other UDP
   // responder) in one scenario -- and WGET resolving a hostname before
   // opening its HTTP session needs exactly that combination.
+  if (responders.ftp && parseTcpSegment(frame)) {
+    respondFtp(frame, card, responders.ftp);
+    return;
+  }
+
   if (responders.tcp && parseTcpSegment(frame)) {
     respondTcp(frame, card, responders.tcp);
     return;
@@ -720,7 +975,7 @@ module.exports = {
   parseDnsQuery, buildDnsResponse,
   buildNtpResponse,
   respondTftp,
-  parseTcpSegment, buildTcpSegment, buildHttpResponse, respondTcp,
+  parseTcpSegment, buildTcpSegment, buildHttpResponse, respondTcp, respondFtp,
   respond,
   DEFAULT_SERVER_MAC, BROADCAST_MAC,
 };

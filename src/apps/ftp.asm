@@ -519,6 +519,9 @@ START
 	CALL	PARSE_PASV
 	JP	C,PASV_FAIL
 
+	; Console output: the window is still open from READ_REPLY's
+	; poll tick, and DSS must never be called through it.
+	CALL	@ISA.ISA_CLOSE
 	PRINT MSG_PASV_HDR
 	LD	HL,PASV_IP
 	CALL	PRINT_IPV4
@@ -530,6 +533,7 @@ START
 	LD	L,A
 	CALL	PRINT_DEC_HL
 	PRINT LINE_END
+	CALL	@ISA.ISA_OPEN
 
 	; --- Open the local file ---
 	;   GET  -> output, with overwrite prompt (file_lib).
@@ -738,7 +742,12 @@ START
 	CALL	@TCP.RESTORE_CTX
 
 	; --- Data-channel transfer ---
+	; TPUT_START reads the clock through DSS_SYSTIME, so the ISA
+	; window (still open from the 150 reply's READ_REPLY) has to be
+	; closed around it like any other DSS call.
+	CALL	@ISA.ISA_CLOSE
 	CALL	@UTIL.TPUT_START
+	CALL	@ISA.ISA_OPEN
 	LD	HL,0
 	LD	(FTP_DATA_LEN),HL
 	LD	(BODY_TOTAL_LO),HL
@@ -805,8 +814,11 @@ START
 
 	; Terminate the "X / Y" progress line (it ends with CR
 	; only) so the server's "226 Transfer complete" banner
-	; lands on a fresh line.
+	; lands on a fresh line.  Console output needs the ISA
+	; window shut; TCP.CLOSE above left it open.
+	CALL	@ISA.ISA_CLOSE
 	PRINT LINE_END
+	CALL	@ISA.ISA_OPEN
 
 	; Restore control session.
 	LD	HL,CTRL_BACKUP
@@ -835,6 +847,10 @@ START
 	LD	A,(LIST_MODE)
 	OR	A
 	JR	NZ,.SKIP_SUMMARY
+	; The summary is pure console work (TPUT_REPORT also reads the
+	; clock through DSS_SYSTIME): shut the ISA window for it and
+	; reopen for the QUIT exchange below, which needs the chip.
+	CALL	@ISA.ISA_CLOSE
 	PRINT MSG_DONE_PRE
 	LD	HL,(BODY_TOTAL_LO)
 	LD	DE,(BODY_TOTAL_HI)
@@ -850,6 +866,7 @@ START
 	LD	HL,(BODY_TOTAL_LO)
 	LD	DE,(BODY_TOTAL_HI)
 	CALL	@UTIL.TPUT_REPORT
+	CALL	@ISA.ISA_OPEN
 .SKIP_SUMMARY
 
 	; QUIT
@@ -1168,8 +1185,22 @@ APPEND_TO_ACCUM
 
 ; ------------------------------------------------------
 ; PRINT_REPLY: print "ddd text" to console.
+;
+; The ISA window is OPEN on entry: every call site reaches
+; here straight out of READ_REPLY, and RECV's poll tick
+; reopens the window before it returns.  Console output must
+; therefore close it first.  Printing with the window mapped
+; is the forbidden pattern in CLAUDE.md: DSS_PCHARS scrolls
+; through BIOS WIN_MOVE, which remaps pages and restores
+; SLOT1 by POPping -- over the ISA card instead of system
+; RAM while the window is open.  That corrupts chip state
+; and system memory, and the damage surfaces later as a
+; wedged transfer rather than at the print itself.
+; Restores the open window on exit, so callers keep the
+; state they had.
 ; ------------------------------------------------------
 PRINT_REPLY
+	CALL	@ISA.ISA_CLOSE
 	LD	HL,REPLY_CODE
 	LD	B,3
 .LP
@@ -1185,7 +1216,7 @@ PRINT_REPLY
 	LD	C,DSS_PCHARS
 	RST	DSS
 	PRINT LINE_END
-	RET
+	JP	@ISA.ISA_OPEN
 
 
 ; ------------------------------------------------------

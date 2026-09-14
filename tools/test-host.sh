@@ -29,6 +29,7 @@ node --check "$script_dir/exe-harness/test-util.js"
 node --check "$script_dir/test-exe-harness.js"
 node --check "$script_dir/test-exe-net.js"
 node --check "$script_dir/test-exe-tcp.js"
+node --check "$script_dir/test-exe-ftp.js"
 node --check "$script_dir/test-exe-dll.js"
 
 # Every dev script, not a hand-kept subset: the responders are edited as
@@ -64,6 +65,7 @@ fi
 node "$script_dir/test-exe-harness.js"
 node "$script_dir/test-exe-net.js"
 node "$script_dir/test-exe-tcp.js"
+node "$script_dir/test-exe-ftp.js"
 node "$script_dir/test-exe-dll.js"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$script_dir/dev" \
   python3 "$script_dir/dev/test_unettest_tcp_probe.py"

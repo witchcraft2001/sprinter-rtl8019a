@@ -99,25 +99,65 @@ ACK_WAIT_RX_PENDING	EQU 2
 ; one durable 536-byte pending slot. Keeping its MSS equal to that slot makes
 ; 2048/2144-byte consumers expose four whole segments per active call and
 ; avoids the zero-window stop/start regression seen with MSS 1460.
+; Receive geometry. Direct clients use MSS 1460 with a two-segment
+; 2920-byte window; UNETRTL keeps 536 for its transient buffers.
+;
+; USE_TCP_RX_SMALL drops a direct client to MSS 536 / window 2680 / ACK
+; every fourth segment. It exists for ONE reason: a host that loses frames
+; ahead of the card. Measured on the MAME stand (2026-09-13, 380 KB FTP
+; GET over a feth pair), MSS 1460 lost a segment out of every burst, each
+; loss cost a full server RTO because this stack keeps no out-of-order
+; queue, the backoff grew 0.14 -> 26 s and the transfer died on the
+; receive timeout -- while `ovw` stayed 0, i.e. the frames never reached
+; the card's ring at all. The same transfer at MSS 536 ran clean.
+;
+; That is NOT a protocol-level limit, and the default must not be lowered
+; for it: driven straight into the emulated card (tools/test-exe-ftp.js,
+; disk writes costed at 0/30/100/200/400 ms) MSS 1460 completes the same
+; 380 KB byte-perfect at every setting -- including 400 ms flushes where
+; the card's own ring overflows ten times and recovery handles it -- and
+; is 2.5x faster than MSS 536 when the disk is not the bottleneck. The
+; loss is specific to the host capture path in front of the emulator; fix
+; it there, and use this switch only while stuck with such a host.
 	IFDEF UNET_DLL
+TCP_RECV_MSS_HI		EQU 0x02		; 536 = 0x0218
+TCP_RECV_MSS_LO		EQU 0x18
+	ELSE
+	IFDEF USE_TCP_RX_SMALL
 TCP_RECV_MSS_HI		EQU 0x02		; 536 = 0x0218
 TCP_RECV_MSS_LO		EQU 0x18
 	ELSE
 TCP_RECV_MSS_HI		EQU 0x05		; 1460 = 0x05B4
 TCP_RECV_MSS_LO		EQU 0xB4
 	ENDIF
+	ENDIF
 
-; Direct, single-session clients may keep three full frames in flight.
+; Direct, single-session clients keep TWO full frames in flight.
 ; The byte-mode ring has 25 storable 256-byte pages; one maximum frame plus
-; its DP8390 header takes 6 pages, so three consume 18 and leave 7 pages for
-; broadcasts and drain latency. UNETRTL ignores this fixed value in its
+; its DP8390 header takes 6 pages, so two outstanding segments occupy 12 and
+; leave 13 pages for broadcasts and the latency of an 8 KB disk flush -- the
+; window the peer may fill while the client is away writing. Three segments
+; (the earlier value) occupied 18 of 25 and left only 7, which a single
+; stray broadcast plus one flush tipped into an RX-ring overflow; because
+; this stack keeps no out-of-order queue, that overflow cost a whole window
+; and an RTO, and on a real card the transfer stalled and timed out (the
+; 2026-09-14 "ovw 0x03" hardware capture). Two segments is exactly what the
+; sibling 3C509B kit settled on for the same reason. MSS stays 1460, so the
+; per-byte receive cost -- the actual throughput lever -- is unchanged; on
+; the host harness the two-segment window is if anything slightly faster
+; (fewer overflow-recovery stalls). UNETRTL ignores this fixed value in its
 ; builders and computes an honest caller+pending window capped at 2680.
 	IFDEF UNET_DLL
 TCP_RECV_WIN_HI		EQU 0x0A		; fallback/cap documentation: 2680
 TCP_RECV_WIN_LO		EQU 0x78
 	ELSE
-TCP_RECV_WIN_HI		EQU 0x11		; 4380 = 0x111C (3 * 1460)
-TCP_RECV_WIN_LO		EQU 0x1C
+	IFDEF USE_TCP_RX_SMALL
+TCP_RECV_WIN_HI		EQU 0x0A		; 2680 = 0x0A78 (5 * MSS 536)
+TCP_RECV_WIN_LO		EQU 0x78
+	ELSE
+TCP_RECV_WIN_HI		EQU 0x0B		; 2920 = 0x0B68 (2 * 1460)
+TCP_RECV_WIN_LO		EQU 0x68
+	ENDIF
 	ENDIF
 
 ; Multichannel only: the honest window while an ACK is built for a
@@ -130,12 +170,19 @@ TCP_FOREIGN_WIN_HI	EQU 0x02		; 536 = 0x0218 (one MSS, one pend slot)
 TCP_FOREIGN_WIN_LO	EQU 0x18
 
 ; ACK at least every second full-sized segment, as required by RFC 1122.
-; With the three-segment direct window this lets the peer refill while the
-; third frame is still in flight. An empty ring still flushes immediately.
+; With the two-segment direct window this acks the pair the peer holds in
+; flight together, letting it refill promptly. An empty ring still flushes
+; immediately. ACKing every single segment (threshold 1) was measured to be
+; slightly worse -- it advances the peer's window faster, so more data lands
+; while the client is off flushing to disk, raising ring pressure.
 	IFDEF USE_TCP_MULTICHAN
 TCP_ACK_THRESH		EQU 1		; another channel's ring traffic must not defer us
 	ELSE
+	IFDEF USE_TCP_RX_SMALL
+TCP_ACK_THRESH		EQU 4		; five 536-byte segments fit the 2680 window
+	ELSE
 TCP_ACK_THRESH		EQU 2
+	ENDIF
 	ENDIF
 
 ETH_TYPE_IPV4		EQU 0x0800

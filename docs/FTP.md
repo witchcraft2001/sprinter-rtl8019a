@@ -144,6 +144,42 @@ RESULT OK
 Listing data is streamed straight to the console (no local file
 is opened); progress dots are not emitted.
 
+## If a transfer stalls and restarts repeatedly
+
+This TCP implementation keeps no out-of-order queue: a segment arriving
+after a gap is discarded, so losing one segment costs every byte the
+server sent after it plus a full retransmission timeout.  A path that
+drops the occasional frame therefore does not merely slow down, it
+crawls -- the server's backoff grows and the transfer can end on
+`[E] data recv failed, code 0x02`.
+
+The `ovw` field on that line says where the loss is:
+
+| `ovw`      | Meaning                                                  |
+|------------|----------------------------------------------------------|
+| non-zero   | The card's own receive ring overflowed -- the machine is |
+|            | not draining fast enough.  Recovery ran; frames were lost.|
+| `0x00`     | The frames never reached the card.  The loss is upstream |
+|            | of it -- on the wire, or in the host path of an emulator. |
+
+The first case (`ovw` non-zero) is what a real card shows when the server
+fills the advertised receive window faster than the Z80 drains the ring,
+typically while an 8 KB block is being written to disk.  The direct client
+advertises a two-segment (2920-byte) window at MSS 1460 for exactly this
+reason: two maximum frames occupy 12 of the ring's 25 usable pages, leaving
+room for a stray broadcast and the flush latency.  Advertising three
+segments (the earlier value) filled 18 of 25 and overflowed under that
+load.  The window is the lever here, not the segment size -- MSS 1460 keeps
+the per-byte receive cost, and therefore the throughput, unchanged.
+
+The second case (`ovw 0x00`) has been seen under MAME, whose host capture
+path can drop frames that `tcpdump` on the same interface still shows.
+That is not a property of the card or of this stack: driven straight into
+the NIC the same transfer completes byte-perfect.  Where that host cannot
+be fixed, rebuild with `USE_TCP_RX_SMALL`, which drops the receive geometry
+to MSS 536 with a five-segment window; smaller frames are serviced faster
+and survive such a path, at roughly a third of the throughput.
+
 ## Exit codes
 
 | Code | Meaning                                                  |

@@ -133,12 +133,31 @@ class Rtl8019 {
     this.pending.push({ atMs: this.currentMs + Math.max(0, delayMs || 0), bytes });
   }
 
+  // Timer for a responder, fired from the same clock that delivers frames.
+  // A protocol peer needs this to model a retransmission timeout: a real
+  // sender resends unacknowledged data when its RTO expires, without any
+  // prompting from the receiver. Without a timer a responder can only react
+  // to frames it receives, so any test in which the client legitimately
+  // falls silent (waiting for data it never got) deadlocks the model rather
+  // than the code under test.
+  scheduleCallback(delayMs, fn) {
+    this.pending.push({ atMs: this.currentMs + Math.max(0, delayMs || 0), fn });
+  }
+
   pumpScheduled() {
     if (!this.pending.length) return;
-    const ready = [], notYet = [];
-    for (const p of this.pending) (p.atMs <= this.currentMs ? ready : notYet).push(p);
-    this.pending = notYet;
-    for (const p of ready) this.deliverFrame(p.bytes);
+    // Re-check after each batch: a callback may schedule more work that is
+    // already due (an RTO that fires into an even later RTO).
+    for (let guard = 0; guard < 64; guard++) {
+      const ready = [], notYet = [];
+      for (const p of this.pending) (p.atMs <= this.currentMs ? ready : notYet).push(p);
+      if (!ready.length) return;
+      this.pending = notYet;
+      // Deliver frames in scheduled order so a single peer's stream is never
+      // reordered on the wire, which Ethernet would not do either.
+      ready.sort((a, b) => a.atMs - b.atMs);
+      for (const p of ready) { if (p.fn) p.fn(); else this.deliverFrame(p.bytes); }
+    }
   }
 
   // ---- reset port (BASE+0x1F) ----
