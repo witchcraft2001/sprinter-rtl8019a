@@ -38,6 +38,41 @@ const payload = (n) => {
   return b;
 };
 
+const MODLAND_GREETING = [
+  '220-      __  ___               __ __                      __',
+  '220-    //  \\/   \\             |  |  |  .: welcome to :.  |  |',
+  '220-   |          |  _____   __|  |  |  _____   _____   __|  |',
+  '220-..:|          |// ,   |// ,   |  |// ,   |//     |// ,   |:..',
+  '220-   |___,__,__/|______/|______/|__|____,__|____,__|______/',
+  '220-',
+  '220-Welcome to Modland - probably the largest module archive in the world.',
+  '220-Currently there are 516118 modules online in 409 different formats,',
+  '220-old and new! If you are a module freak like us, feel free to download!',
+  '220-If you have no idea what a module is, then you are in the wrong place!',
+  '220-',
+  '220-If you find any duplicates or other errors, or you have something to',
+  '220-add to the collection, or just a question - join our Discord at:',
+  '220-https://discord.com/invite/AJ2xV8X',
+  '220-',
+  '220-Modland is administered by Menace and Ziphoid.',
+  '220-For anything else, get in touch at admins@modland.com.',
+  '220 Only anonymous FTP is allowed here',
+].join('\r\n');
+
+{ // ftp.modland.com sends its whole >512-byte multiline greeting in one
+  // TCP segment. FTP must retain the final "220 " line instead of ACKing
+  // and silently dropping the tail beyond its reply accumulator.
+  const file = payload(64);
+  const r = run('192.168.7.1 ALLMODS -y', {
+    environment: { ...NET_ENV },
+    responders: { arp: arpToServer, ftp: { file, greeting: MODLAND_GREETING } },
+  });
+  assert.strictEqual(r.exitCode, 0, 'long multiline FTP greeting must be parsed');
+  assert.match(r.output, /220 Only anonymous FTP is allowed here/);
+  assert.match(r.output, /RESULT OK/);
+  checkCleanupClaimedPage(r);
+}
+
 { // Small download: the whole control dialogue plus a one-flush transfer.
   const file = payload(4096);
   const r = run('192.168.7.1 SMALL.BIN -y', {

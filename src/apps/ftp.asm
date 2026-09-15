@@ -84,6 +84,8 @@ START
 	XOR	A
 	LD	(CANCELLED),A
 	LD	(PUT_MODE),A		; USER_ABORT may run before the parse
+	LD	(ACCUM_LEN),A		; preserve reply tails across READ_REPLY calls
+	LD	(ACCUM_LEN + 1),A
 	LD	A,NO_HANDLE		; ... and it inspects both of these
 	LD	(OUT_FH),A
 	LD	HL,0
@@ -982,9 +984,6 @@ START
 ;        CF=0 ok; CF=1 connection closed/error.
 ; ------------------------------------------------------
 READ_REPLY
-	XOR	A
-	LD	(ACCUM_LEN),A
-	LD	(ACCUM_LEN + 1),A
 .LP
 	CALL	FIND_LINE
 	JR	NC,.HAVE
@@ -996,18 +995,19 @@ READ_REPLY
 	RET
 .GOT
 	CALL	APPEND_TO_ACCUM
+	JR	C,.FAIL			; overlong/malformed reply, never truncate it
 	JR	.LP
+.FAIL
+	SCF
+	RET
 .HAVE
-	; A line is in ACCUM_BUF[0..LINE_LEN-1].  The line was
-	; already consumed from ACCUM (shifted out).
+	; A line is in ACCUM_BUF[0..LINE_LEN-1].  Keep it in place
+	; until it has been inspected/copied, then consume it.
 	; Check first 4 bytes: 3 digits + ' ' = final.
-	LD	A,(LINE_LEN)
-	LD	B,A
-	LD	A,(LINE_LEN + 1)
-	OR	B
-	JR	Z,.IGNORE		; empty line, skip
-	LD	A,(LINE_LEN)
-	CP	4
+	LD	HL,(LINE_LEN)
+	LD	DE,4
+	OR	A
+	SBC	HL,DE
 	JR	C,.IGNORE
 	LD	HL,ACCUM_BUF
 	LD	A,(HL)
@@ -1031,6 +1031,8 @@ READ_REPLY
 	LD	BC,3
 	LDIR
 	; Copy text from ACCUM_BUF + 4 .. LINE_LEN-1 into REPLY_LINE.
+	; The parser accepts a full FTP line, but the printable result
+	; buffer is deliberately smaller; truncate only displayed text.
 	LD	HL,(LINE_LEN)
 	LD	DE,4
 	OR	A
@@ -1044,16 +1046,23 @@ READ_REPLY
 	LD	(REPLY_LINE),A
 	JR	.RDONE
 .HAS_TEXT
+	LD	A,B
+	OR	A
+	JR	Z,.TEXT_LEN_OK
+	LD	BC,REPLY_LINE_SIZE - 1
+.TEXT_LEN_OK
 	LD	HL,ACCUM_BUF + 4
 	LD	DE,REPLY_LINE
 	LDIR
 	XOR	A
 	LD	(DE),A
 .RDONE
+	CALL	CONSUME_LINE
 	OR	A			; CF=0
 	RET
 .IGNORE
 	; Continuation or non-code line; just fetch next line.
+	CALL	CONSUME_LINE
 	JR	.LP
 
 
@@ -1074,10 +1083,9 @@ IS_DIGIT
 
 ; ------------------------------------------------------
 ; FIND_LINE: search ACCUM_BUF for the first \r\n.
-; If found, copy the line (excluding \r\n) to ACCUM_BUF
-; start (in place; line was already at start), set
-; LINE_LEN, shift the rest of ACCUM down, and update
-; ACCUM_LEN.  Returns CF=0 on success.
+; If found, leave the line in place and set LINE_LEN.
+; CONSUME_LINE removes it only after READ_REPLY has inspected it.
+; Returns CF=0 on success.
 ; If no \r\n in buffer: CF=1 (caller must read more).
 ; ------------------------------------------------------
 FIND_LINE
@@ -1109,17 +1117,21 @@ FIND_LINE
 .FOUND
 	; HL points to \n; line ends at HL-1 (\r).
 	LD	DE,ACCUM_BUF + 1
-	PUSH	HL
 	OR	A
 	SBC	HL,DE
 	LD	(LINE_LEN),HL
-	POP	HL
-	INC	HL			; past \n -> remaining starts here
-	; Compute consumed = HL - ACCUM_BUF, remaining = ACCUM_LEN - consumed.
-	PUSH	HL			; src ptr
-	LD	DE,ACCUM_BUF
 	OR	A
-	SBC	HL,DE			; HL = consumed
+	RET
+
+
+; ------------------------------------------------------
+; CONSUME_LINE: remove LINE_LEN bytes plus CRLF from the
+; front of ACCUM_BUF, preserving any pipelined next reply.
+; ------------------------------------------------------
+CONSUME_LINE
+	LD	HL,(LINE_LEN)
+	LD	DE,2
+	ADD	HL,DE
 	EX	DE,HL			; DE = consumed
 	LD	HL,(ACCUM_LEN)
 	OR	A
@@ -1127,45 +1139,43 @@ FIND_LINE
 	LD	(ACCUM_LEN),HL
 	LD	B,H
 	LD	C,L
-	POP	HL			; HL = src ptr
 	LD	A,B
 	OR	C
-	JR	Z,.DONE
+	RET	Z
+	LD	HL,ACCUM_BUF
+	ADD	HL,DE
 	LD	DE,ACCUM_BUF
 	LDIR
-.DONE
-	OR	A
 	RET
 
 
 ; ------------------------------------------------------
 ; APPEND_TO_ACCUM: copy the bytes returned by TCP.RECV
-; into ACCUM_BUF (cap at ACCUM_BUF_SIZE).
+; into ACCUM_BUF.  ACCUM_BUF holds one maximum incomplete
+; FTP line plus one maximum Ethernet/TCP payload.  Reject
+; malformed overlength input instead of ACKing and silently
+; discarding bytes from the reply stream.
+;   Out: CF=0 copied; CF=1 would overflow ACCUM_BUF.
 ; ------------------------------------------------------
 APPEND_TO_ACCUM
 	LD	BC,(TCP_RX_DATA_LEN)
 	LD	A,B
 	OR	C
-	RET	Z
+	JR	Z,.OK
 	; Available = ACCUM_BUF_SIZE - ACCUM_LEN.
 	LD	HL,ACCUM_BUF_SIZE
 	LD	DE,(ACCUM_LEN)
 	OR	A
 	SBC	HL,DE			; HL = available
-	LD	A,H
-	OR	L
-	RET	Z			; full -- drop input
-	; If available < count, copy only available.
+	; Fail if available < count.
 	LD	A,H
 	CP	B
-	JR	C,.CAP
+	JR	C,.OVERFLOW
 	JR	NZ,.NOCAP
 	LD	A,L
 	CP	C
 	JR	NC,.NOCAP
-.CAP
-	LD	B,H
-	LD	C,L
+	JR	.OVERFLOW
 .NOCAP
 	; Dst = ACCUM_BUF + ACCUM_LEN.  Src = TCP_RX_DATA_PTR.
 	LD	HL,ACCUM_BUF
@@ -1180,6 +1190,13 @@ APPEND_TO_ACCUM
 	LD	HL,(ACCUM_LEN)
 	ADD	HL,BC
 	LD	(ACCUM_LEN),HL
+	OR	A
+	RET
+.OVERFLOW
+	SCF
+	RET
+.OK
+	OR	A
 	RET
 
 
@@ -2189,7 +2206,11 @@ DEFAULT_PASS	DB "anonymous@"
 DEFAULT_PASS_LEN EQU $ - DEFAULT_PASS
 
 
-ACCUM_BUF_SIZE	EQU 512
+; TCP.RECV can return one 1460-byte segment.  Keeping 2048 bytes lets a
+; <=512-byte partial FTP line survive while the next full segment is
+; appended; the old 512-byte buffer silently discarded Modland's final
+; "220 " line when its long greeting arrived in one segment.
+ACCUM_BUF_SIZE	EQU 2048
 REPLY_LINE_SIZE	EQU 256
 CMD_BUF_SIZE	EQU 256
 
@@ -2241,6 +2262,9 @@ RESUME_FLAG	EQU PROG_CNT + 1		; 1 (1 if -r was given)
 RESUME_OFFSET	EQU RESUME_FLAG + 1		; 4 (LE; local size at open, REST offset)
 CTRL_PORT	EQU RESUME_OFFSET + 4		; 2 (LE; control port, default 21)
 DOTS_FLAG	EQU CTRL_PORT + 2		; 1 (1 if -d was given)
+FTP_APP_BSS_END	EQU DOTS_FLAG + 1
+
+	ASSERT FTP_APP_BSS_END < RT_STACK_TOP - 0x0100
 
 NO_HANDLE	EQU 0xFF
 FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
