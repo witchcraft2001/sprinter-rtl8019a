@@ -1464,13 +1464,35 @@ PRINT_TX_RAM_DIAG
 
 ; ------------------------------------------------------
 ; WAIT_PING_GAP: wait PING_GAP_MS between echo requests.
-; Uses the same close-delay-scan-open tick as reply waits.
+; Uses the same close-delay-scan-open tick as reply waits,
+; but keeps servicing the RX ring: a router's ARP probe for
+; us lands in this gap almost every time (it is ~97% of the
+; cycle).  Left in the ring, it was answered only after the
+; next echo had gone out, and the router dropped that echo's
+; reply while its neighbour check was still unanswered.
+; Everything except an ARP request for OUR_IP is discarded.
 ;   Out: CF=0 normal; CF=1 cancelled.
 ; ------------------------------------------------------
 WAIT_PING_GAP
 	LD	HL,PING_GAP_MS
 	LD	(TIMEOUT_MS_LEFT),HL
 .LP
+	; Drain at most RX_DRAIN_BUDGET frames per tick so a broadcast
+	; flood cannot stretch the gap or starve the key poll.
+	LD	A,RX_DRAIN_BUDGET
+	LD	(RX_DRAIN_LEFT),A
+.DRAIN
+	CALL	@RTL.RING_HAS_PACKET
+	JR	Z,.TICK
+	LD	HL,RX_HDR
+	LD	DE,RX_BUF
+	LD	BC,RX_BUF_SIZE
+	CALL	@RTL.READ_PACKET
+	CALL	NC,HANDLE_ARP_REQUEST
+	LD	HL,RX_DRAIN_LEFT
+	DEC	(HL)
+	JR	NZ,.DRAIN
+.TICK
 	CALL	TICK_AND_CHECK_KEY
 	RET	C
 	LD	HL,(TIMEOUT_MS_LEFT)

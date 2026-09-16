@@ -115,6 +115,29 @@ for (const app of ['PING', 'PINGALT']) {
     }
     count();
   }
+  { // A gateway ARP probe that lands in the 1 s inter-echo gap must be
+    // answered inside the gap, BEFORE the next echo goes out.  An idle gap
+    // left it in the ring until after echo #2 was sent, so the router
+    // dropped that echo's reply while its neighbour check was unanswered
+    // (real-hardware loss pattern: rx=1 frame = stale ARP request).
+    const r = run(app, '-n 2 192.168.7.1', {
+      environment: { ...NET_ENV },
+      responders: { arp: { mac: [2, 0, 0, 0, 0, 1] }, icmp: { probeAfterMs: 300 } },
+    });
+    assert.strictEqual(r.exitCode, 0);
+    const kinds = r.transmittedFrames.map((h) => {
+      const f = Buffer.from(h, 'hex');
+      if (f[12] === 0x08 && f[13] === 0x06) return f[21] === 1 ? 'arp-req' : 'arp-rep';
+      return f[23] === 1 && f[34] === 8 ? 'echo' : 'other';
+    });
+    assert.deepStrictEqual(kinds, ['arp-req', 'echo', 'arp-rep', 'echo'],
+      'ARP reply must be sent during the gap, before echo #2');
+    const rep = Buffer.from(r.transmittedFrames[2], 'hex');
+    assert.strictEqual(rep.subarray(0, 6).toString('hex'), '020000000001');
+    assert.strictEqual(rep.subarray(28, 32).toString('hex'), 'c0a80702', 'reply SPA = our IP');
+    assert.match(r.output, /Packets: Sent = 2, Received = 2, Lost = 0\./);
+    checkCleanupClaimedPage(r);
+  }
   { // -b: forces an L2 broadcast destination, unicast IP/ICMP payload unchanged
     const r = run(app, '-b -n 1 192.168.7.1', { environment: { ...NET_ENV }, responders: arpAndIcmp });
     assert.strictEqual(r.exitCode, 0);

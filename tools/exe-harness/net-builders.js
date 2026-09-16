@@ -942,6 +942,12 @@ function respond(frame, card, scenario) {
       ? record(buildIcmpUnreachable(frame, echo, icmp))
       : record(buildIcmpReply(frame, echo, icmp));
     card.schedule(icmp.afterMs ?? 1, reply);
+    // Gateway neighbour probe: a real router re-verifies the sender's MAC
+    // with a who-has some time after it forwarded a reply.  Landing it in
+    // the pinger's inter-echo gap is what exposed the unserviced-gap bug.
+    if (icmp.probeAfterMs !== undefined && icmp._count === 1) {
+      card.schedule(icmp.probeAfterMs, record(buildArpRequest(frame.slice(26, 30), { mac: frame.slice(0, 6) })));
+    }
     return;
   }
 
