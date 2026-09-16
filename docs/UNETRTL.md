@@ -184,6 +184,14 @@ same TCP sequence number, up to four transmissions with a one-second ACK
 wait per attempt.  Exhaustion returns `NERR_SEND`; `DE` still reports the
 bytes confirmed, including a partial ACK of the failing chunk.
 
+A NIC transmit error returns `NERR_HW` at once.  Since 0.3.12 it also keeps
+the sequence state honest about what it proves: only a **first** attempt that
+failed to leave the NIC rewinds the stream to the unacknowledged byte.  A
+failed *retransmission* says nothing about the earlier copy -- it may well
+have reached the peer -- so the segment stays outstanding and the next
+`CLOSE` aborts with the dual RST described below instead of sending a FIN at
+a sequence number the peer may already be past.  This matches `UNET509B`.
+
 Since 0.3.8, a peer FIN that arrives during that ACK wait **and leaves the
 current chunk unacknowledged** is reported as `NERR_CLOSED`, not `NERR_SEND`.
 A server may answer before it has consumed the body it is still being sent --
@@ -218,7 +226,8 @@ the case that made the pre-0.3.8 blind drain unusable (FTP's `226 Transfer
 complete` on the control connection while the data connection was closing).
 
 When a `SEND` ended with bytes transmitted but unacknowledged -- it was
-cancelled, or it exhausted its retries -- whether the peer took those bytes is
+cancelled, it exhausted its retries, or a retransmission failed in the NIC
+after the first copy went out -- whether the peer took those bytes is
 unknowable from this side, and a FIN is wrong either way: at the low sequence
 number it is an old duplicate the peer ignores, at the high one it is an
 out-of-order segment that never reaches end-of-stream.  Both leave the peer

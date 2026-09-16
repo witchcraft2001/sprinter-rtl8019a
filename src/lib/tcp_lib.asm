@@ -1618,7 +1618,18 @@ SEND
 	CALL	XMIT_TX_BUF
 	ENDIF
 	JR	NC,.WAIT_ACK
-	CALL	.RESTORE_SEQ
+	; A transmit failure proves nothing about EARLIER attempts of this
+	; same segment.  Rewinding SND_NXT to SND_UNA is right only when no
+	; attempt ever left the NIC; after a retransmit failure the first
+	; copy may well have reached the peer, and rewinding would make
+	; CLOSE read the stream as fully acknowledged and send a FIN at an
+	; obsolete sequence number -- exactly the peer-keeps-the-request
+	; failure the dual-RST abort exists to prevent.  RETRY_LEFT is
+	; decremented only at .ATTEMPT_EXHAUSTED, so it still equals
+	; SEND_ATTEMPTS here if and only if this was the first attempt.
+	LD	A,(TCP_SEND_RETRY_LEFT)
+	CP	SEND_ATTEMPTS
+	CALL	Z,.RESTORE_SEQ		; only the first attempt never left the NIC
 	XOR	A
 	LD	(TCP_ACK_WAIT_STATE),A
 	JP	FAIL_SEND

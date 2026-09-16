@@ -901,6 +901,80 @@ const tcpOf = r => r.transmittedFrames
   checkProbe(r);
 }
 
+// A NIC transmit failure says nothing about the EARLIER attempts of the same
+// segment.  These vectors pin down which of them may rewind SND_NXT: only a
+// first attempt that never left the NIC.  The DLL must not mistake a failed
+// retransmission for proof that the first copy was never delivered, or the
+// following CLOSE reads the stream as fully acknowledged and sends a FIN at an
+// obsolete sequence number -- the peer that DID take the segment then keeps
+// the request (and whatever it locked) until its own timeout.
+const seqsOf = segs => segs.map(v => v.seq).sort();
+const expectAbortAt = (r, closeIx, seq0, msg) => {
+  const sent = tcpOf(r);
+  assert.ok(!sent.some(v => v.flags & 1), `${msg}: a FIN went out at a possibly-stale sequence`);
+  assert.deepStrictEqual(seqsOf(sent.filter(v => v.flags & 4)), seqsOf([{ seq: seq0 }, { seq: (seq0 + 7) >>> 0 }]),
+    `${msg}: RST did not cover both candidates for the peer RCV.NXT`);
+  assert.strictEqual(r.results[closeIx].a, 0, `${msg}: an abort that reached the wire reported a failure`);
+};
+
+{ // First transmit succeeds, its ACK is lost, the first retransmission fails
+  // in the NIC.  SEND reports NERR_HW, but the segment is still in flight
+  // for all this side can tell, so CLOSE must abort at both candidates.
+  const txError = { attempts: [] };
+  let payloads = 0;
+  const r = probe([init, connect(), send(), close(0)], dllScenario({ txError }),
+    peer(({ card, seg }) => {
+      // The peer takes the segment and stays silent; the next transmit after
+      // the first copy is the retransmit, which is the one that fails.
+      if (seg.payload.length && ++payloads === 1) txError.attempts.push(card.txAttempts + 1);
+    }));
+  const data = tcpOf(r).find(v => v.payload.length === 7);
+  assert.ok(data, 'the probe never transmitted its payload');
+  assert.strictEqual(payloads, 1, 'the failed retransmit reached the peer');
+  assert.strictEqual(r.results[2].a, 1, 'SEND should have reported NERR_HW');
+  expectAbortAt(r, 3, data.seq, 'retransmit TX error');
+  checkProbe(r);
+}
+
+{ // Same, but the retransmission happens after an ASYNCSEND suspension: the
+  // slice returns NERR_AGAIN, the resumed call exhausts the attempt and its
+  // retransmit fails.  The resume must not have forgotten that the first
+  // copy went out.
+  const txError = { attempts: [] };
+  let payloads = 0;
+  const r = probe([init, connect(), sendslice(500), send(), send(), close(0)], dllScenario({ txError }),
+    peer(({ card, seg }) => {
+      if (seg.payload.length && ++payloads === 1) txError.attempts.push(card.txAttempts + 1);
+    }));
+  const data = tcpOf(r).find(v => v.payload.length === 7);
+  assert.strictEqual(r.results[3].a, 15, 'the sliced SEND did not suspend (NERR_AGAIN expected)');
+  assert.strictEqual(r.results[4].a, 1, 'the resumed SEND should have reported NERR_HW');
+  assert.strictEqual(payloads, 1, 'the failed retransmit reached the peer');
+  expectAbortAt(r, 5, data.seq, 'retransmit TX error after resume');
+  checkProbe(r);
+}
+
+{ // The first transmit itself fails: nothing ever left the NIC, so the
+  // rewind is correct and CLOSE keeps its orderly FIN at the unadvanced
+  // sequence -- the one case where a TX error IS proof of non-delivery.
+  const txError = { attempts: [] };
+  let fins = 0;
+  const r = probe([init, connect(), send(), close(0)], dllScenario({ txError }),
+    peer(({ card, seg, t, emit }) => {
+      if (seg.flags & 16 && !seg.payload.length && !(seg.flags & 1) && !txError.attempts.length) {
+        txError.attempts.push(card.txAttempts + 1);   // the handshake ACK; next is the data
+      }
+      if (seg.flags & 1) { fins += 1; t.clientNext = (seg.seq + 1) >>> 0; emit({ flags: 16 }); }
+    }));
+  const sent = tcpOf(r);
+  assert.ok(!sent.some(v => v.payload.length === 7), 'the failed first transmit reached the peer');
+  assert.strictEqual(r.results[2].a, 1, 'SEND should have reported NERR_HW');
+  assert.ok(!sent.some(v => v.flags & 4), 'an unsent segment was aborted with RST');
+  assert.strictEqual(fins, 1, 'expected exactly one orderly FIN');
+  assert.strictEqual(r.results[3].a, 0, 'an orderly close after an unsent segment reported a failure');
+  checkProbe(r);
+}
+
 { // Everything acknowledged: an orderly FIN, at the sequence right after
   // the acknowledged data, and exactly one of them.
   let fins = 0;
