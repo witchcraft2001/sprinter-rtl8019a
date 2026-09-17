@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Phase 3 actual-EXE integration vectors: TCP client utilities (WGET,
-// DLDIRECT, DLDIRCP) plus a DLSPEED smoke test through UNETRTL.DLL.
+// DLDIRECT, DLDIRCP, DLWIN3, DLOOO3) plus a DLSPEED smoke test through UNETRTL.DLL.
 // SPDX-License-Identifier: BSD-3-Clause
 'use strict';
 
@@ -8,7 +8,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { runExe } = require('./exe-harness/harness.js');
-const { parseTcpSegment } = require('./exe-harness/net-builders.js');
+const { parseTcpSegment, buildHttpResponse } = require('./exe-harness/net-builders.js');
 const { count, caseCount, checkCleanup, checkCleanupClaimedPage } = require('./exe-harness/test-util.js');
 
 const root = path.resolve(__dirname, '..');
@@ -147,8 +147,13 @@ for (const missing of ['NET_IP', 'NET_MAC']) {
 // ---------------------------------------------------------------------
 // DLDIRECT.EXE / DLDIRCP.EXE (byte-identical protocol; DLDIRCP only adds
 // an extra memcpy of each segment before parsing, per src/apps/dldircp.asm)
+// DLWIN3 changes only the advertised receive window to three MSS.
 // ---------------------------------------------------------------------
-for (const app of ['DLDIRECT', 'DLDIRCP']) {
+for (const app of ['DLDIRECT', 'DLDIRCP', 'DLWIN3']) {
+  const receiveWindow = app === 'DLWIN3' ? 4380 : 2920;
+  // Existing direct BUILD_FIN clears the window low byte. Preserve that
+  // unrelated close-path behavior in this receive-window-only experiment.
+  const expectedWindow = v => (v.flags & 1) ? (receiveWindow & 0xff00) : receiveWindow;
   {
     const body = Buffer.from(Array.from({ length: 4096 }, (_, i) => i & 255));
     const r = run(app, 'http://192.168.7.1/file.bin', {
@@ -164,12 +169,40 @@ for (const app of ['DLDIRECT', 'DLDIRCP']) {
       .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
     const syn = sent.find(v => v.flags === 2);
     assert.strictEqual(syn?.mss, 1460, `${app} did not advertise receive MSS 1460`);
-    assert.strictEqual(syn?.window, 2920, `${app} did not advertise the two-MSS receive window`);
+    assert.strictEqual(syn?.window, receiveWindow, `${app} SYN receive window`);
+    assert.ok(sent.filter(v => v.flags & 0x10).every(v => v.window === expectedWindow(v)),
+      `${app} ACK/data/FIN receive window`);
+    if (app === 'DLWIN3') assert.match(r.output, /EXPERIMENT RXWIN=4380/);
     const received = r.generatedFrames
       .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
     assert.ok(received.some(v => v.payload.length === 1460),
       `${app} was not exercised with a full 1460-byte receive segment`);
     count();
+  }
+  for (const afterMs of [1, 100]) { // Full-window bursts on fast and delayed paths.
+    const body = Buffer.alloc(64 * 1024, 0x5a);
+    const r = run(app, 'http://192.168.7.1/file.bin', {
+      environment: { ...NET_ENV },
+      responders: { arp: arpToServer, tcp: { body, streamAhead: true, afterMs } },
+    });
+    assert.strictEqual(r.exitCode, 0, r.output);
+    assert.match(r.output, /Received: 65536 bytes/);
+    assert.match(r.output, /RESULT OK/);
+    const sent = r.transmittedFrames
+      .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+    assert.ok(sent.every(v => v.window === expectedWindow(v)), `${app} bulk receive window`);
+    const received = r.generatedFrames
+      .map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+    assert.ok(received.filter(v => v.payload.length === 1460).length > 40);
+    assert.strictEqual(r.card.stats.overflowEvents, 0, `${app} RX overflow at ${afterMs} ms`);
+    checkCleanupClaimedPage(r);
+  }
+  if (app === 'DLWIN3') {
+    const r = run(app, '/?', { environment: { ...NET_ENV } });
+    assert.strictEqual(r.exitCode, 0);
+    assert.match(r.output, /Usage: DLWIN3\.EXE/);
+    assert.strictEqual(r.transmittedFrames.length, 0);
+    checkCleanupClaimedPage(r);
   }
   { // HTTP/1.1 request includes a non-default port in the Host header
     // (unlike WGET, which never appends the port to Host at all).
@@ -229,6 +262,173 @@ for (const app of ['DLDIRECT', 'DLDIRCP']) {
 }
 
 // ---------------------------------------------------------------------
+// DLOOO3.EXE -- the 4380-byte DLWIN3 experiment plus exactly two durable
+// out-of-order slots.  These vectors use a response body whose bytes are
+// deliberately non-repeating; a mere Content-Length success cannot hide a
+// reordered/corrupted parser input in the responder trace.
+// ---------------------------------------------------------------------
+for (const order of [[1, 2, 0], [2, 1, 0]]) {
+  const body = Buffer.from(Array.from({ length: 3 * 1460 + 311 }, (_, i) => (i * 37 + 11) & 255));
+  const tcp = { body, streamAhead: true, oooOrder: order, afterMs: 1 };
+  const parserBytes = [];
+  const r = run('DLOOO3', 'http://192.168.7.1/file.bin', {
+    environment: { ...NET_ENV }, responders: { arp: arpToServer, tcp },
+    // RECEIVE_BODY's CALL DHTTP.CONSUME in the large DLDIRECT layout.
+    // Capture the actual HL/BC slices supplied to the parser, not merely
+    // its final Content-Length result, so a duplicate/skip/reorder cannot
+    // pass this vector accidentally.
+    cpuProbes: { 0x4448: ({ state, read }) => {
+      const ptr = (state.h << 8) | state.l;
+      const len = (state.b << 8) | state.c;
+      parserBytes.push(Buffer.from(Array.from({ length: len }, (_, i) => read((ptr + i) & 0xffff))));
+    } },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /DLOOO3 v.*RXWIN=4380 OOO=2/);
+  assert.match(r.output, /OOO saved=2 delivered=2 nospace=0 max=2/);
+  assert.match(r.output, /ovw=[0-9]+ txfail=[0-9]+/);
+  assert.match(r.output, new RegExp(`Received: ${body.length} bytes`));
+  assert.match(r.output, /Integrity: OK/);
+  assert.deepStrictEqual(Buffer.concat(parserBytes), buildHttpResponse(tcp),
+    'HTTP parser did not receive the exact reordered response byte stream');
+  const sent = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  const syn = sent.find(v => v.flags === 2);
+  assert.strictEqual(syn?.mss, 1460);
+  assert.strictEqual(syn?.window, 4380);
+  // Before the missing first segment arrives every ACK stays at its old
+  // cumulative point; no ACK may claim either saved segment prematurely.
+  const dataAcks = sent.filter(v => (v.flags & 0x10) && !(v.flags & 2));
+  const initialAck = 0x12345679; // harness responder's server ISN + SYN
+  assert.ok(dataAcks.filter(v => v.ack === initialAck).length >= 2,
+    'saved segments must produce duplicate ACKs at the hole, not ACK through it');
+  assert.ok(r.generatedFrames.length >= 4, 'expected a three-segment reordered flight');
+  checkCleanupClaimedPage(r);
+  count();
+}
+{ // Queue-full path: after a hole, a third ahead segment must be ACKed but not copied.
+  const body = Buffer.alloc(5 * 1460 + 17, 0x6d);
+  const r = run('DLOOO3', 'http://192.168.7.1/file.bin', {
+    environment: { ...NET_ENV },
+    responders: { arp: arpToServer, tcp: { body, streamAhead: true, oooOrder: [1, 2, 0], maxBurst: 4, afterMs: 1 } },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /OOO saved=2 delivered=2 nospace=[0-9]+ max=2/);
+  checkCleanupClaimedPage(r);
+  count();
+}
+
+// ---------------------------------------------------------------------
+// DLTUNE.EXE -- runtime window/ACK experiment.  The parser accepts flags
+// on either side of the URL, while malformed/repeated options fail before
+// the NIC is touched.
+// ---------------------------------------------------------------------
+function checkTuneWindows(sent, wmax) {
+  const acks = sent.filter(v => (v.flags & 0x10) && !(v.flags & 2));
+  assert.ok(acks.length > 4, 'DLTUNE bulk vector did not exercise window growth');
+  let previousAck = acks[0].ack >>> 0;
+  let edge = (previousAck + 4380) >>> 0;
+  for (const seg of acks) {
+    const ack = seg.ack >>> 0;
+    const advance = (ack - previousAck) >>> 0;
+    if (advance && advance < 0x80000000) {
+      const stepEdge = (edge + 2920) >>> 0;
+      const limitEdge = (ack + wmax) >>> 0;
+      const stepFromEdge = (stepEdge - edge) >>> 0;
+      const limitFromEdge = (limitEdge - edge) >>> 0;
+      if (limitFromEdge < 0x80000000)
+        edge = (edge + Math.min(stepFromEdge, limitFromEdge)) >>> 0;
+      previousAck = ack;
+    }
+    assert.strictEqual(seg.window, (edge - ack) >>> 0,
+      `wrong DLTUNE edge at ACK ${ack.toString(16)}`);
+    assert.ok(seg.window <= wmax, `window exceeded max: ${seg.window}`);
+  }
+}
+
+for (const w of [3, 6, 9]) for (const a of [1, 2]) for (const afterMs of [1, 100]) {
+  const body = Buffer.alloc(64 * 1024, 0x74);
+  const r = run('DLTUNE', `http://192.168.7.1/file.bin -a ${a} -w ${w}`, {
+    environment: { ...NET_ENV },
+    responders: { arp: arpToServer, tcp: { body, streamAhead: true, afterMs } },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, new RegExp(`RXWIN_MAX=${w * 1460} ACK=${a} OOO=2 EDGE_STEP=2920`));
+  assert.match(r.output, /Received: 65536 bytes/);
+  const sent = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  assert.strictEqual(sent.find(v => v.flags === 2)?.window, 4380);
+  checkTuneWindows(sent, w * 1460);
+  if (w === 3)
+    assert.strictEqual(r.card.stats.overflowEvents, 0,
+      `DLTUNE -w ${w} -a ${a} RX overflow at ${afterMs} ms`);
+  count();
+}
+{ // The advertised right edge and its comparisons stay correct across wrap.
+  const body = Buffer.alloc(16 * 1024, 0x77);
+  const r = run('DLTUNE', 'http://192.168.7.1/file.bin -a 2 -w 9', {
+    environment: { ...NET_ENV },
+    responders: { arp: arpToServer, tcp: { body, streamAhead: true, afterMs: 1, isn: 0xfffff000 } },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /Received: 16384 bytes/);
+  const sent = r.transmittedFrames.map(f => parseTcpSegment(Buffer.from(f, 'hex'))).filter(Boolean);
+  checkTuneWindows(sent, 9 * 1460);
+  assert.ok(sent.some(v => v.ack < 0x1000), 'DLTUNE wrap vector did not cross sequence zero');
+  count();
+}
+{ // Once -w 6 has grown beyond 4380, a valid far-ahead segment must use
+  // the advertised edge rather than DLOOO3's fixed three-MSS limit.  Keep
+  // the remainder of the original flight delayed so the injected segment
+  // arrives with an end offset of 5840 from the current RCV_NXT.
+  const body = Buffer.alloc(64 * 1024, 0x78);
+  const r = run('DLTUNE', 'http://192.168.7.1/file.bin -a 1 -w 6', {
+    environment: { ...NET_ENV },
+    responders: { arp: arpToServer, tcp: {
+      body, streamAhead: true, afterMs: 1, segmentGapMs: 100, maxBurst: 4,
+      oooAfterOffset: 1460, oooOrder: [1, 0],
+    } },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /Received: 65536 bytes/);
+  assert.match(r.output, /OOO saved=[1-9][0-9]* delivered=[1-9][0-9]*/);
+  assert.match(r.output, /oowin=0/);
+  assert.match(r.output, /ovw=[0-9]+ txfail=[0-9]+/);
+  assert.match(r.output, /Integrity: OK/);
+  count();
+}
+{ // Exercise the high byte of every OOO event counter.  The old increment
+  // helper pinned DELIVERED at 255 and advanced the other u16 counters by
+  // 256 whenever their low byte wrapped.
+  const body = Buffer.alloc(2 * 1024 * 1024, 0x79);
+  const r = run('DLTUNE', 'http://192.168.7.1/file.bin -a 1 -w 3', {
+    maxInstructions: 750000000,
+    environment: { ...NET_ENV },
+    responders: { arp: arpToServer, tcp: {
+      body, streamAhead: true, afterMs: 1, maxBurst: 2,
+      oooOrder: [1, 0], oooRepeat: true,
+    } },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /Received: 2097152 bytes/);
+  const counters = r.output.match(/OOO saved=([0-9]+) delivered=([0-9]+)/);
+  assert.ok(counters, 'missing DLTUNE OOO counters');
+  assert.ok(Number(counters[1]) > 255, `saved counter did not cross 255: ${counters[1]}`);
+  assert.strictEqual(counters[2], counters[1], 'queued segments were not delivered exactly once');
+  assert.match(r.output, /Integrity: OK/);
+  count();
+}
+for (const args of [
+  '-w 4 http://192.168.7.1/file.bin',
+  '-a 3 http://192.168.7.1/file.bin',
+  '-w 3 -w 6 http://192.168.7.1/file.bin',
+  '-a 1 -a 2 http://192.168.7.1/file.bin',
+]) {
+  const r = run('DLTUNE', args, { environment: { ...NET_ENV } });
+  assert.strictEqual(r.exitCode, 1);
+  assert.match(r.output, /Usage: DLTUNE/);
+  count();
+}
+
+// ---------------------------------------------------------------------
 // DLSPEED.EXE (loads UNETRTL.DLL via libman13.asm)
 // ---------------------------------------------------------------------
 const dllBytes = fs.readFileSync(exe('UNETRTL').replace(/\.EXE$/, '.DLL'));
@@ -285,4 +485,4 @@ const dllScenario = (extra = {}) => ({
   count();
 }
 
-console.log(`Actual DSS EXE TCP harness: ${caseCount()} WGET/DLDIRECT/DLDIRCP/DLSPEED checks passed`);
+console.log(`Actual DSS EXE TCP harness: ${caseCount()} WGET/DLDIRECT/DLDIRCP/DLWIN3/DLOOO3/DLTUNE/DLSPEED checks passed`);

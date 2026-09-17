@@ -37,6 +37,9 @@ BUILD_APPS=(
   dlspeed
   dldirect
   dldircp
+  dlwin3
+  dlooo3
+  dltune
   unettest
 )
 
@@ -62,6 +65,9 @@ ZIP_EXCLUDE_APPS=(
   dlspeed
   dldirect
   dldircp
+  dlwin3
+  dlooo3
+  dltune
   unettest
 )
 ZIP_EXCLUDE_DLLS=()

@@ -85,6 +85,64 @@ Repeat until each utility has five successful samples. Compare median KiB/s:
 
 This does not compare the RTL stack with ESP-AT.
 
+## Experimental receive-window A/B test
+
+`DLWIN3.EXE` is a developer-image-only DLDIRECT variant. It advertises a
+4380-byte receive window (three MSS) instead of 2920 (two MSS). Its banner
+includes `EXPERIMENT RXWIN=4380`; MSS remains 1460 and the ACK policy,
+HTTP parser, timing and discard-without-disk-I/O path are unchanged.
+The regular DLDIRECT, DLDIRCP, WGET, FTP and UNETRTL builds are unaffected.
+
+```
+DLDIRECT http://modland.antarctica.no/allmods.zip
+DLWIN3   http://modland.antarctica.no/allmods.zip
+DLDIRECT http://modland.antarctica.no/allmods.zip
+```
+
+Keep the URL, route and emulator speed unchanged. Capture each run separately
+on feth1, starting before the SYN, and compare throughput AND retransmissions.
+Verify window 4380 and MSS 1460 in the experimental SYN and window 4380 in
+its ACKs. Require the same received byte count, `Integrity: OK` and `RESULT OK`.
+The existing integrity message checks HTTP framing/length, not a file hash.
+
+This is not an approved production window increase. Three full packets leave
+less NIC ring headroom; earlier file-client tests saw overflows with this
+window. Stop testing on a timeout/failure and retain the capture and screen.
+Do not apply the experiment to FTP/WGET or the DLL without separate validation.
+MAME and real-hardware acceptance remain pending. Exit codes match DLDIRECT:
+0 success, 1 usage, 2 missing NIC, 3 network/HTTP/RTC/cancel error,
+4 missing network environment.
+
+## DLOOO3 loss-recovery experiment
+
+`DLOOO3.EXE` keeps DLWIN3's MSS 1460 and 4380-byte advertised window, but
+adds two private 1460-byte slots for segments that arrive ahead of `RCV.NXT`.
+It is on the developer floppy only and is excluded from the release ZIP.
+The banner is `DLOOO3 ... RXWIN=4380 OOO=2`.
+
+When a segment fills a hole, DLOOO3 emits the current cumulative ACK; it
+does not ACK the saved bytes early.  Once the missing segment arrives, the
+saved segments are released in sequence before another NIC frame is read.
+After the timed transfer it prints decimal `saved`, `delivered`, `nospace`,
+`max`, `dup`, `overlap`, `badlen`, `oowin`, `badframe`, and `ackfail`
+counters, followed by the driver's `ovw` and `txfail` counters. Event
+counters are saturating 16-bit values; `max`, `ovw`, and `txfail` are
+saturating bytes. Do not compare those lines during the timed part -- the
+program deliberately prints nothing while downloading.
+
+`DLTUNE.EXE` adds runtime `-w 3|6|9` and `-a 1|2` choices to the same
+two-slot experiment. The SYN starts at 4380 bytes in every mode; the receive
+edge can then grow by 2920 bytes per ACK of new sequential data, up to the
+selected maximum. Wider windows do not add OOO slots, so `nospace` and NIC
+`ovw` may increase under load. A larger selected maximum is an experiment,
+not a promise of higher throughput.
+
+For MAME acceptance, run DLWIN3 and DLOOO3 three times each, alternating
+the two programs against the same URL and taking one `feth1` capture per
+run. Check byte count, `Integrity: OK`, MSS/window in SYN and normal ACKs,
+the duplicate ACK at a simulated/observed hole, and queue use. Compare the
+median KiB/s; this experiment does not change WGET, FTP, or UNETRTL.
+
 ## Exit status
 
 - `0` -- complete body received and measured.

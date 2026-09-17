@@ -568,6 +568,9 @@ function tcpStreamAhead(session, card, tcp, seg) {
 function streamEmit(session, card, tcp, mss, window, total) {
   let emitted = 0;
   const gap = tcp.segmentGapMs ?? 1;
+
+  const reorderThisFlight = Boolean(tcp.oooOrder && (tcp.oooRepeat || !session.oooFirstFlightDone) &&
+    session.ackedOffset >= (tcp.oooAfterOffset ?? 0));
   while (session.sentOffset < total &&
          (session.sentOffset - session.ackedOffset) + mss <= window &&
          emitted < (tcp.maxBurst ?? 8)) {
@@ -580,8 +583,23 @@ function streamEmit(session, card, tcp, mss, window, total) {
     session.sentOffset += size;
     session.nextMs = Math.max((session.nextMs ?? 0), card.currentMs + (tcp.afterMs ?? 1)) + (emitted ? gap : 0);
     card.generated.push(segOut);
-    card.schedule(session.nextMs - card.currentMs, segOut);
+    // OOO vectors need a deterministic hole without relying on host capture
+    // timing. Reorder the first eligible flight: [1,2,0] emits segments
+    // 2,3,1 and oooAfterOffset can defer that flight until DLTUNE has grown
+    // its advertised edge. The sender's sequence state remains normal, so
+    // duplicate ACK fast retransmit/RTO behaviour still comes from
+    // tcpStreamAhead rather than from a test-only receive path.
+    let due = session.nextMs - card.currentMs;
+    if (reorderThisFlight && emitted < tcp.oooOrder.length) {
+      const rank = tcp.oooOrder.indexOf(emitted);
+      if (rank >= 0) due = (tcp.afterMs ?? 1) + rank * gap;
+    }
+    card.schedule(due, segOut);
     emitted++;
+  }
+  if (reorderThisFlight && emitted >= tcp.oooOrder.length) {
+    session.oooFirstFlightDone = true;
+    session.oooEmitted = emitted;
   }
   armRto(session, card, tcp, mss, window, total);
 }

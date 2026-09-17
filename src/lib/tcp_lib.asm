@@ -15,7 +15,7 @@
 ; Design choices:
 ;   - one session.
 ;   - direct clients announce receive MSS 1460 and advertise
-;     4380 = 3 * MSS. UNETRTL keeps receive MSS 536 because its
+;     2920 = 2 * MSS by default. UNETRTL keeps receive MSS 536 because its
 ;     synchronous caller buffer is transient and its durable queue is
 ;     exactly one 536-byte segment; its window is computed at runtime.
 ;   - sequence numbers stored big-endian on disk to match
@@ -156,6 +156,37 @@ TCP_RECV_MSS_LO		EQU 0xB4
 ; the host harness the two-segment window is if anything slightly faster
 ; (fewer overflow-recovery stalls). UNETRTL ignores this fixed value in its
 ; builders and computes an honest caller+pending window capped at 2680.
+; USE_TCP_RX_WIN3 is an opt-in DLWIN3 throughput experiment, NOT a new
+; default: only the advertised window changes; MSS and ACK policy stay put.
+	IFDEF USE_TCP_RX_TUNE
+TCP_RECV_WIN_HI		EQU 0x11
+TCP_RECV_WIN_LO		EQU 0x1C
+	ELSE
+	IFDEF USE_TCP_RX_WIN3
+	IFDEF UNET_DLL
+	ASSERT 0, "USE_TCP_RX_WIN3 is for direct diagnostics only"
+	ENDIF
+	IFDEF USE_TCP_RX_OOO
+	IFNDEF USE_TCP_RX_WIN3
+	ASSERT 0, "USE_TCP_RX_OOO requires the 4380-byte experiment window"
+	ENDIF
+	IFDEF UNET_DLL
+	ASSERT 0, "USE_TCP_RX_OOO is for direct diagnostics only"
+	ENDIF
+	IFDEF USE_TCP_RX_SMALL
+	ASSERT 0, "USE_TCP_RX_OOO requires MSS 1460"
+	ENDIF
+	IFDEF USE_TCP_MULTICHAN
+	ASSERT 0, "USE_TCP_RX_OOO is for one session only"
+	ENDIF
+	ENDIF
+	IFDEF USE_TCP_RX_SMALL
+	ASSERT 0, "USE_TCP_RX_WIN3 requires MSS 1460"
+	ENDIF
+	IFDEF USE_TCP_MULTICHAN
+	ASSERT 0, "USE_TCP_RX_WIN3 is for single-session diagnostics only"
+	ENDIF
+	ENDIF
 	IFDEF UNET_DLL
 TCP_RECV_WIN_HI		EQU 0x0A		; fallback/cap documentation: 2680
 TCP_RECV_WIN_LO		EQU 0x78
@@ -164,8 +195,14 @@ TCP_RECV_WIN_LO		EQU 0x78
 TCP_RECV_WIN_HI		EQU 0x0A		; 2680 = 0x0A78 (5 * MSS 536)
 TCP_RECV_WIN_LO		EQU 0x78
 	ELSE
+	IFDEF USE_TCP_RX_WIN3
+TCP_RECV_WIN_HI		EQU 0x11		; 4380 = 0x111C (3 * 1460), experimental
+TCP_RECV_WIN_LO		EQU 0x1C
+	ELSE
 TCP_RECV_WIN_HI		EQU 0x0B		; 2920 = 0x0B68 (2 * 1460)
 TCP_RECV_WIN_LO		EQU 0x68
+	ENDIF
+	ENDIF
 	ENDIF
 	ENDIF
 
@@ -279,6 +316,9 @@ OPEN
 	XOR	A
 	LD	(TCP_LAST_FAIL),A
 	LD	(RECV_UNACKED),A
+	IFDEF USE_TCP_RX_OOO
+	CALL	@TCP_OOO.RESET
+	ENDIF
 	IFDEF USE_TCP_RELIABLE_SEND
 	LD	(TCP_ACK_WAIT_STATE),A
 	ENDIF
@@ -403,6 +443,9 @@ OPEN
 	CALL	COPY_SEQ32
 	LD	DE,TCP_RCV_NXT
 	CALL	INC_SEQ32
+	IFDEF USE_TCP_RX_TUNE
+	CALL	TUNE_INIT_EDGE
+	ENDIF
 
 	; Build & send pure ACK to complete the handshake.
 	CALL	BUILD_ACK
@@ -692,6 +735,126 @@ WRITE_RX_WINDOW
 	RET
 	ENDIF
 
+	IFDEF USE_TCP_RX_TUNE
+; DLTUNE window control.  TCP_TUNE_EDGE is the right edge of the last
+; successfully transmitted announcement; it is never moved backwards.
+TUNE_INIT_EDGE
+	LD	HL,TCP_RCV_NXT
+	LD	DE,TCP_TUNE_EDGE
+	CALL	COPY_SEQ32
+	LD	BC,4380
+	LD	DE,TCP_TUNE_EDGE
+	CALL	ADD32_BE_BC
+	RET
+
+TUNE_ADVANCE
+	; Keep the last successfully advertised edge recoverable until TX
+	; succeeds.  Callers restore it with TUNE_ROLLBACK on send failure.
+	LD	HL,TCP_TUNE_EDGE
+	LD	DE,TCP_TUNE_PREV
+	CALL	COPY_SEQ32
+	LD	HL,TCP_RCV_NXT
+	LD	DE,TCP_TUNE_CAND
+	CALL	COPY_SEQ32
+	LD	BC,(TCP_TUNE_WMAX)
+	LD	DE,TCP_TUNE_CAND
+	CALL	ADD32_BE_BC
+	LD	HL,TCP_TUNE_EDGE
+	LD	DE,TCP_TUNE_TMP
+	CALL	COPY_SEQ32
+	LD	BC,2920
+	LD	DE,TCP_TUNE_TMP
+	CALL	ADD32_BE_BC
+	LD	HL,TCP_TUNE_TMP
+	LD	DE,TCP_TUNE_CAND
+	CALL	CMP32_SEQ
+	JR	NC,.CAND_READY
+	LD	HL,TCP_TUNE_TMP
+	LD	DE,TCP_TUNE_CAND
+	CALL	COPY_SEQ32
+.CAND_READY
+	LD	HL,TCP_TUNE_EDGE
+	LD	DE,TCP_TUNE_CAND
+	CALL	CMP32_SEQ
+	RET	NC
+	LD	HL,TCP_TUNE_CAND
+	LD	DE,TCP_TUNE_EDGE
+	JP	COPY_SEQ32
+
+; CMP32_SEQ: RFC-style modulo-2^32 sequence comparison.  CF means that
+; the value at HL precedes the value at DE (signed (HL-DE) < 0).  Every
+; DLTUNE distance is at most 13140, safely below the half-space boundary.
+CMP32_SEQ
+	PUSH	HL
+	PUSH	DE
+	INC	HL
+	INC	HL
+	INC	HL
+	INC	DE
+	INC	DE
+	INC	DE
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	SUB	C
+	DEC	HL
+	DEC	DE
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	SBC	A,C
+	DEC	HL
+	DEC	DE
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	SBC	A,C
+	DEC	HL
+	DEC	DE
+	LD	A,(DE)
+	LD	C,A
+	LD	A,(HL)
+	SBC	A,C
+	POP	DE
+	POP	HL
+	RLCA				; sign bit -> carry
+	RET
+
+TUNE_ROLLBACK
+	LD	HL,TCP_TUNE_PREV
+	LD	DE,TCP_TUNE_EDGE
+	JP	COPY_SEQ32
+
+TUNE_KEEP_EDGE
+	; Pure/repeated ACKs advertise the current edge but must not expand it.
+	; Snapshot it anyway so the common TX-failure rollback is harmless.
+	LD	HL,TCP_TUNE_EDGE
+	LD	DE,TCP_TUNE_PREV
+	JP	COPY_SEQ32
+
+; DE points at the two-byte TCP window field in an outgoing header.
+WRITE_TUNE_WINDOW
+	LD	A,(TCP_TUNE_EDGE+3)
+	LD	C,A
+	LD	A,(TCP_RCV_NXT+3)
+	LD	B,A
+	LD	A,C
+	SUB	B
+	LD	C,A
+	LD	A,(TCP_TUNE_EDGE+2)
+	LD	H,A
+	LD	A,(TCP_RCV_NXT+2)
+	LD	B,A
+	LD	A,H
+	SBC	A,B
+	LD	(DE),A
+	INC	DE
+	LD	A,C
+	LD	(DE),A
+	INC	DE
+	RET
+	ENDIF
+
 SEND_DUP_ACK
 	CALL	BUILD_ACK
 	JP	XMIT_TX_BUF
@@ -751,12 +914,16 @@ BUILD_ACK
 	LD	(DE),A
 	INC	DE
 	ELSE
+	IFDEF USE_TCP_RX_TUNE
+	CALL	WRITE_TUNE_WINDOW
+	ELSE
 	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
 	LD	A,TCP_RECV_WIN_LO
 	LD	(DE),A
 	INC	DE
+	ENDIF
 	ENDIF
 	ENDIF
 
@@ -1922,6 +2089,21 @@ RECV
 .START_WAIT
 	ENDIF
 	ENDIF
+	IFDEF USE_TCP_RX_OOO
+	; A filled hole may make an already-buffered segment contiguous.  Always
+	; expose that byte range before asking the NIC for another frame.
+	CALL	@TCP_OOO.DELIVER
+	JR	C,.OOO_EMPTY
+	LD	A,(TCP_STATE)
+	CP	ST_CLOSE_WAIT
+	JR	Z,.OOO_FIN
+	OR	A
+	RET
+.OOO_FIN
+	SCF
+	RET
+.OOO_EMPTY
+	ENDIF
 	; Initial budget: caller's RECV_TIMEOUT (set via the public
 	; knob) or the 30 000 ms default if the caller didn't touch
 	; it.  After consuming the budget we re-arm the default so
@@ -1973,6 +2155,9 @@ RECV
 	CALL	@RTL.READ_PACKET
 	ENDIF
 	JP	C,.TICK
+	IFDEF USE_TCP_RX_OOO
+	LD	(.FRAME_LEN),BC
+	ENDIF
 	CALL	IS_TCP_FROM_PEER
 	IFDEF USE_TCP_MULTICHAN
 	JR	C,.COMMIT_PEER
@@ -2009,6 +2194,11 @@ RECV
 	JP	.TICK
 	ENDIF
 .PEER_SEG
+	IFDEF USE_TCP_RX_OOO
+	LD	BC,(.FRAME_LEN)
+	CALL	@TCP_OOO.VALIDATE_FRAME
+	JP	C,.BAD_FRAME
+	ENDIF
 	; Flags.
 	LD	A,(@MAIN.RX_BUF + 14 + IP_HDR_LEN + 13)
 	LD	(.FLAGS),A
@@ -2022,6 +2212,9 @@ RECV
 	; RST -> immediate fail.
 	AND	TF_RST
 	JR	Z,.NO_RST
+	IFDEF USE_TCP_RX_OOO
+	CALL	@TCP_OOO.RELEASE
+	ENDIF
 	LD	A,F_RST
 	JP	FAIL_A
 .NO_RST
@@ -2111,6 +2304,16 @@ RECV
 	CALL	@UNET.PEER_CLOSED
 	ENDIF
 .NO_FIN
+	IFDEF USE_TCP_RX_OOO
+	LD	A,(.FLAGS)
+	AND	TF_FIN
+	JR	Z,.OOO_PRUNE
+	CALL	@TCP_OOO.RELEASE	; FIN is final; discard every later slot
+	JR	.OOO_PRUNED
+.OOO_PRUNE
+	CALL	@TCP_OOO.PRUNE
+.OOO_PRUNED
+	ENDIF
 		; Decide whether to ACK this segment now.  Force ACK on FIN
 	; (state == CLOSE_WAIT here).  Otherwise apply delayed-ACK:
 	; bump the unacked counter and skip the ACK so long as more
@@ -2133,7 +2336,12 @@ RECV
 		JR	NZ,.DEFER_ACK
 		INC	A
 		LD	(RECV_UNACKED),A
+		IFDEF USE_TCP_RX_TUNE
+		LD	A,(TCP_TUNE_ACK_MODE)
 		CP	TCP_ACK_THRESH
+		ELSE
+		CP	TCP_ACK_THRESH
+		ENDIF
 		JR	NC,.SEND_ACK
 		CALL	@RTL.RING_HAS_PACKET
 		JR	Z,.SEND_ACK		; ring empty -> flush ACK now
@@ -2149,6 +2357,20 @@ RECV
 		LD	(RECV_UNACKED),A
 		JR	.AOK
 .SEND_ACK
+	IFDEF USE_TCP_RX_TUNE
+		LD	HL,(TCP_RX_DATA_LEN)
+		LD	A,H
+		OR	L
+		JR	NZ,.TUNE_GROW
+		LD	A,(.FLAGS)
+		AND	TF_FIN
+		JR	NZ,.TUNE_GROW
+		CALL	TUNE_KEEP_EDGE
+		JR	.TUNE_READY
+.TUNE_GROW
+		CALL	TUNE_ADVANCE
+.TUNE_READY
+	ENDIF
 		; Preserve the scoped-defer bit on a forced FIN ACK.  On a
 		; transmit failure preserve the complete debt byte so the DLL
 		; can retry its cumulative ACK on the next public RECV.
@@ -2160,6 +2382,9 @@ RECV
 		LD	(RECV_UNACKED),A
 		JR	.AOK
 .ACK_SEND_FAIL
+	IFDEF USE_TCP_RX_TUNE
+		CALL	TUNE_ROLLBACK
+	ENDIF
 		; Count the ACK that just failed as debt.  In the scoped drain this
 		; turns a lone defer bit (for example FIN+data as the first segment)
 		; into a flushable 0x81 instead of silently losing the retry.
@@ -2301,6 +2526,15 @@ RECV
 	; backoff and we would ignore every copy until RECV times out.
 	; The dup-ACK also fires the peer's fast retransmit on a lost
 	; data segment instead of waiting out its RTO.
+	IFDEF USE_TCP_RX_OOO
+		; STORE accepts only a future, complete, in-window segment and
+		; never advances RCV_NXT.  A duplicate ACK below remains mandatory
+		; for both saved and rejected arrivals.
+		LD	HL,(.SEG_PTR)
+		LD	BC,(.SEG_LEN)
+		LD	A,(.FLAGS)
+		CALL	@TCP_OOO.STORE
+	ENDIF
 		; A duplicate/out-of-order segment still gets an immediate ACK,
 		; even inside a scoped drain.  Restore bit 7 afterwards so the
 		; public caller can flush the remaining cumulative debt at exit.
@@ -2315,9 +2549,19 @@ RECV
 		LD	(TCP_RX_DATA_LEN),HL
 		JP	.AOK
 	ELSE
-		JP	.TICK
+	JP	.TICK
+	ENDIF
+	IFDEF USE_TCP_RX_OOO
+.BAD_FRAME
+	LD	HL,TCP_OOO_BADFRAME
+	CALL	@TCP_OOO.INC_SAT16
+	LD	A,F_BAD_SEG
+	JP	FAIL_A
 	ENDIF
 .CANCEL
+	IFDEF USE_TCP_RX_OOO
+	CALL	@TCP_OOO.RELEASE
+	ENDIF
 	LD	A,F_CANCEL
 	JP	FAIL_A
 .FLAGS		DB 0
@@ -2325,6 +2569,9 @@ RECV
 .SEG_PTR	DW 0		; payload ptr/length of the segment being
 .SEG_LEN	DW 0		; classified (trimmed on overlap)
 .DELTA_LO	DW 0		; low 16 bits of RCV_NXT - seq
+	IFDEF USE_TCP_RX_OOO
+.FRAME_LEN	DW 0
+	ENDIF
 
 ; Counter of segments processed since the last outbound ACK.  Reset
 ; on TCP.OPEN and on every actual ACK send; bumped on every accepted
@@ -2351,6 +2598,9 @@ RECV_TIMEOUT	DW 0
 ;   Out: CF=0 cleanly closed; CF=1 on send/timeout error.
 ; ------------------------------------------------------
 CLOSE
+	IFDEF USE_TCP_RX_OOO
+	CALL	@TCP_OOO.RELEASE
+	ENDIF
 	IFDEF USE_TCP_RELIABLE_SEND
 	XOR	A
 	LD	(TCP_ACK_WAIT_STATE),A
@@ -2573,12 +2823,16 @@ BUILD_DATA
 	IFDEF UNET_DLL
 	CALL	WRITE_RX_WINDOW
 	ELSE
+	IFDEF USE_TCP_RX_TUNE
+	CALL	WRITE_TUNE_WINDOW
+	ELSE
 	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
 	LD	A,TCP_RECV_WIN_LO
 	LD	(DE),A
 	INC	DE
+	ENDIF
 	ENDIF
 	XOR	A
 	LD	(DE),A			; csum hi
@@ -2659,12 +2913,17 @@ BUILD_FIN
 	CALL	WRITE_RX_WINDOW
 	XOR	A
 	ELSE
+	IFDEF USE_TCP_RX_TUNE
+	CALL	WRITE_TUNE_WINDOW
+	XOR	A
+	ELSE
 	LD	A,TCP_RECV_WIN_HI
 	LD	(DE),A
 	INC	DE
 	XOR	A
 	LD	(DE),A
 	INC	DE
+	ENDIF
 	ENDIF
 	LD	(DE),A
 	INC	DE
