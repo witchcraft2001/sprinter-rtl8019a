@@ -570,8 +570,26 @@ function runExe(exePath, args = '', inputScenario = {}) {
       }
       case 0x52: setCarry(s, false); return ret(s); // GOTOXY: no screen to model, stub ok
       case 0x56: setCarry(s, false); return ret(s); // CLEAR: no screen to model, stub ok
-      case 0x5b: stdout += String.fromCharCode(s.a); setCarry(s, false); return ret(s);
-      case 0x5c: stdout += cstr((s.h << 8) | s.l); setCarry(s, false); return ret(s);
+      // Console output does NOT preserve registers on real DSS: RST 10h
+      // saves nothing, PUTCHAR/PCHARS load B with the shell colour, C with
+      // the BIOS function and IY with 0, and tail into BIOS LP_PR_LINE_DIR
+      // (Estex-DSS API/PutChar.asm, API/PChars.asm).  PCHARS also zeroes D
+      // and returns HL just past the terminator.  A model that preserved
+      // them let NICREG 0.3.18 ship `LD B,count / PRINT / ... DJNZ`, which
+      // printed 256 samples on hardware.  B = 0 is the value that makes such
+      // a loop as loud as possible.
+      case 0x5b:
+        stdout += String.fromCharCode(s.a);
+        s.a = 0; s.b = 0; s.c = 0xe0; s.iy = 0;
+        setCarry(s, false); return ret(s);
+      case 0x5c: {
+        const text = cstr((s.h << 8) | s.l);
+        stdout += text;
+        const next = (((s.h << 8) | s.l) + text.length + 1) & 0xffff;
+        s.h = next >> 8; s.l = next & 0xff;
+        s.a = 0; s.b = 0; s.c = 0xe0; s.d = 0; s.e = 0; s.iy = 0;
+        setCarry(s, false); return ret(s);
+      }
       default: throw new Error(`unknown DSS call 0x${fn.toString(16)}`);
     }
   };

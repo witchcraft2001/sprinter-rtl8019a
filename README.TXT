@@ -92,6 +92,7 @@ PROGRAMS
   TELNET.EXE    ANSI/VT100 Telnet client with Zmodem and Ymodem
   NICINFO.EXE   show card identity, MAC, memory layout, and registers
   ISAPROBE.EXE  inspect the ISA window when the card is not detected
+  NICREG.EXE    check that the card's registers read back reliably
 
   UNETRTL.DLL   reusable RTL8019AS network API for other DSS programs
 

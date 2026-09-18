@@ -435,4 +435,183 @@ function unicastFrame(payload = 'PAYLOAD') {
   checkCleanupClaimedPage(r);
 }
 
-console.log(`Actual DSS EXE harness: ${caseCount()} header, self-test, NICINFO/NICRAM/NICLB/NICTX/NICRX and ISAPROBE checks passed`);
+// ---------------------------------------------------------------------
+// NICREG: register read-stability diagnostic.  Its whole point is to tell
+// an UNDRIVEN bit (returns whatever the previous bus cycle left behind --
+// harmless, and normal for a clone's reserved bits) from a DRIVEN bit that
+// is misread (a genuine marginal-bus fault).  Every target read is preceded
+// by a read of a conditioner register preset to 00 and then to FF.
+// ---------------------------------------------------------------------
+{ // healthy card: every pair equal, nothing transmitted without -t
+  const r = run('NICREG', '');
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /\[G0\] Slot\/Addr: 1\/#300 chip=Realtek/);
+  assert.match(r.output, /bad after-00=0000 after-FF=0000 cond=0000/);
+  assert.match(r.output, /\[G2\] PAGE2 CONFIG .* bad=0000/);
+  assert.match(r.output, /RCR   04\|04\/04\|04\/04 TCR   02\|02\/02\|02\/02/);
+  assert.match(r.output, /CR    21\/21\|21\/21/);
+  assert.match(r.output, /\[G4\] PAR=028019112233  per row: 288000 reads, 192000 writes/);
+  assert.match(r.output, / row  rd-bad bits wr-lost wr-bad cr-bad rxpages badticks withrx/);
+  for (const row of ['stop', 'deaf', 'live']) {
+    assert.match(r.output, new RegExp(` ${row} 0000   00   0000    0000   0000   0000    0000     0000`));
+  }
+  assert.doesNotMatch(r.output, /^  (rd|wr) /m);
+  assert.match(r.output, /RESULT OK/);
+  assert.strictEqual(r.transmittedFrames.length, 0, 'NICREG must not transmit unless asked');
+  // The diagnostic leaves the controller stopped, as it found it.
+  assert.strictEqual(r.card.cr & 0x3f, 0x21);
+  checkCleanup(r);
+}
+{ // UM9003F-style read-back: reserved bits follow the bus.  That is NOT an
+  // unstable read and must not fail the run: the value after a 00 conditioner
+  // and the value after an FF conditioner differ, but each pair is equal.
+  const r = run('NICREG', '', {
+    quirks: { variant: 'UM9003', hangOnResetPort: true, floatingBits: true },
+    environment: { NET_RTL_HW: '1/#300' },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /chip=clone/);
+  assert.match(r.output, /RCR   04\|04\/04\|C4\/C4 TCR   02\|02\/02\|E2\/E2/);
+  assert.match(r.output, /DCR   48\|48\/48\|C8\/C8 IMR   00\|00\/00\|80\/80/);
+  assert.match(r.output, /ID0   00\/00\|FF\/FF ID1   00\/00\|FF\/FF/);
+  assert.match(r.output, /bad after-00=0000 after-FF=0000 cond=0000/);
+  assert.match(r.output, /RESULT OK/);
+  // A clone has no page 3, and its reset port may hang the machine.
+  assert.strictEqual(r.card.stats.page3Reads, 0);
+  checkCleanup(r);
+}
+{ // genuine fault: a DRIVEN bit of a read/write register comes back wrong
+  // now and then.  Counted, attributed to its bit, and fatal.
+  const r = run('NICREG', '', { quirks: { regReadGlitch: { page: 1, everyN: 997, xor: 0x80 } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, /bad after-00=000E after-FF=000E/);
+  assert.match(r.output, /PAR0  bad=0001 bits=80/);
+  // A fault that does not care about the chip's state shows in ALL [G4]
+  // rows, the stopped control included, and in ticks where the ring never
+  // moved; the misreads are kept verbatim.  No write is blamed for it.
+  for (const row of ['stop', 'deaf', 'live']) {
+    assert.match(r.output, new RegExp(` ${row} 01E5   80   0000    0000   0000   0000    01E5     0000`));
+  }
+  assert.match(r.output, /  rd PAR5=B3@1B PAR3=91@01 /);
+  assert.doesNotMatch(r.output, /^  wr /m);
+  // 0.3.18 loaded the sample counter into B and THEN printed the "  rd"
+  // label; real DSS console calls trash B, and hardware printed 256 samples
+  // of stray memory.  The model trashes B the same way: the line must stop
+  // at the six samples that were kept.
+  const rdLines = r.output.split(/\r?\n/).filter((l) => l.startsWith('  rd'));
+  assert.strictEqual(rdLines.length, 3);
+  for (const l of rdLines) assert.match(l, /^  rd( PAR[0-5]=[0-9A-F]{2}@[01][0-9A-F]){6}$/);
+  assert.match(r.output, /RESULT FAIL/);
+  checkCleanup(r);
+}
+{ // register reads that collide with the chip's receive-buffer DMA (a host
+  // that does not honour IOCHRDY): clean while the receiver is deaf, bad only
+  // while frames are stored, and every bad tick is a tick the ring moved in.
+  const bc = (n) => ({
+    afterMs: 100 + n * 100,
+    bytes: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2, 0, 0, 0, 0, 9, 0x08, 0x06, ...new Array(46).fill(n)],
+  });
+  const r = run('NICREG', '', {
+    // one frame per 100 ms across all three rows (3 x 1500 ticks of 1 ms)
+    rxFrames: Array.from({ length: 45 }, (_, i) => bc(i)),
+    quirks: { rxDmaGlitch: { afterReads: 14, xor: 0xff } },
+  });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, /bad after-00=0000 after-FF=0000 cond=0000/);
+  assert.match(r.output, / stop 0000   00   0000    0000   0000   0000    0000     0000/);
+  assert.match(r.output, / deaf 0000   00   0000    0000   0000   0000    0000     0000/);
+  const live = r.output.match(/ live ([0-9A-F]{4})   FF   0000    0000   0000   ([0-9A-F]{4})    ([0-9A-F]{4})     ([0-9A-F]{4})/);
+  assert.ok(live, 'live row with misreads expected');
+  assert.ok(parseInt(live[1], 16) > 0);
+  assert.strictEqual(live[2], live[1], 'one stored frame, one page, one misread');
+  assert.strictEqual(live[3], live[1]);
+  assert.strictEqual(live[4], live[1], 'every bad tick must be tied to reception');
+  // 14th register read after the frame: 6 PAR + 4 MAR read-backs, then
+  // PAR3 of the second sweep (0x11 ^ 0xFF)
+  assert.match(r.output, /  rd PAR3=EE@01 /);
+  assert.ok(r.card.stats.filteredRx > 0, 'the deaf row must have had traffic to ignore');
+  checkCleanup(r);
+}
+{ // Writes a started chip never latches (seen on real hardware).  MAR0..3
+  // keep the previous sweep's pattern: counted as LOST, not as misreads, and
+  // only in the rows where the chip runs.
+  const r = run('NICREG', '', { quirks: { regWriteDrop: { target: 'reg', everyN: 10007, runningOnly: true } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, / stop 0000   00   0000    0000   0000   0000    0000     0000/);
+  assert.match(r.output, / deaf 0000   00   0013    0000   0000   0000    0013     0000/);
+  assert.match(r.output, / live 0000   00   0013    0000   0000   0000    0013     0000/);
+  assert.match(r.output, /  wr MAR2=69>96 MAR3=69>96 MAR0=C3>3C MAR1=C3>3C/);
+  // same counter-across-a-DSS-print trap as the "  rd" line: four, not 256
+  const wrLines = r.output.split(/\r?\n/).filter((l) => l.startsWith('  wr'));
+  assert.strictEqual(wrLines.length, 2);
+  for (const l of wrLines) assert.match(l, /^  wr( MAR[0-3]=[0-9A-F]{2}>[0-9A-F]{2}){4}$/);
+  assert.match(r.output, /RESULT FAIL/);
+  checkCleanup(r);
+}
+{ // The dangerous one: a dropped page switch.  Unverified, the ring drain's
+  // BNRY/ISR writes would land in PAR2/CURR (this is what real hardware
+  // showed).  SET_PAGE must notice, repeat the write and count it -- and the
+  // station address must survive.
+  const r = run('NICREG', '', { quirks: { regWriteDrop: { target: 'cr', everyN: 1201, runningOnly: true } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, / stop 0000   00   0000    0000   0000   0000    0000     0000/);
+  assert.match(r.output, / deaf 0000   00   0000    0000   0003   0000    0003     0000/);
+  assert.match(r.output, / live 0000   00   0000    0000   0003   0000    0003     0000/);
+  assert.ok(r.card.stats.droppedWrites >= 6);
+  assert.strictEqual(r.card.par, '028019112233', 'PAR must not be hit by a stray BNRY write');
+  assert.strictEqual(r.card.curr, 0x47, 'CURR must not be hit by a stray ISR write');
+  assert.match(r.output, /RESULT FAIL/);
+  checkCleanup(r);
+}
+{ // a misread page-2 DEFINED bit fails too (reserved ones never do)
+  const r = run('NICREG', '', { quirks: { regReadGlitch: { page: 2, everyN: 501, xor: 0x04 } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.doesNotMatch(r.output, /\[G2\] PAGE2 CONFIG .* bad=0000/);
+  assert.match(r.output, /RESULT FAIL/);
+  checkCleanup(r);
+}
+{ // -t: 3 x 20 tagged frames, in order, while live broadcast traffic is
+  // drained so the ring cannot overflow under the test.
+  // The stop and deaf rows of [G4] take the first 3000 ms; aim the traffic at
+  // the live row and at the transmit phase after it.
+  const bc = (n) => ({
+    afterMs: 3100 + n * 40,
+    bytes: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2, 0, 0, 0, 0, 9, 0x08, 0x06, ...new Array(46).fill(n)],
+  });
+  const r = run('NICREG', '-t', { rxFrames: Array.from({ length: 60 }, (_, i) => bc(i)) });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, / A poll  ptx=20 /);
+  assert.match(r.output, / B quiet ptx=20 /);
+  assert.match(r.output, / C drv   ptx=20/);
+  assert.match(r.output, / live 0000   00   0000    0000   0000   (?!0000)[0-9A-F]{4}    0000     0000/);
+  assert.strictEqual(r.transmittedFrames.length, 60);
+  const marks = r.transmittedFrames.map((h) => {
+    const f = Buffer.from(h, 'hex');
+    assert.strictEqual(f.length, 60);
+    assert.strictEqual(f.readUInt16BE(12), 0x88b5);
+    assert.strictEqual(f.subarray(14, 24).toString('latin1'), 'NICREG TX ');
+    return String.fromCharCode(f[24]) + f[25];
+  });
+  const expected = ['A', 'B', 'C'].flatMap((m) => Array.from({ length: 20 }, (_, i) => m + (i + 1)));
+  assert.deepStrictEqual(marks, expected);
+  assert.strictEqual(r.card.stats.overflowEvents, 0);
+  checkCleanup(r);
+}
+{ // a transmitter that does not complete is a failure of the -t phase
+  const r = run('NICREG', '-t', { txError: true });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, / A poll  ptx=00 /);
+  assert.match(r.output, /RESULT FAIL/);
+  checkCleanup(r);
+}
+{ // help and "no card" paths
+  const h = run('NICREG', '/?');
+  assert.strictEqual(h.exitCode, 0);
+  assert.match(h.output, /NICREG -t/);
+  checkCleanup(h);
+  const n = run('NICREG', '', { cardPresent: false });
+  assert.strictEqual(n.exitCode, 2);
+  checkCleanup(n);
+}
+
+console.log(`Actual DSS EXE harness: ${caseCount()} header, self-test, NICINFO/NICRAM/NICLB/NICTX/NICRX, ISAPROBE and NICREG checks passed`);

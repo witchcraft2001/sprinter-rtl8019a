@@ -53,6 +53,24 @@ class Rtl8019 {
       isrRstOnStop: quirks.isrRstOnStop === true, // real HW: true; MAME default: false
       openBusValue: quirks.openBusValue !== undefined ? quirks.openBusValue : 0xff,
       hangOnResetPort: quirks.hangOnResetPort === true, // UM9003-style clone
+      // UM9003F-style read-back: bits the chip does not drive return whatever
+      // the previous register-file cycle left behind (page-2 reserved bits,
+      // and the undecoded page-0 8019ID offsets).  NICREG must report these
+      // as following the bus, not as unstable reads.
+      floatingBits: quirks.floatingBits === true,
+      // Genuine marginal-bus fault: every Nth register read on `page` comes
+      // back with `xor` flipped.  { page, everyN, xor }.  NICREG must FAIL.
+      regReadGlitch: quirks.regReadGlitch || null,
+      // Register read colliding with receive-buffer DMA: the Nth register
+      // read after a frame was stored comes back with `xor` flipped.
+      // { afterReads, xor }.  NICREG must pin it on its "live" row only.
+      rxDmaGlitch: quirks.rxDmaGlitch || null,
+      // A write the chip never latches: every Nth write of the chosen kind
+      // is dropped.  { target: 'cr' | 'reg', everyN, runningOnly }.  Seen on
+      // real hardware with a started chip: a dropped "CR := page 0" sent the
+      // following BNRY write into PAR2.  NICREG must count these and keep
+      // its own page switches safe.
+      regWriteDrop: quirks.regWriteDrop || null,
       // Early UMC UM9003F (measured 2026-09-17): internal loopback completes
       // PTX but the receive side posts neither PRX nor RXE and leaves the
       // ring alone; only ISR.CNT appears.
@@ -124,6 +142,10 @@ class Rtl8019 {
     this.rxDelivered = 0;
     this.stats = { filteredRx: 0, oobDma: 0, overflowEvents: 0, stopEdges: 0, page3Reads: 0 };
     this._dmaByteIndex = 0;
+    this.lastBus = 0xff;   // last value seen on the register-file data bus
+    this._glitchReads = 0;
+    this._rxGlitchIn = 0;  // register reads left until the rxDmaGlitch one
+    this._dropWrites = 0;
 
     // Scheduled RX delivery: preloaded scenario.rxFrames plus anything a
     // protocol responder (net-builders.js, via onTransmit) schedules in
@@ -246,6 +268,31 @@ class Rtl8019 {
 
   // ---- generic page0/1/2/3 register file, offsets 0x01..0x0F ----
   readReg(offset) {
+    const previous = this.lastBus;
+    let value = this._readRegRaw(offset) & 0xff;
+    const page = (this.cr >> 6) & 3;
+    if (this.quirks.floatingBits && offset >= 0x01 && offset <= 0x0f) {
+      // defined-bit masks of the page-2 configuration read-back
+      const p2 = { 0x0c: 0x3f, 0x0d: 0x1f, 0x0e: 0x7f, 0x0f: 0x7f };
+      if (page === 2 && p2[offset] !== undefined) value = (value & p2[offset]) | (previous & ~p2[offset] & 0xff);
+      if (page === 0 && (offset === 0x0a || offset === 0x0b)) value = previous;
+    }
+    const glitch = this.quirks.regReadGlitch;
+    if (glitch && page === glitch.page && offset >= 0x01 && offset <= 0x0f) {
+      if (++this._glitchReads % glitch.everyN === 0) value ^= glitch.xor;
+    }
+    // A host register read that lands in the chip's own receive-buffer DMA
+    // burst, on a bus that does not honour IOCHRDY: one read goes wrong a
+    // fixed number of register reads after a frame was STORED.  A frame the
+    // filter rejected (or monitor mode dropped) causes no DMA and no glitch.
+    if (this._rxGlitchIn > 0 && offset >= 0x01 && offset <= 0x0f && --this._rxGlitchIn === 0) {
+      value ^= this.quirks.rxDmaGlitch.xor;
+    }
+    this.lastBus = value;
+    return value;
+  }
+
+  _readRegRaw(offset) {
     if (offset === 0x00) return this.cr;
     if (offset === 0x10) return this.readData();
     if (offset === 0x1f) return this.readResetPort();
@@ -307,6 +354,14 @@ class Rtl8019 {
 
   writeReg(offset, value) {
     value &= 0xff;
+    this.lastBus = value;
+    const drop = this.quirks.regWriteDrop;
+    if (drop && offset <= 0x0f && (!drop.runningOnly || !this.stopped) &&
+        (drop.target === 'cr') === (offset === 0x00) &&
+        ++this._dropWrites % drop.everyN === 0) {
+      this.stats.droppedWrites = (this.stats.droppedWrites || 0) + 1;
+      return undefined;
+    }
     if (offset === 0x00) return this.writeCr(value);
     if (offset === 0x10) return this.writeData(value);
     if (offset === 0x1f) return this.writeResetPort(value);
@@ -433,6 +488,7 @@ class Rtl8019 {
     this.curr = nextPage;
     this.isr |= ISR_PRX;
     this.rxDelivered++;
+    if (this.quirks.rxDmaGlitch && !options.loopback) this._rxGlitchIn = this.quirks.rxDmaGlitch.afterReads;
   }
 }
 

@@ -98,6 +98,23 @@ code was 0.
                              // "did not throw" is the assertion.  Used to
                              // prove the driver only pulses that port on a
                              // card that reports the Realtek ID.
+    floatingBits: false,    // UM9003F-style read-back: page-2 reserved bits
+                             // and the undecoded page-0 ID offsets return
+                             // whatever the previous register cycle left on
+                             // the bus.  NICREG must call that benign.
+    regReadGlitch: null,    // { page, everyN, xor }: every Nth register read
+                             // on that page comes back with `xor` flipped --
+                             // a genuine marginal-bus fault.  NICREG must FAIL.
+    rxDmaGlitch: null,      // { afterReads, xor }: the Nth register read after
+                             // a frame was STORED comes back flipped -- a read
+                             // colliding with receive-buffer DMA on a host that
+                             // ignores IOCHRDY.  Rejected frames cause none, so
+                             // NICREG's deaf row stays clean and its live row
+                             // fails with withrx == badticks.
+    regWriteDrop: null,     // { target: 'cr'|'reg', everyN, runningOnly }:
+                             // every Nth write of that kind is never latched.
+                             // Real hardware dropped a "CR := page 0" on a
+                             // started chip and the next BNRY write hit PAR2.
   },
   config: { cfg0, cfg1, cfg2, cfg3, cfg4 }, // page-3 CONFIG raw bytes
   txError: true,             // or {attempts:[1,2]} to fail specific TXP attempts
@@ -167,6 +184,21 @@ pages **before** `EXIT` -- it is `false` (and not a bug) for any
    the address range (e.g. `libman13.asm`'s DLL loader legitimately
    `SETWIN3`s a scratch block there). Kept as an opt-in for a scenario
    that specifically wants to assert nothing else ever maps that range.
+
+### DSS console calls trash registers, as on real DSS
+
+`PUTCHAR` (`0x5B`) and `PCHARS` (`0x5C`) do **not** preserve registers on a
+real machine: `RST 0x10` saves nothing, both handlers load `B` with the
+shell colour, `C` with the BIOS function and `IY` with 0 before tailing
+into the BIOS line printer, and `PCHARS` also zeroes `D` and returns `HL`
+just past the string terminator (`Estex-DSS` `API/PutChar.asm`,
+`API/PChars.asm`). The model returns `A=0`, `B=0`, `C=0xE0`, `IY=0` from
+both, plus `DE=0` and the advanced `HL` from `PCHARS`. `B=0` is deliberate:
+it turns a `LD B,n` / `PRINT` / ... / `DJNZ` loop into 256 iterations, which
+no output assertion can miss. NICREG 0.3.18 shipped exactly that loop while
+the model still preserved everything; on hardware it printed 256 samples of
+stray memory. Keep a counter or pointer that must survive a print in
+memory, or load it after the print.
 
 Bugs the harness would have caught automatically, for reference: the
 `LISTEN` ACK off-by-one, the `WIN0COLD.RUN` `BC` clobber, and the

@@ -29,6 +29,7 @@ the same layout: usage syntax, options, examples, exit codes.
 | `TFTP.TXT`    | TFTP download with RFC 2348 blksize                  |
 | `ISAPROBE.TXT`| ISA bus troubleshooting and raw window inspection    |
 | `NICEEP.TXT`  | Read-only dump of a jumperless card's 93C46 EEPROM   |
+| `NICREG.TXT`  | Register read-stability test for a marginal ISA bus  |
 | `UNETRTL.TXT` | UNET DLL: TCP/UDP/DNS/ping, two channels, developer API |
 
 `UNETRTL.DLL` is for developers: it exposes the kit's network stack
