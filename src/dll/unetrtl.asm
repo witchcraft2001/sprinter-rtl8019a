@@ -1462,7 +1462,7 @@ F_PING
 	POP	BC				; timeout ms
 	LD	HL,TARGET_IP
 	LD	DE,TARGET_MAC
-	LD	A,32				; payload bytes (even, per CHECKSUM)
+	LD	A,32				; payload bytes
 	CALL	@ICMP.ECHO			; -> DE = tick-count RTT
 	JR	C,.fail
 	PUSH	DE

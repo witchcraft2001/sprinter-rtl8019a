@@ -156,6 +156,70 @@ for (const app of ['PING', 'PINGALT']) {
     assert.match(r.output, /\[E62\] ARP reply timeout/);
     checkCleanupClaimedPage(r);
   }
+  { // The timeout register dump must not take the chip offline.  PING keeps
+    // receiving after a lost echo, and SNAPSHOT_REGS used to select pages 1
+    // and 2 with STP: an STP->STA restart of the receiver in the middle of a
+    // session, which a strict DP8390 clone does not treat as a page switch.
+    // Same run with and without the lost echo: the dump adds no stop edges.
+    const edges = (drop) => {
+      const r = run(app, '-n 2 192.168.7.1', {
+        environment: { ...NET_ENV }, responders: { arp: arpAndIcmp.arp, icmp: { drop } },
+      });
+      assert.match(r.output, new RegExp(`Received = ${2 - drop}, Lost = ${drop}\\.`));
+      checkCleanupClaimedPage(r);
+      return r.card.stats.stopEdges;
+    };
+    assert.strictEqual(edges(1), edges(0), 'timeout diagnostics must not write CR.STP');
+  }
+  { // An ODD -l size is legal and must not hang.  UTIL.CHECKSUM stepped its
+    // byte count by two and tested it against zero, so an odd count sailed
+    // past zero and the loop ran away through memory -- with the ISA window
+    // open, which is how it reached the chip's data port.  RFC 1071 pads the
+    // final byte with a zero low half; both checksums must still verify.
+    const verify = (bytes) => {
+      let sum = 0;
+      for (let i = 0; i < bytes.length; i += 2) sum += (bytes[i] << 8) | (bytes[i + 1] || 0);
+      while (sum >>> 16) sum = (sum & 0xffff) + (sum >>> 16);
+      return sum;
+    };
+    for (const size of [1, 33, 255]) {
+      const r = run(app, `-n 1 -l ${size} 192.168.7.1`, {
+        environment: { ...NET_ENV }, responders: arpAndIcmp,
+      });
+      assert.strictEqual(r.exitCode, 0, `-l ${size}`);
+      assert.match(r.output, new RegExp(`bytes=${size} `));
+      const frame = Buffer.from(r.transmittedFrames[1], 'hex');
+      // Frames below the 60-byte Ethernet minimum are padded by SEND_FRAME.
+      assert.strictEqual(frame.length, Math.max(60, 42 + size), `-l ${size} frame length`);
+      assert.strictEqual(verify(frame.subarray(14, 34)), 0xffff, `-l ${size} IP checksum`);
+      assert.strictEqual(verify(frame.subarray(34, 42 + size)), 0xffff, `-l ${size} ICMP checksum`);
+      checkCleanupClaimedPage(r);
+    }
+    count();
+  }
+  { // Page 3 (CONFIG0/CONFIG3) exists only on a Realtek.  On a clone the
+    // TX path must not select or read it, and the timeout dump must say so
+    // instead of printing page-1 MAC bytes as a medium/duplex setting.
+    const clone = run(app, '-n 1 192.168.7.1', {
+      quirks: { variant: 'UM9003' },
+      environment: { ...NET_ENV, NET_RTL_HW: '1/#300' },
+      responders: { arp: arpAndIcmp.arp },
+    });
+    assert.strictEqual(clone.exitCode, 3);
+    // TPSR still comes from page 2, which every DP8390 has (PINGALT's
+    // alternate packet-RAM layout puts it at 46 rather than 40).
+    assert.match(clone.output, /PHY n\/a \(no page 3\) NCR=[0-9A-F]{2} TPSR=4[06]/);
+    assert.strictEqual(clone.card.stats.page3Reads, 0, 'no page-3 read on a clone');
+    checkCleanupClaimedPage(clone);
+
+    const realtek = run(app, '-n 1 192.168.7.1', {
+      environment: { ...NET_ENV }, responders: { arp: arpAndIcmp.arp },
+    });
+    assert.strictEqual(realtek.exitCode, 3);
+    assert.match(realtek.output, /PHY C0=[0-9A-F]{2}>[0-9A-F]{2} C3=/);
+    assert.ok(realtek.card.stats.page3Reads > 0, 'a genuine Realtek still gets the PHY capture');
+    checkCleanupClaimedPage(realtek);
+  }
   { // ARP resolves but no ICMP echo reply ever arrives
     const r = run(app, '-n 1 192.168.7.1', { environment: { ...NET_ENV }, responders: { arp: arpAndIcmp.arp } });
     assert.strictEqual(r.exitCode, 3);

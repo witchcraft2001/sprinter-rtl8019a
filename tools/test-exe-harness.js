@@ -172,6 +172,17 @@ for (const base of [0x200, 0x320, 0x3e0]) {
   assert.match(r.output, /\[E02\] RTL ID mismatch/);
   assert.match(r.output, /\[W02\]/);
   assert.match(r.output, /RESULT OK/);
+  // Page 3 is a Realtek extension: on a clone it is not decoded, so no
+  // MEDIA/POWER guesses and no medium/duplex/power warnings.
+  assert.match(r.output, /\[N6\] P3 N\/A: no Realtek ID, CONFIG not decoded/);
+  assert.doesNotMatch(r.output, /\[N7\]|\[N8\]|\[W0[345]\]/);
+  checkCleanup(r);
+}
+{ // a genuine RTL8019AS still gets the page-3 decode
+  const r = run('NICINFO', '');
+  assert.match(r.output, /\[N6\] P3 9346=/);
+  assert.match(r.output, /\[N7\] MODE=/);
+  assert.match(r.output, /\[N8\] POWER=/);
   checkCleanup(r);
 }
 { // ID mismatch AND an implausible (all-zero) MAC -> FAIL
@@ -297,6 +308,21 @@ const cloneHangs = {
   assert.match(r.output, /\[L5\] LOOP FIFO OK ISR=/);
   assert.match(r.output, /\[L6\] RX SRAM N\/A/);
   assert.match(r.output, /RESULT OK/);
+  checkCleanup(r);
+}
+{ // receive status posted 20 ms after PTX: the wait must catch it
+  const r = run('NICLB', '', { quirks: { loopbackToRing: false, loopbackStatusDelayMs: 20 } });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /\[L5\] LOOP FIFO OK ISR=04 RSR=01 TSR=01 FIFO=00 00 00 00 00 00 00 00\r?\n NIC fae=00 crc=00 mpc=00/);
+  assert.match(r.output, /RESULT OK/);
+  checkCleanup(r);
+}
+{ // UM9003F: PTX, then neither PRX nor RXE, only ISR.CNT.  The failure
+  // must show what the chip did report, not just the register dump.
+  const r = run('NICLB', '', { quirks: { loopbackToRing: false, loopbackSilent: true } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, /\[E23\] loopback produced neither PRX nor RXE in 50 ms\r?\n ISR=20 RSR=00 TSR=01 FIFO=00 00 00 00 00 00 00 00\r?\n NIC fae=00 crc=00 mpc=00\r?\nREGS /);
+  assert.match(r.output, /RESULT FAIL/);
   checkCleanup(r);
 }
 {

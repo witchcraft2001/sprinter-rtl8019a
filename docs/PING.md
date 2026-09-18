@@ -16,7 +16,7 @@ PING /?
 | `-m`     | Diagnostic: use IPv4 all-hosts multicast destination.  |
 | `-r`     | Diagnostic: reset/reinit NIC before each ICMP transmit. |
 | `-n N`   | Number of echo requests (default 4, max 255).          |
-| `-l N`   | Payload size in bytes (default 32, max 255).           |
+| `-l N`   | Payload size in bytes (default 32, max 255, odd sizes allowed). |
 | `-i TTL` | IP TTL on outgoing requests (default 64).              |
 | `-w MS`  | Per-reply wait timeout in milliseconds (default 4000). |
 | `target` | Destination IPv4 or hostname.                          |
@@ -88,6 +88,14 @@ On the affected physical card, v0.2.10 measured stable
 `C0=08>08 C3=70>70 NCR=00`: UTP stayed selected but FUDUP remained enabled.
 A changed `C0` would instead indicate TP/CX auto-detect switching away from
 UTP while the frame is sent.
+
+Page 3 is a Realtek extension.  On a chip that does not report the
+Realtek ID the driver does not select or read it at all, and the line
+reads `PHY n/a (no page 3) NCR=xx TPSR=xx` instead.  A UMC UM9003
+answers page-3 reads with a copy of page 1, so the old unconditional
+capture printed MAC bytes (`C0=95 C3=3D`) dressed up as a medium and
+duplex setting.  `NCR` and `TPSR` come from pages 0 and 2, which every
+DP8390 has, so they are still shown.
 
 ## The `NIC` line: what the card threw away
 

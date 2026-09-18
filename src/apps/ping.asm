@@ -783,7 +783,7 @@ BUILD_ICMP_ECHO
 	LD	(TX_BUF + 14 + 11),A
 
 	; ICMP checksum over TX_BUF+34, length = ICMP_HDR_LEN + payload.
-	; Must be even length for CHECKSUM; payload sizes default to even.
+	; An odd -l size is fine: CHECKSUM zero-pads the final byte.
 	PUSH	IX
 	LD	IX,TX_BUF + 14 + IP_HDR_LEN
 	LD	A,(PAYLOAD_LEN)
@@ -1356,6 +1356,13 @@ PRINT_TX_DIAG
 	LD	HL,(RTL_TX_LAST_CLDA)
 	CALL	@UTIL.PRINT_HEX_HL
 	PRINT	LINE_END
+	; CONFIG0/CONFIG3 come from Realtek's page 3, which a DP8390 clone
+	; does not have: a UM9003 answers there with page 1, so the figures
+	; would be MAC bytes pretending to be a medium/duplex setting.  The
+	; driver does not read them on such a chip; say so instead.
+	LD	A,(RTL_CHIP_KIND)
+	CP	RTL_CHIP_CLONE
+	JR	Z,.PHY_NA
 	PRINT	MSG_TX_PHY
 	LD	A,(RTL_TX_CFG0_PRE)
 	CALL	@UTIL.PRINT_HEX_A
@@ -1370,6 +1377,10 @@ PRINT_TX_DIAG
 	CALL	PUTCHAR
 	LD	A,(RTL_TX_CFG3_POST)
 	CALL	@UTIL.PRINT_HEX_A
+	JR	.PHY_DONE
+.PHY_NA
+	PRINT	MSG_TX_PHY_NA
+.PHY_DONE
 	PRINT	MSG_TX_NCR
 	LD	A,(RTL_TX_LAST_NCR)
 	CALL	@UTIL.PRINT_HEX_A
@@ -1743,6 +1754,7 @@ MSG_TX_TSR	DB " TSR=",0
 MSG_TX_CR	DB " CR=",0
 MSG_TX_CLDA	DB " CLDA=",0
 MSG_TX_PHY	DB "PHY C0=",0
+MSG_TX_PHY_NA	DB "PHY n/a (no page 3)",0
 MSG_TX_CFG3	DB " C3=",0
 MSG_TX_NCR	DB " NCR=",0
 MSG_TX_TPSR	DB " TPSR=",0

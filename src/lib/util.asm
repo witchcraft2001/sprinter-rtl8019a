@@ -275,12 +275,19 @@ PARSE_HEX_BYTE
 ; Internet checksum (RFC 1071): one's-complement sum of
 ; 16-bit BE words, complemented.
 ;
-; In:  IX = buffer pointer, BC = byte count (must be even).
+; In:  IX = buffer pointer, BC = byte count.  An ODD count is
+;      legal: RFC 1071 pads the final byte with a zero low half.
 ;      The buffer is read in BIG-ENDIAN order: (IX+0) is high,
 ;      (IX+1) is low of the first 16-bit word.
 ; Out: HL = ~accumulator. Store as `H, L` to get the 16-bit
 ;      checksum in BIG-ENDIAN bytes.
 ; Trashes: A, BC, DE, IX.
+;
+; The count used to be stepped by two and tested against zero, so an
+; odd count sailed past it and the loop ran forever -- walking IX
+; through all of memory, with the ISA window open in PING's case.
+; `PING -l 33` hung the machine that way; the count is now consumed
+; one byte at a time so an odd tail simply ends the loop.
 ; ------------------------------------------------------
 CHECKSUM
 	LD	HL,0
@@ -289,19 +296,23 @@ CHECKSUM
 	OR	C
 	JR	Z,.DONE
 	LD	D,(IX+0)
-	LD	E,(IX+1)
 	INC	IX
+	DEC	BC
+	LD	E,0			; zero pad, in case this is the odd tail
+	LD	A,B
+	OR	C
+	JR	Z,.ADD
+	LD	E,(IX+0)
 	INC	IX
+	DEC	BC
+.ADD
 	ADD	HL,DE
-	JR	NC,.NC
+	JR	NC,.LP
 	INC	HL			; end-around carry
 	LD	A,H
 	OR	L
-	JR	NZ,.NC
+	JR	NZ,.LP
 	INC	HL
-.NC
-	DEC	BC
-	DEC	BC
 	JR	.LP
 .DONE
 	LD	A,H

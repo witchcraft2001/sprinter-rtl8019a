@@ -133,6 +133,17 @@ RTL_SOFT_RESET	EQU LIBBSS_BASE + 0x139	; 1 byte
 RTL_RESET_HARD	EQU 0
 RTL_RESET_SOFT	EQU 1
 RTL_RESET_AUTO	EQU 2
+; RTL_CHIP_KIND: what RTL.RESET's ID probe found, cached for the rest
+; of the session.  Separate from RTL_SOFT_RESET on purpose: that one is
+; a policy the user can force through NET.CFG, this one is a property of
+; the silicon.  Page 3 (9346CR, CONFIG0..4) is a Realtek extension --
+; a UM9003 answers there with a copy of page 1 -- so the TX path's PHY
+; capture is skipped on a clone.  Same 0x139..0x13F gap, so LIBBSS_SIZE
+; and every literal BSS offset in src/dll/unetrtl.asm stay unchanged.
+RTL_CHIP_KIND	EQU LIBBSS_BASE + 0x13A	; 1 byte
+RTL_CHIP_UNKNOWN EQU 0			; not probed (UNETRTL.DLL: always)
+RTL_CHIP_REALTEK EQU 1			; page-0 8019ID0/ID1 read 'Pp'
+RTL_CHIP_CLONE	EQU 2			; anything else: no page 3
 RTL_TX_VERIFY_BUF	EQU LIBBSS_BASE + 0x140	; 42 bytes read back from NIC packet RAM
 RTL_TX_VERIFY_SIZE	EQU 42
 RTL_TX_LAST_CLDA	EQU LIBBSS_BASE + 0x16A	; 2 bytes, page-0 CLDA0/1 after TX

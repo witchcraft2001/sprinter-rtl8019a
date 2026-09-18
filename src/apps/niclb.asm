@@ -12,6 +12,13 @@
 ; Acceptance: PTX plus either MAME RX-ring payload match, or
 ; real-chip FIFO loopback status. External RX SRAM is tested
 ; separately by NICRX.EXE.
+;
+; The receive status is polled for LOOP_WAIT_MS rather than read
+; once, and a failure prints what the chip DID report (ISR, RSR,
+; TSR, FIFO, tally counters).  An early UMC UM9003F answers PTX
+; with neither PRX nor RXE and raises only ISR.CNT, while the
+; UM9003AF passes; without these values the two cannot be told
+; apart from a screenshot.
 ; ======================================================
 
 EXE_VERSION		EQU 1		; DSS executable format version, not app version
@@ -27,10 +34,12 @@ EXE_VERSION		EQU 1		; DSS executable format version, not app version
 	DEFINE USE_RTL_INIT_LOOPBACK
 	DEFINE USE_RTL_SEND_FRAME
 	DEFINE USE_RTL_WAIT_PTX
+	DEFINE USE_RTL_SNAPSHOT_TALLY	; tally counters around the loop
 
 ; -- frame layout in TX_BUF --
 FRAME_LEN	EQU 60			; min Ethernet frame, no FCS
 ETH_TYPE	EQU 0x88B5		; experimental EtherType per spec stage 4
+LOOP_WAIT_MS	EQU 50			; receive-status wait after PTX
 
 	MODULE MAIN
 
@@ -75,6 +84,10 @@ START
 	LD	HL,TEST_MAC
 	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.INIT_LOOPBACK
+	; Read-to-clear the tally counters (and ISR.CNT) so the values
+	; printed after the loop belong to this one frame.
+	LD	HL,TALLY_BUF
+	CALL	@RTL.SNAPSHOT_TALLY
 	CALL	@ISA.ISA_CLOSE
 	PRINTLN MSG_OK
 
@@ -105,11 +118,28 @@ START
 	; PRX and writes RX SRAM.  Real RTL8019AS does not store loopback
 	; frames in SRAM; it exposes the tail in FIFO and, for this test
 	; shape, reports RXE after the already-confirmed PTX.
+	; The status is polled: a clone may post it later than PTX.  The
+	; window is closed across each 1 ms delay (ISA discipline).
 	PRINT MSG_L5
+	LD	B,LOOP_WAIT_MS
+.WAIT_STATUS
+	PUSH	BC
 	CALL	@ISA.ISA_OPEN
 	LD	IX,(RTL_BASE_PTR)
 	LD	A,(IX+RTL_ISR_OFF)
 	LD	(LOOP_ISR),A
+	POP	BC
+	AND	ISR_PRX | ISR_RXE
+	JR	NZ,.STATUS_SEEN
+	DEC	B
+	JR	Z,.STATUS_SEEN		; timed out, window still open
+	PUSH	BC
+	CALL	@ISA.ISA_CLOSE
+	CALL	@UTIL.DELAY_1MS
+	POP	BC
+	JR	.WAIT_STATUS
+.STATUS_SEEN
+	LD	A,(LOOP_ISR)
 	AND	ISR_PRX
 	JP	NZ,.LOOP_SRAM
 	LD	A,(IX+RTL_RSR_OFF)
@@ -121,26 +151,16 @@ START
 	LD	(HL),A
 	INC	HL
 	DJNZ	.FIFO_READ
+	LD	HL,TALLY_BUF
+	CALL	@RTL.SNAPSHOT_TALLY
 	LD	A,(LOOP_ISR)
 	AND	ISR_RXE
 	JP	Z,PRX_OPEN_FAIL
+	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_ISR_OFF),ISR_RXE
 	CALL	@ISA.ISA_CLOSE
 	PRINT	MSG_FIFO_OK
-	LD	A,(LOOP_ISR)
-	CALL	@UTIL.PRINT_HEX_A
-	PRINT	MSG_RSR_EQ
-	LD	A,(LOOP_RSR)
-	CALL	@UTIL.PRINT_HEX_A
-	PRINT	MSG_FIFO_EQ
-	LD	HL,FIFO_BUF
-	LD	B,8
-.FIFO_PRINT
-	LD	A,(HL)
-	CALL	@UTIL.PRINT_HEX_A
-	INC	HL
-	DJNZ	.FIFO_PRINT
-	PRINT	LINE_END
+	CALL	PRINT_LOOP_DIAG
 	PRINTLN MSG_L6_NA
 	PRINTLN MSG_L7_NA
 	PRINTLN MSG_L8_NA
@@ -236,6 +256,8 @@ PRX_OPEN_FAIL
 PRX_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_PRX
+	PRINT	MSG_LOOP_INDENT
+	CALL	PRINT_LOOP_DIAG
 	JP	FAIL_CAPTURED
 
 READ_OPEN_FAIL
@@ -364,6 +386,52 @@ PUTCHAR
 	RET
 
 
+; ------------------------------------------------------
+; PRINT_LOOP_DIAG: what the receive side reported after PTX.
+;   "ISR=xx RSR=xx TSR=xx FIFO=xx xx xx xx xx xx xx xx"
+;   " NIC fae=xx crc=xx mpc=xx"
+; ISR is the value the wait loop ended on, TSR the one WAIT_PTX
+; captured at completion, the counters this frame's delta.
+; ------------------------------------------------------
+PRINT_LOOP_DIAG
+	PRINT	MSG_ISR_EQ
+	LD	A,(LOOP_ISR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_RSR_EQ
+	LD	A,(LOOP_RSR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_TSR_EQ
+	LD	A,(RTL_TX_LAST_TSR)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_FIFO_EQ
+	LD	HL,FIFO_BUF
+	LD	B,8
+.FIFO
+	LD	A,(HL)
+	CALL	@UTIL.PRINT_HEX_A
+	INC	HL
+	DEC	B
+	JR	Z,.FIFO_DONE
+	PUSH	HL			; DSS output does not preserve HL
+	LD	A,' '
+	CALL	PUTCHAR
+	POP	HL
+	JR	.FIFO
+.FIFO_DONE
+	PRINT	LINE_END
+	PRINT	MSG_NIC_FAE
+	LD	A,(TALLY_BUF + 0)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_NIC_CRC
+	LD	A,(TALLY_BUF + 1)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	MSG_NIC_MPC
+	LD	A,(TALLY_BUF + 2)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT	LINE_END
+	RET
+
+
 PRINT_REG_DUMP
 	PRINT MSG_REGS
 	LD	HL,REG_NAMES
@@ -422,9 +490,15 @@ MSG_L3		DB "[L3] WRITE TX ",0
 MSG_L4_OK	DB "[L4] PTX OK",0
 MSG_L5		DB "[L5] LOOP ",0
 MSG_SRAM_OK	DB "SRAM OK",0
-MSG_FIFO_OK	DB "FIFO OK ISR=",0
+MSG_FIFO_OK	DB "FIFO OK ",0
+MSG_LOOP_INDENT	DB " ",0
+MSG_ISR_EQ	DB "ISR=",0
 MSG_RSR_EQ	DB " RSR=",0
+MSG_TSR_EQ	DB " TSR=",0
 MSG_FIFO_EQ	DB " FIFO=",0
+MSG_NIC_FAE	DB " NIC fae=",0
+MSG_NIC_CRC	DB " crc=",0
+MSG_NIC_MPC	DB " mpc=",0
 MSG_L6		DB "[L6] RX HDR",0
 MSG_STS_EQ	DB " STS=",0
 MSG_NEXT_EQ	DB " NEXT=",0
@@ -439,7 +513,7 @@ MSG_RESULT_OK	DB "RESULT OK",0
 MSG_RESULT_FAIL	DB "RESULT FAIL",0
 MSG_E_RESET	DB "[E20] RESET timeout",0
 MSG_E_WRITE	DB "[E21] DMA write or PTX timeout",0
-MSG_E_PRX	DB "[E23] loopback produced neither PRX nor RXE",0
+MSG_E_PRX	DB "[E23] loopback produced neither PRX nor RXE in 50 ms",0
 MSG_E_READ	DB "[E24] DMA read timeout",0
 MSG_E_STS	DB "[E25] RX status mismatch, got STS=",0
 MSG_E_LEN	DB "[E26] RX len mismatch, got LEN=",0
@@ -458,13 +532,17 @@ NICLB_IMAGE_END
 
 	MODULE MAIN
 
-TX_BUF		EQU NICLB_IMAGE_END
+; Not right after the image: DSS scribbles on the 0x9xxx area while
+; printing on real hardware (NICINFO lost a captured byte at 0x910F
+; that way), and these values are printed across many DSS calls.
+TX_BUF		EQU APP_BSS_BASE
 RX_HDR		EQU TX_BUF + FRAME_LEN
 RX_BUF		EQU RX_HDR + 4
 FIFO_BUF	EQU RX_BUF + FRAME_LEN	; 8-byte real-chip diagnostic FIFO capture
 LOOP_ISR	EQU FIFO_BUF + 8
 LOOP_RSR	EQU LOOP_ISR + 1
-NICLB_BSS_END	EQU LOOP_RSR + 1
+TALLY_BUF	EQU LOOP_RSR + 1	; CNTR0..2 + RSR from SNAPSHOT_TALLY
+NICLB_BSS_END	EQU TALLY_BUF + 4
 
 	ENDMODULE
 

@@ -53,6 +53,12 @@ class Rtl8019 {
       isrRstOnStop: quirks.isrRstOnStop === true, // real HW: true; MAME default: false
       openBusValue: quirks.openBusValue !== undefined ? quirks.openBusValue : 0xff,
       hangOnResetPort: quirks.hangOnResetPort === true, // UM9003-style clone
+      // Early UMC UM9003F (measured 2026-09-17): internal loopback completes
+      // PTX but the receive side posts neither PRX nor RXE and leaves the
+      // ring alone; only ISR.CNT appears.
+      loopbackSilent: quirks.loopbackSilent === true,
+      // FIFO-path loopback whose RXE lands this many ms after PTX.
+      loopbackStatusDelayMs: quirks.loopbackStatusDelayMs || 0,
     };
     this.promLayout = scenario.promLayout || 'direct';
     this.prom = buildProm(this.mac, this.promLayout, scenario.promSignature);
@@ -116,7 +122,7 @@ class Rtl8019 {
     this.transmitted = []; // frames that actually left the wire
     this.txAttempts = 0;
     this.rxDelivered = 0;
-    this.stats = { filteredRx: 0, oobDma: 0, overflowEvents: 0 };
+    this.stats = { filteredRx: 0, oobDma: 0, overflowEvents: 0, stopEdges: 0, page3Reads: 0 };
     this._dmaByteIndex = 0;
 
     // Scheduled RX delivery: preloaded scenario.rxFrames plus anything a
@@ -179,6 +185,7 @@ class Rtl8019 {
     this.cr = value;
     const stp = !!(value & 0x01), sta = !!(value & 0x02), txp = !!(value & 0x04);
     if (stp) {
+      if (!this.stopped) this.stats.stopEdges++; // running -> offline
       this.stopped = true;
       if (this.quirks.isrRstOnStop) this.isr |= ISR_RST;
     } else if (sta && this.stopped) {
@@ -281,7 +288,9 @@ class Rtl8019 {
         default: return 0xff;
       }
     }
-    // page 3
+    // page 3 -- a Realtek extension; a DP8390 clone has none, so the
+    // driver must not read here once it knows the chip is not a Realtek.
+    this.stats.page3Reads++;
     switch (offset) {
       case 0x01: return this.cr9346;
       case 0x02: return this.bpage;
@@ -356,10 +365,16 @@ class Rtl8019 {
     if (loopbackActive) {
       if (this.quirks.loopbackToRing) {
         this.deliverFrame(frame, { loopback: true });
+      } else if (this.quirks.loopbackSilent) {
+        this.isr |= ISR_CNT;
       } else {
-        this.isr |= ISR_RXE;
-        this.rsr = 0x01;
-        this.fifo = frame.length ? frame[frame.length - 1] : 0;
+        const post = () => {
+          this.isr |= ISR_RXE;
+          this.rsr = 0x01;
+          this.fifo = frame.length ? frame[frame.length - 1] : 0;
+        };
+        if (this.quirks.loopbackStatusDelayMs) this.scheduleCallback(this.quirks.loopbackStatusDelayMs, post);
+        else post();
       }
     } else {
       this.transmitted.push(frame);

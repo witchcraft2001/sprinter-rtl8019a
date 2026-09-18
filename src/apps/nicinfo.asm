@@ -194,6 +194,7 @@ START
 	; setting or TP/CX fallback can lose frames even though TSR reports
 	; PTX success.  Capture happened above while ISA was open; all
 	; formatting is deliberately done with the system mapping restored.
+	; Realtek chips only -- see CHIP_IS_RTL.
 	CALL	PRINT_PAGE3
 
 	; -- determine RESULT --
@@ -636,11 +637,33 @@ PRINT_REG_DUMP
 
 
 ; ------------------------------------------------------
+; CHIP_IS_RTL: ZF=1 when PROBE_ID read the Realtek 'Pp' ID.
+;
+; Page 3 (9346CR, CONFIG0..4) is a Realtek extension.  A DP8390
+; clone has no such page: a UM9003F answers with a copy of page 1,
+; so CONFIG0..3 come back as MAC bytes 2..5 and decode into a
+; convincing MEDIA=BNC / POWER=SLEEP / "not UTP" that sends the
+; user after jumpers for nothing (measured 2026-09-17).
+; Trashes A.
+; ------------------------------------------------------
+CHIP_IS_RTL
+	LD	A,(@RTL.ID0_RAW)
+	CP	RTL_ID0_VAL
+	RET	NZ
+	LD	A,(@RTL.ID1_RAW)
+	CP	RTL_ID1_VAL
+	RET
+
+
+; ------------------------------------------------------
 ; CAPTURE_PAGE3: read the RTL8019AS-specific configuration
 ; registers.  Caller has the ISA window open.  No DSS/BIOS calls.
 ; The common driver remains in normal page 0/start state on return.
+; Needs PROBE_ID first; a non-Realtek chip is not touched.
 ; ------------------------------------------------------
 CAPTURE_PAGE3
+	CALL	CHIP_IS_RTL
+	RET	NZ
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE3_START
 	LD	A,(IX+RTL_9346CR_OFF)
@@ -667,6 +690,11 @@ CAPTURE_PAGE3
 ; NICINFO result: it may be intentional on another board/network.
 ; ------------------------------------------------------
 PRINT_PAGE3
+	CALL	CHIP_IS_RTL
+	JR	Z,.REALTEK
+	PRINTLN	MSG_N6_NA
+	RET
+.REALTEK
 	PRINT	MSG_N6
 	LD	A,(P3_9346)
 	CALL	@UTIL.PRINT_HEX_A
@@ -839,6 +867,7 @@ MSG_DOUBLED	DB "doubled",0
 MSG_UNKNOWN	DB "unknown",0
 MSG_N5		DB "[N5] REG RAW ",0
 MSG_N6		DB "[N6] P3 9346=",0
+MSG_N6_NA	DB "[N6] P3 N/A: no Realtek ID, CONFIG not decoded",0
 MSG_CFG0	DB " C0=",0
 MSG_CFG1	DB " C1=",0
 MSG_CFG2	DB " C2=",0

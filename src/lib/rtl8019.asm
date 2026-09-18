@@ -116,6 +116,9 @@ INIT_BASE
 	XOR	A
 	LD	(RTL_RX_OVW_COUNT),A
 	LD	(RTL_TX_FAIL_COUNT),A
+	IFNDEF	UNET_DLL
+	LD	(RTL_CHIP_KIND),A	; RTL_CHIP_UNKNOWN until RESET probes
+	ENDIF
 	LD	A,RCR_AB		; sane default until INIT_NORMAL runs
 	LD	(RTL_RCR_SHADOW),A
 	IFDEF	RTL_SOFT_RESET_SUPPORTED
@@ -686,6 +689,16 @@ RESET
 	OR	A
 	JR	NZ,.SOFT
 	ELSE
+	; Identify the chip on every reset, whatever the reset policy is.
+	; AUTO needs the answer to decide about BASE+0x1F, and the TX path
+	; needs it to decide whether page 3 exists at all -- and a user who
+	; forces RTL_RESET=SOFT on a genuine Realtek must not lose the
+	; page-3 PHY diagnostics as a side effect.  IS_REALTEK only stops
+	; the core and reads two page-0 registers; it never touches the
+	; board reset port, so it is safe on the clones that stall there.
+	PUSH	AF
+	CALL	IS_REALTEK		; records RTL_CHIP_KIND
+	POP	AF
 	DEC	A
 	JR	Z,.SOFT			; RTL_RESET_SOFT: forced
 	DEC	A
@@ -696,9 +709,10 @@ RESET
 	; itself before going anywhere near that port.  Resolve once and
 	; write the answer back: later RESET calls skip the probe, and
 	; NICINFO/NETCFG can report which path the card actually took.
-	CALL	IS_REALTEK
+	LD	A,(RTL_CHIP_KIND)
+	CP	RTL_CHIP_REALTEK
 	LD	A,RTL_RESET_SOFT
-	JR	C,.AUTO_SOFT
+	JR	NZ,.AUTO_SOFT
 	LD	A,RTL_RESET_HARD
 	LD	(RTL_SOFT_RESET),A
 	JR	.HARD
@@ -785,6 +799,8 @@ RESET
 ; Trashes A, BC, DE, HL.  IX preserved.
 ; ------------------------------------------------------
 IS_REALTEK
+	LD	A,RTL_CHIP_CLONE	; assume clone until both ID bytes match
+	LD	(RTL_CHIP_KIND),A
 	LD	HL,(RTL_BASE_PTR)
 	LD	(HL),CR_PAGE0_STOP
 	LD	DE,RTL_ID0_OFF
@@ -800,6 +816,8 @@ IS_REALTEK
 	LD	A,(HL)
 	CP	RTL_ID1_VAL
 	JR	NZ,.NO
+	LD	A,RTL_CHIP_REALTEK
+	LD	(RTL_CHIP_KIND),A
 	OR	A			; CF=0
 	RET
 .NO
@@ -855,14 +873,17 @@ SNAPSHOT_REGS
 	LD	(REG_SNAPSHOT+1),A
 	LD	A,(IX+RTL_BNRY_OFF)
 	LD	(REG_SNAPSHOT+8),A
-	; Page 1 read (CURR).
-	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
+	; Page 1 read (CURR).  Page selects keep STA: this runs mid-session
+	; after a timeout, and an STP write takes the chip offline -- it
+	; aborts a frame being received and, on strict DP8390 clones, the
+	; STP->STA edge is a receiver restart, not a harmless page switch.
+	LD	(IX+RTL_CR_OFF),CR_PAGE1_START
 	LD	A,(IX+RTL_CURR_OFF)
 	LD	(REG_SNAPSHOT+9),A
 	; Page 2 provides the actual readable values for the page-0
 	; write-side configuration registers.  Read hardware, not software
 	; shadows, so a lost/corrupt write remains visible in diagnostics.
-	LD	(IX+RTL_CR_OFF),CR_PAGE2_STOP
+	LD	(IX+RTL_CR_OFF),CR_PAGE2_START
 	LD	A,(IX+RTL_DCR_OFF)
 	LD	(REG_SNAPSHOT+2),A
 	LD	A,(IX+RTL_RCR_OFF)
@@ -1946,10 +1967,28 @@ CAPTURE_TX_PHY_PRE
 	LD	IX,(RTL_BASE_PTR)
 	; Page 2 exposes the write-only-on-page-0 TPSR value.  Capture it at
 	; the exact TX boundary so PTX cannot hide transmission from a stale or
-	; corrupted packet-RAM page.
+	; corrupted packet-RAM page.  Page 2 is plain DP8390, so this part runs
+	; on every chip.
 	LD	(IX+RTL_CR_OFF),CR_PAGE2_START
 	LD	A,(IX+RTL_TPSR_OFF)
 	LD	(TX_LAST_TPSR),A
+	; The CONFIG registers below live on Realtek's page 3.  A DP8390
+	; clone has no such page -- a UM9003 mirrors page 1 there, so the
+	; "PHY" figures would be MAC bytes -- and the caller already marked
+	; them invalid (0xFF) for the app to print as n/a.  Nothing is read
+	; and no page is selected on such a chip; page 0 is restored first
+	; because this is an early exit out of the page-2 read above.
+	; UNETRTL.DLL has no ID probe (image budget), so it keeps the
+	; unconditional capture -- and stays byte-identical to its last
+	; build, which this arrangement of the guard preserves.
+	IFNDEF	UNET_DLL
+	LD	A,(RTL_CHIP_KIND)
+	CP	RTL_CHIP_CLONE
+	JR	NZ,.HAVE_PAGE3
+	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	RET
+.HAVE_PAGE3
+	ENDIF
 	LD	(IX+RTL_CR_OFF),CR_PAGE3_START
 	LD	A,(IX+RTL_CONFIG0_OFF)
 	LD	(TX_CFG0_PRE),A
@@ -1959,6 +1998,11 @@ CAPTURE_TX_PHY_PRE
 	RET
 
 CAPTURE_TX_PHY_POST
+	IFNDEF	UNET_DLL
+	LD	A,(RTL_CHIP_KIND)	; page 3 is Realtek-only, see _PRE
+	CP	RTL_CHIP_CLONE
+	RET	Z
+	ENDIF
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE3_START
 	LD	A,(IX+RTL_CONFIG0_OFF)
