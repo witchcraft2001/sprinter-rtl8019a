@@ -44,7 +44,7 @@ that disappears at 7 MHz is a bus-timing fault.
 ## Output
 
 ```
-RTL8019AS NICREG v0.3.19
+RTL8019AS NICREG v0.3.20
 [G0] Slot/Addr: 0/#300 chip=clone
 [G1] RW STORAGE stopped, 14 regs x 2048 reads
  bad after-00=0000 after-FF=0000 cond=0000
@@ -229,7 +229,12 @@ capture filter:  ether proto 0x88b5
 display filter:  eth.type == 0x88b5
 ```
 
-and count the frames per mode letter.  `B` arriving in full while `A`
+The source address is NICREG's own test address, **not the card's MAC**,
+and the destination is broadcast: a capture filter on the card's MAC or on
+an IP address (`ether host ...`, `host ...`) hides every one of these
+frames.  Filter on the EtherType, or do not filter at all.
+
+Count the frames per mode letter.  `B` arriving in full while `A`
 loses frames means that accessing the chip during a transmission disturbs
 it.  All three modes losing the same share means the loss is not caused by
 how the driver talks to the chip.

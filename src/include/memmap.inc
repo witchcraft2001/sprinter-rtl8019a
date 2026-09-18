@@ -144,6 +144,14 @@ RTL_CHIP_KIND	EQU LIBBSS_BASE + 0x13A	; 1 byte
 RTL_CHIP_UNKNOWN EQU 0			; not probed (UNETRTL.DLL: always)
 RTL_CHIP_REALTEK EQU 1			; page-0 8019ID0/ID1 read 'Pp'
 RTL_CHIP_CLONE	EQU 2			; anything else: no page 3
+; RTL_BNRY_SHADOW: the driver's own copy of BNRY.  The receive path
+; reads the ring position from here, never from the chip: a missed
+; ISA read cycle returns a stray value (NICREG saw ring page numbers
+; leak into unrelated reads), and an in-range stray BNRY sent
+; READ_PACKET to the wrong page.  The chip register is still written
+; on every commit -- it is what keeps the receive DMA off unread
+; frames.  Same 0x139..0x13F gap, LIBBSS_SIZE unchanged.
+RTL_BNRY_SHADOW	EQU LIBBSS_BASE + 0x13B	; 1 byte
 RTL_TX_VERIFY_BUF	EQU LIBBSS_BASE + 0x140	; 42 bytes read back from NIC packet RAM
 RTL_TX_VERIFY_SIZE	EQU 42
 RTL_TX_LAST_CLDA	EQU LIBBSS_BASE + 0x16A	; 2 bytes, page-0 CLDA0/1 after TX

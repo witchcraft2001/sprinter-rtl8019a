@@ -63,7 +63,6 @@ G4_WR_REGS	EQU 4			; MAR0..3: on a wrong page these offsets
 					; are RSAR/RBCR, harmless without a DMA command
 G4_WSAMPLES	EQU 4			; failed writes kept verbatim per row
 	ASSERT G4_TICKS * G4_ITER * G4_WR_REGS == 192000
-CR_VERIFY_MASK	EQU 0xC3		; page select + STA/STP
 TX_FRAMES	EQU 20
 TX_GAP_MS	EQU 10
 PTX_POLLS	EQU 16000

@@ -181,6 +181,9 @@ CR_PAGE2_STOP	EQU 0xA1	; page 2, stop, DMA abort
 CR_PAGE2_START	EQU 0xA2	; page 2, start, DMA abort
 CR_PAGE3_STOP	EQU 0xE1	; page 3, stop, DMA abort
 CR_PAGE3_START	EQU 0xE2	; page 3, start, DMA abort
+; CR bits a page-select write must read back unchanged: page select
+; plus STA/STP.  RD2 and TXP are excluded -- both clear on their own.
+CR_VERIFY_MASK	EQU 0xC3
 
 ; Remote DMA commands (low 6 bits, OR with page select bits if needed).
 ; All include STA so the chip stays running.

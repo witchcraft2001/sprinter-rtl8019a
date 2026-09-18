@@ -105,6 +105,20 @@ port stalls the ISA bus cycle on this card and would freeze the machine.
 `docs/HOWTO.md` covers the explicit overrides, and `docs/ISAPROBE.md`
 what to do when a card is not found at all.
 
+**Never select page 3 on a chip that did not answer the Realtek ID
+probe, least of all next to a transmit.** Page 3 is a Realtek
+extension; a UM9003 mirrors page 1 there instead of exposing PHY
+config registers, so reading it returns MAC bytes, not a medium/duplex
+state (see `docs/PING.md`). Worse, on a UMC UM9003F the pre-v0.3.19
+driver selected page 3 immediately before the TXP write and again
+after PTX as part of `CAPTURE_TX_PHY_PRE`/`_POST`, and that stray page
+switch cost 17-27% of transmitted frames outright -- the chip reported
+`PTX`/`TSR=03`, but a capture on the target never saw the frame at
+all. Confirmed by an A/B on the same card, cable and evening: the old
+`PING.EXE` kept losing, v0.3.19 (page-3 capture gated on `RTL_CHIP_KIND
+= RTL_CHIP_REALTEK`, see `IS_REALTEK`/`CAPTURE_TX_PHY_PRE` in
+`src/lib/rtl8019.asm`) sent 20/20, and v0.3.20 sent 50/50.
+
 ## Installing on Sprinter DSS
 
 The `distr/sprinter-rtl8019a.zip` archive and the FAT12 floppy image both

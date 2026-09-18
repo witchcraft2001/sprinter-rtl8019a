@@ -59,7 +59,8 @@ class Rtl8019 {
       // as following the bus, not as unstable reads.
       floatingBits: quirks.floatingBits === true,
       // Genuine marginal-bus fault: every Nth register read on `page` comes
-      // back with `xor` flipped.  { page, everyN, xor }.  NICREG must FAIL.
+      // back with `xor` flipped.  { page, everyN, xor, offset? } -- offset
+      // narrows it to one register.  NICREG must FAIL.
       regReadGlitch: quirks.regReadGlitch || null,
       // Register read colliding with receive-buffer DMA: the Nth register
       // read after a frame was stored comes back with `xor` flipped.
@@ -69,7 +70,12 @@ class Rtl8019 {
       // is dropped.  { target: 'cr' | 'reg', everyN, runningOnly }.  Seen on
       // real hardware with a started chip: a dropped "CR := page 0" sent the
       // following BNRY write into PAR2.  NICREG must count these and keep
-      // its own page switches safe.
+      // its own page switches safe.  pageSwitchOnly limits a 'cr' drop to
+      // plain page selects (STA + abort DMA, no TXP, no remote-DMA start):
+      // the class the driver reads back.  A lost remote-DMA start or TXP
+      // is caught by the RDC/PTX timeouts instead, and the model's strict
+      // data-port checks would stop the run on it.  offset and value narrow
+      // the drop to one register write, limit caps the number of drops.
       regWriteDrop: quirks.regWriteDrop || null,
       // Early UMC UM9003F (measured 2026-09-17): internal loopback completes
       // PTX but the receive side posts neither PRX nor RXE and leaves the
@@ -278,7 +284,8 @@ class Rtl8019 {
       if (page === 0 && (offset === 0x0a || offset === 0x0b)) value = previous;
     }
     const glitch = this.quirks.regReadGlitch;
-    if (glitch && page === glitch.page && offset >= 0x01 && offset <= 0x0f) {
+    if (glitch && page === glitch.page && offset >= 0x01 && offset <= 0x0f &&
+        (glitch.offset === undefined || offset === glitch.offset)) {
       if (++this._glitchReads % glitch.everyN === 0) value ^= glitch.xor;
     }
     // A host register read that lands in the chip's own receive-buffer DMA
@@ -358,6 +365,10 @@ class Rtl8019 {
     const drop = this.quirks.regWriteDrop;
     if (drop && offset <= 0x0f && (!drop.runningOnly || !this.stopped) &&
         (drop.target === 'cr') === (offset === 0x00) &&
+        (!drop.pageSwitchOnly || (value & 0x3f) === 0x22) &&
+        (drop.offset === undefined || offset === drop.offset) &&
+        (drop.value === undefined || value === drop.value) &&
+        (drop.limit === undefined || (this.stats.droppedWrites || 0) < drop.limit) &&
         ++this._dropWrites % drop.everyN === 0) {
       this.stats.droppedWrites = (this.stats.droppedWrites || 0) + 1;
       return undefined;

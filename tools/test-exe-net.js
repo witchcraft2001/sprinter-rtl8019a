@@ -260,6 +260,47 @@ for (const app of ['PING', 'PINGALT']) {
 }
 
 // ---------------------------------------------------------------------
+// Driver hardening against missed ISA bus cycles (NICREG measured them on
+// real cards with frames on the wire).  Each scenario broke the driver
+// before: a lost page switch left the RX poll on page 1 or sent WAIT_PTX's
+// ISR write into page 3's TEST register; a stray in-range CURR or BNRY
+// read sent READ_PACKET into stale ring pages (hang, DMA outside the
+// ring); a lost TPSR write at init transmitted the wrong page for good.
+// ---------------------------------------------------------------------
+{
+  const pingEnv = { environment: { ...NET_ENV }, responders: { arp: { mac: [2, 0, 0, 0, 0, 1] }, icmp: {} } };
+  for (const everyN of [13, 31]) { // lost page selects: read back and repeated
+    const r = run('PING', '-n 6 192.168.7.1', {
+      ...pingEnv, quirks: { regWriteDrop: { target: 'cr', everyN, runningOnly: true, pageSwitchOnly: true } },
+    });
+    assert.strictEqual(r.exitCode, 0, `page-select drop every ${everyN}`);
+    assert.match(r.output, /Received = 6, Lost = 0\./);
+    assert.ok(r.card.stats.droppedWrites > 100, 'the driver must keep switching pages after a drop');
+    assert.strictEqual(r.card.par, '028019112233');
+    checkCleanupClaimedPage(r);
+  }
+  // Misreads on a ring that has wrapped, so stale frames sit past CURR.
+  for (const glitch of [{ page: 1, offset: 0x07, everyN: 7, xor: 0x01 },   // CURR
+    { page: 1, offset: 0x07, everyN: 5, xor: 0x03 },
+    { page: 0, offset: 0x03, everyN: 3, xor: 0x01 }]) {                    // BNRY
+    const r = run('PING', '-n 40 -l 200 192.168.7.1', { ...pingEnv, quirks: { regReadGlitch: glitch } });
+    assert.strictEqual(r.exitCode, 0, JSON.stringify(glitch));
+    assert.match(r.output, /Received = 40, Lost = 0\./);
+    assert.strictEqual(r.card.stats.oobDma, 0, 'no remote DMA outside the ring');
+    checkCleanupClaimedPage(r);
+  }
+  { // the init TPSR write is lost; the per-frame write repairs it
+    const r = run('PING', '-n 2 192.168.7.1', {
+      ...pingEnv, quirks: { regWriteDrop: { target: 'reg', offset: 0x04, value: 0x40, everyN: 1, limit: 1 } },
+    });
+    assert.strictEqual(r.card.stats.droppedWrites, 1);
+    assert.strictEqual(r.exitCode, 0);
+    assert.match(r.output, /Received = 2, Lost = 0\./);
+    checkCleanupClaimedPage(r);
+  }
+}
+
+// ---------------------------------------------------------------------
 // UDPTEST.EXE
 // ---------------------------------------------------------------------
 {

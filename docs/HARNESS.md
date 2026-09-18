@@ -102,9 +102,12 @@ code was 0.
                              // and the undecoded page-0 ID offsets return
                              // whatever the previous register cycle left on
                              // the bus.  NICREG must call that benign.
-    regReadGlitch: null,    // { page, everyN, xor }: every Nth register read
-                             // on that page comes back with `xor` flipped --
-                             // a genuine marginal-bus fault.  NICREG must FAIL.
+    regReadGlitch: null,    // { page, everyN, xor, offset? }: every Nth
+                             // register read on that page (or only at
+                             // `offset`) comes back with `xor` flipped --
+                             // a genuine marginal-bus fault.  NICREG must
+                             // FAIL; the driver must survive a stray CURR or
+                             // BNRY on a wrapped ring.
     rxDmaGlitch: null,      // { afterReads, xor }: the Nth register read after
                              // a frame was STORED comes back flipped -- a read
                              // colliding with receive-buffer DMA on a host that
@@ -115,6 +118,9 @@ code was 0.
                              // every Nth write of that kind is never latched.
                              // Real hardware dropped a "CR := page 0" on a
                              // started chip and the next BNRY write hit PAR2.
+                             // Narrowing: pageSwitchOnly (plain page selects,
+                             // the writes the driver reads back), offset,
+                             // value, limit (stop after that many drops).
   },
   config: { cfg0, cfg1, cfg2, cfg3, cfg4 }, // page-3 CONFIG raw bytes
   txError: true,             // or {attempts:[1,2]} to fail specific TXP attempts

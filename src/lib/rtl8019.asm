@@ -1374,7 +1374,8 @@ INIT_NORMAL
 	LD	(RTL_RX_TO_TX_PENDING),A
 	PUSH	HL
 	LD	IX,(RTL_BASE_PTR)
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP
+	LD	A,CR_PAGE0_STOP
+	CALL	SELECT_PAGE
 	LD	(IX+RTL_DCR_OFF),DCR_INIT
 	LD	(IX+RTL_RBCR0_OFF),0
 	LD	(IX+RTL_RBCR1_OFF),0
@@ -1387,10 +1388,14 @@ INIT_NORMAL
 	LD	(IX+RTL_PSTART_OFF),RTL_PSTART_INIT
 	LD	(IX+RTL_PSTOP_OFF),RTL_PSTOP_INIT
 	LD	(IX+RTL_BNRY_OFF),RTL_BNRY_INIT
+	LD	A,RTL_BNRY_INIT
+	LD	(RTL_BNRY_SHADOW),A
 	LD	(IX+RTL_ISR_OFF),0xFF
 	LD	(IX+RTL_IMR_OFF),0
-	; Page 1: PAR + CURR + MAR.
-	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
+	; Page 1: PAR + CURR + MAR.  A lost page switch here would write
+	; the MAC over PSTART/PSTOP/BNRY/TPSR, so it is read back.
+	LD	A,CR_PAGE1_STOP
+	CALL	SELECT_PAGE
 	POP	HL
 	; LDIR target (DE) = IX + PAR0_OFF.
 	PUSH	IX
@@ -1412,7 +1417,8 @@ INIT_NORMAL
 	LD	(IX+RTL_MAR0_OFF + 5),0
 	LD	(IX+RTL_MAR0_OFF + 6),0
 	LD	(IX+RTL_MAR0_OFF + 7),0
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	A,CR_PAGE0_START
+	CALL	SELECT_PAGE
 	LD	(IX+RTL_TCR_OFF),TCR_NORMAL
 	LD	A,(.RCR_VALUE)
 	LD	(IX+RTL_RCR_OFF),A
@@ -1432,7 +1438,8 @@ INIT_LOOPBACK
 	LD	(RTL_RX_TO_TX_PENDING),A
 	PUSH	HL
 	LD	IX,(RTL_BASE_PTR)
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_STOP
+	LD	A,CR_PAGE0_STOP
+	CALL	SELECT_PAGE
 	LD	(IX+RTL_DCR_OFF),DCR_LOOPBACK
 	LD	(IX+RTL_RBCR0_OFF),0
 	LD	(IX+RTL_RBCR1_OFF),0
@@ -1442,9 +1449,12 @@ INIT_LOOPBACK
 	LD	(IX+RTL_PSTART_OFF),RTL_PSTART_INIT
 	LD	(IX+RTL_PSTOP_OFF),RTL_PSTOP_INIT
 	LD	(IX+RTL_BNRY_OFF),RTL_BNRY_INIT
+	LD	A,RTL_BNRY_INIT
+	LD	(RTL_BNRY_SHADOW),A
 	LD	(IX+RTL_ISR_OFF),0xFF
 	LD	(IX+RTL_IMR_OFF),0
-	LD	(IX+RTL_CR_OFF),CR_PAGE1_STOP
+	LD	A,CR_PAGE1_STOP
+	CALL	SELECT_PAGE
 	POP	HL
 	PUSH	IX
 	POP	DE
@@ -1465,7 +1475,8 @@ INIT_LOOPBACK
 	LD	(IX+RTL_MAR0_OFF + 5),0
 	LD	(IX+RTL_MAR0_OFF + 6),0
 	LD	(IX+RTL_MAR0_OFF + 7),0
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	LD	A,CR_PAGE0_START
+	CALL	SELECT_PAGE
 	RET
 	ENDIF
 
@@ -1509,7 +1520,9 @@ WAIT_PTX
 	RET
 .EVENT
 	CALL	CAPTURE_TX_STATE
+	IFNDEF	UNET_DLL
 	CALL	CAPTURE_TX_PHY_POST
+	ENDIF
 	LD	A,(TX_LAST_ISR)
 	AND	ISR_TXE
 	JR	NZ,.TX_ERROR
@@ -1581,16 +1594,10 @@ SEND_FRAME_SG
 	LD	BC,60
 .LEN_OK
 	LD	(TX_LENGTH),BC
-	; Mark per-attempt PHY diagnostics invalid until their exact phase is
-	; reached.  This prevents a pre-TX failure from printing values left by
-	; an older frame.
+	; Mark the collision count invalid until CAPTURE_TX_STATE reads it.
+	; The PHY/TPSR captures of the EXE build do not exist here.
 	LD	A,0xFF
-	LD	(TX_CFG0_PRE),A
-	LD	(TX_CFG3_PRE),A
-	LD	(TX_CFG0_POST),A
-	LD	(TX_CFG3_POST),A
 	LD	(TX_LAST_NCR),A
-	LD	(TX_LAST_TPSR),A
 	; A successful RX immediately followed by TX was unreliable on the
 	; ORIGINAL card (see RX_TO_TX_GUARD_MS above); the guard compiles
 	; out at 0 and can be re-enabled there if TX verify errors return.
@@ -1670,6 +1677,11 @@ SEND_FRAME_SG
 	LD	BC,(TX_LENGTH)
 	LD	(IX+RTL_TBCR0_OFF),C
 	LD	(IX+RTL_TBCR1_OFF),B
+	; TPSR is re-asserted per frame (Crynwr's send_pkt does the same):
+	; a single lost TPSR write at init would otherwise transmit the
+	; wrong packet-RAM page, with PTX reporting success, until the
+	; next INIT.
+	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
 	; ISR is write-one-to-clear.  Clear BOTH terminal TX bits and
 	; read them back until clear.  The old code wrote PTX once and
 	; immediately polled it after TXP; a delayed or lost clear can let
@@ -1691,10 +1703,6 @@ SEND_FRAME_SG
 	SCF
 	RET
 .STATUS_CLEAR
-	; Capture the medium actually selected and duplex configuration at the
-	; physical TX boundary.  Page 3 is read-only here; restore page 0 before
-	; issuing the single TXP command.
-	CALL	CAPTURE_TX_PHY_PRE
 	; TXP is an edge-like command and MUST be written exactly once.
 	; Do not re-issue it when an immediate CR/ISR read has not yet
 	; exposed TXP/PTX: on real hardware those reads can lag, and the
@@ -1825,6 +1833,11 @@ SEND_FRAME
 	LD	BC,(TX_LENGTH)
 	LD	(IX+RTL_TBCR0_OFF),C
 	LD	(IX+RTL_TBCR1_OFF),B
+	; TPSR is re-asserted per frame (Crynwr's send_pkt does the same):
+	; a single lost TPSR write at init would otherwise transmit the
+	; wrong packet-RAM page, with PTX reporting success, until the
+	; next INIT.
+	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
 	; ISR is write-one-to-clear.  Clear BOTH terminal TX bits and
 	; read them back until clear.  The old code wrote PTX once and
 	; immediately polled it after TXP; a delayed or lost clear can let
@@ -1962,7 +1975,11 @@ CAPTURE_TX_STATE
 ; medium while the frame is being transmitted.  Requires ISA open;
 ; no DSS calls, no EEPROM writes.  Transmission is not active when
 ; either routine is called, so changing CR page bits is safe.
+; EXE builds only: UNETRTL.DLL reports nothing but stage/ISR/TSR/CR
+; (CAPTURE_DIAG), so there these reads were pure page switching on
+; the TX path -- and without an ID probe it visited page 3 on clones.
 ; ------------------------------------------------------
+	IFNDEF	UNET_DLL
 CAPTURE_TX_PHY_PRE
 	LD	IX,(RTL_BASE_PTR)
 	; Page 2 exposes the write-only-on-page-0 TPSR value.  Capture it at
@@ -1976,41 +1993,35 @@ CAPTURE_TX_PHY_PRE
 	; clone has no such page -- a UM9003 mirrors page 1 there, so the
 	; "PHY" figures would be MAC bytes -- and the caller already marked
 	; them invalid (0xFF) for the app to print as n/a.  Nothing is read
-	; and no page is selected on such a chip; page 0 is restored first
-	; because this is an early exit out of the page-2 read above.
-	; UNETRTL.DLL has no ID probe (image budget), so it keeps the
-	; unconditional capture -- and stays byte-identical to its last
-	; build, which this arrangement of the guard preserves.
-	IFNDEF	UNET_DLL
+	; and no page is selected on such a chip.  Either way the return to
+	; page 0 is read back before the caller's TXP write.
 	LD	A,(RTL_CHIP_KIND)
 	CP	RTL_CHIP_CLONE
-	JR	NZ,.HAVE_PAGE3
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
-	RET
-.HAVE_PAGE3
-	ENDIF
+	JR	Z,.PAGE0
 	LD	(IX+RTL_CR_OFF),CR_PAGE3_START
 	LD	A,(IX+RTL_CONFIG0_OFF)
 	LD	(TX_CFG0_PRE),A
 	LD	A,(IX+RTL_CONFIG3_OFF)
 	LD	(TX_CFG3_PRE),A
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
-	RET
+.PAGE0
+	LD	A,CR_PAGE0_START
+	JP	SELECT_PAGE
 
 CAPTURE_TX_PHY_POST
-	IFNDEF	UNET_DLL
 	LD	A,(RTL_CHIP_KIND)	; page 3 is Realtek-only, see _PRE
 	CP	RTL_CHIP_CLONE
 	RET	Z
-	ENDIF
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE3_START
 	LD	A,(IX+RTL_CONFIG0_OFF)
 	LD	(TX_CFG0_POST),A
 	LD	A,(IX+RTL_CONFIG3_OFF)
 	LD	(TX_CFG3_POST),A
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
-	RET
+	; Verified: WAIT_PTX's next write is ISR, which on page 3 is the
+	; Realtek TEST register.
+	LD	A,CR_PAGE0_START
+	JP	SELECT_PAGE
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -2040,34 +2051,45 @@ RING_HAS_PACKET
 	; for good: transfers died mid-file with "code 0x02 ovw 0x00/01",
 	; an empty ring and ISR=00 -- the NIC was halted and nobody knew.
 	;
-	; Read BNRY and validate it is a real ring page.  On marginal
-	; silicon a register read can float to 0xFF (undriven ISA bus);
-	; an out-of-range BNRY/CURR is such a glitch.  Treat it as "ring
-	; empty" so the caller ticks (window closed -> bus/IRQ recover)
-	; instead of DMA-reading garbage from page 0 (BNRY=FF -> address
-	; 0x0000 = PROM/registers), which corrupts ring state and stalls.
-	LD	A,(IX+RTL_BNRY_OFF)
-	CP	RTL_PSTART_INIT
-	JR	C,.GLITCH
-	CP	RTL_PSTOP_INIT
-	JR	NC,.GLITCH
+	; BNRY comes from the driver's shadow, not the chip: a stray read
+	; that happened to land inside the ring would send READ_PACKET to
+	; the wrong page (see RTL_BNRY_SHADOW in memmap.inc).
+	LD	A,(RTL_BNRY_SHADOW)
 	INC	A
 	CP	RTL_PSTOP_INIT
 	JR	C,.NW
 	LD	A,RTL_PSTART_INIT
 .NW
 	LD	B,A
-	LD	(IX+RTL_CR_OFF),CR_PAGE1_START
+	; CURR lives on page 1.  Both page switches are read back: a lost
+	; switch to page 1 would return a page-0 register as CURR, a lost
+	; switch back would leave ISR reads below (and the caller's) on
+	; page 1.  CURR is read twice and must agree -- NICREG showed a
+	; missed read cycle returning a ring page number, which passes the
+	; range check and would make an empty ring look non-empty.  Any
+	; failure reports "ring empty": the caller ticks with the window
+	; closed and polls again.
+	LD	A,CR_PAGE1_START
+	CALL	SELECT_PAGE
+	LD	C,0xFF			; out of range: page 1 not confirmed
+	JR	C,.PAGE0
+	LD	C,(IX+RTL_CURR_OFF)
 	LD	A,(IX+RTL_CURR_OFF)
-	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
-	; Validate CURR likewise.
+	CP	C
+	JR	Z,.PAGE0
+	LD	C,0xFF			; the two reads disagree
+.PAGE0
+	LD	A,CR_PAGE0_START
+	CALL	SELECT_PAGE
+	JR	C,.GLITCH
+	; Validate CURR: on marginal silicon a register read can float to
+	; 0xFF (undriven ISA bus); an out-of-range CURR is such a glitch.
+	LD	A,C
 	CP	RTL_PSTART_INIT
 	JR	C,.GLITCH
 	CP	RTL_PSTOP_INIT
 	JR	NC,.GLITCH
-	LD	C,A
-	LD	A,B
-	CP	C
+	CP	B
 	RET	NZ			; frames queued -> drain before any recovery
 	; Ring empty.  If an overflow is latched the receive engine is
 	; halted and will never store another frame -- restart it now.
@@ -2167,6 +2189,12 @@ RECOVER_OVERFLOW
 .STOPPED
 	LD	(IX+RTL_RBCR0_OFF),0
 	LD	(IX+RTL_RBCR1_OFF),0
+	; Re-assert BNRY from the shadow (the ring is drained, so this is
+	; the value the chip should already hold).  A lost BNRY write on
+	; the last commit would otherwise make the restarted receiver see
+	; a full ring and overflow again at once.
+	LD	A,(RTL_BNRY_SHADOW)
+	LD	(IX+RTL_BNRY_OFF),A
 	LD	(IX+RTL_TCR_OFF),TCR_LB_INTERNAL	; mask RX across the restart
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START	; receive engine resets on STA
 	LD	(IX+RTL_ISR_OFF),0xFF		; clear OVW + latched status AFTER start
@@ -2200,7 +2228,7 @@ READ_PACKET_COMMON
 	LD	(.MAX_LEN),BC
 	LD	IX,(RTL_BASE_PTR)
 	; Compute hdr_addr = (BNRY+1)<<8 with PSTOP wrap.
-	LD	A,(IX+RTL_BNRY_OFF)
+	LD	A,(RTL_BNRY_SHADOW)
 	INC	A
 	CP	RTL_PSTOP_INIT
 	JR	C,.NW
@@ -2367,6 +2395,7 @@ READ_PACKET_COMMON
 	LD	IX,(RTL_BASE_PTR)
 	LD	HL,(.PKT_ADDR)
 	LD	A,H
+	LD	(RTL_BNRY_SHADOW),A
 	LD	(IX+RTL_BNRY_OFF),A
 	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE	; keep OVW latched (see .READ_DONE)
 	SCF
@@ -2409,16 +2438,46 @@ VALID_RX_PAGE_A
 	RET
 
 ; SET_BNRY_FROM_NEXT_A: A = packet next page (or CURR for resync).
-; Writes BNRY = A-1, wrapping PSTART -> PSTOP-1.  Requires IX = base.
+; Writes BNRY = A-1, wrapping PSTART -> PSTOP-1, to the chip and
+; to RTL_BNRY_SHADOW.  Requires IX = base.
 SET_BNRY_FROM_NEXT_A
 	DEC	A
 	CP	RTL_PSTART_INIT
 	JR	NC,.OK
 	LD	A,RTL_PSTOP_INIT - 1
 .OK
+	LD	(RTL_BNRY_SHADOW),A
 	LD	(IX+RTL_BNRY_OFF),A
 	RET
+
 	ENDIF
+
+; ------------------------------------------------------
+; SELECT_PAGE: write CR = A and read it back; repeat the write
+; up to CR_SELECT_TRIES times until page select and STA/STP read
+; back as written.  A missed ISA write cycle on a page switch sends
+; every following register access to the wrong page (NICREG caught
+; a BNRY write landing in PAR2 that way).
+;   In:  A = CR value (no TXP, no remote-DMA start); IX = base.
+;   Out: CF=0 confirmed; CF=1 not confirmed after all tries.
+; Trashes A.  Preserves BC, DE, HL.  ISA open.
+; ------------------------------------------------------
+CR_SELECT_TRIES	EQU 4
+SELECT_PAGE
+	PUSH	BC
+	LD	C,A
+	LD	B,CR_SELECT_TRIES
+.TRY
+	LD	(IX+RTL_CR_OFF),C
+	LD	A,(IX+RTL_CR_OFF)
+	XOR	C
+	AND	CR_VERIFY_MASK		; clears CF
+	JR	Z,.DONE
+	DJNZ	.TRY
+	SCF
+.DONE
+	POP	BC
+	RET
 
 
 	ENDMODULE
