@@ -43,7 +43,9 @@ DSS_SETTIME         EQU 0x22
 DSS_WAITKEY			EQU 0x30							; blocks; key returned in A
 DSS_SCANKEY			EQU 0x31
 DSS_ECHOKEY			EQU	0x32
+DSS_CTRLKEY			EQU 0x33							; modifier snapshot; does NOT pop the ring
 DSS_K_CLEAR			EQU 0x35							; B=subfn (e.g. WAITKEY) -> clear buf + run subfn
+DSS_TESTKEY			EQU 0x37							; peek: ZF=1 empty; does NOT pop the ring
 DSS_SETWIN			EQU 0x38		; A=block, B=index, H=window*0x40
 DSS_SETWIN1			EQU 0x39		; A=block, B=index (WIN1 shortcut)
 DSS_SETWIN2			EQU 0x3A

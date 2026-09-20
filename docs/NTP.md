@@ -36,10 +36,12 @@ The banner line always shows the *resolved* address, so a hostname
 (whether passed as an argument or taken from `NET_NTP`) appears here
 as the IPv4 it resolved to, not as the name.
 
-Local time = UTC + `NET_TZ` hours.  Missing or unparseable
-`NET_TZ` is treated as UTC+0.  `DSS_SETTIME` is fed the local
-time so subsequent `DIR`, `DSS_SYSTIME`, and any file-create
-stamps reflect the right wall clock.
+Local time = UTC + `NET_TZ`, where `NET_TZ` is `[+|-]H[H][:MM]`
+(e.g. `+5:30` for India, `+9:30` for Central Australia).  Missing,
+unparseable, or out-of-range (outside -12:00..+14:00, or a minute
+field not in 00..59) `NET_TZ` is treated as UTC+0.  `DSS_SETTIME`
+is fed the local time so subsequent `DIR`, `DSS_SYSTIME`, and any
+file-create stamps reflect the right wall clock.
 
 ## Exit codes
 

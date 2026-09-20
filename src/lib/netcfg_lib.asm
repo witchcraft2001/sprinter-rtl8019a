@@ -20,7 +20,11 @@
 ;                                         RTL_HW=0/0x3E0
 ;                                       Empty / missing -> driver
 ;                                       auto-scans both slots.
-;   TZ                               -- signed integer hours.
+;   TZ                               -- local offset from UTC, ASCIIZ
+;                                       "[+|-]H[H][:MM]" (e.g. "+5:30",
+;                                       "-3"); empty/missing -> UTC.
+;                                       Stored and published verbatim;
+;                                       only NTP.EXE parses it.
 ;   NTP                              -- ASCIIZ host (<=31 chars).
 ;
 ; Output (module data):
@@ -31,7 +35,7 @@
 ;   NETCFG.DNS1      (4 bytes)
 ;   NETCFG.DNS2      (4 bytes)
 ;   NETCFG.NTP       (32 bytes ASCIIZ)
-;   NETCFG.TZ        (signed byte)
+;   NETCFG.TZ        (8 bytes ASCIIZ, "[+|-]H[H][:MM]" or empty)
 ;
 ; Public API:
 ;   NETCFG.LOAD          read+parse NET.CFG. CF=0 file ok,
@@ -79,7 +83,7 @@ GATEWAY		EQU NETCFG_GATEWAY
 DNS1		EQU NETCFG_DNS1
 DNS2		EQU NETCFG_DNS2
 NTP		EQU NETCFG_NTP
-TZ		EQU NETCFG_TZ
+TZ		EQU NETCFG_TZ_STR
 DHCP_MODE	EQU NETCFG_DHCP_MODE
 LOAD_FH		EQU NETCFG_LOAD_FH
 LOAD_BUF	EQU NETCFG_LOAD_BUF
@@ -536,7 +540,9 @@ PARSE
 .TZ
 	LD	BC,3			; len("TZ=")
 	ADD	HL,BC
-	CALL	PARSE_TZ_LINE
+	LD	DE,TZ
+	LD	B,7
+	CALL	COPY_VALUE
 	JP	.LINE
 .NTPLINE
 	LD	BC,4			; len("NTP=")
@@ -691,38 +697,6 @@ PARSE_MAC_LINE
 	JP	SKIP_TO_NEXT_LINE
 
 .TMP_MAC	EQU NETCFG_TMP_MAC	; 6 bytes in runtime BSS
-
-
-; ------------------------------------------------------
-; PARSE_TZ_LINE: HL just past "TZ=", parse signed integer
-; (-12..14) into NETCFG.TZ.
-; ------------------------------------------------------
-PARSE_TZ_LINE
-	LD	A,(HL)
-	CP	'+'
-	JR	Z,.POS
-	CP	'-'
-	JR	Z,.NEG
-	; No sign -> positive
-	CALL	@UTIL.PARSE_DEC_BYTE
-	JR	C,.SKIP
-	LD	(TZ),A
-	JP	SKIP_TO_NEXT_LINE
-.POS
-	INC	HL
-	CALL	@UTIL.PARSE_DEC_BYTE
-	JR	C,.SKIP
-	LD	(TZ),A
-	JP	SKIP_TO_NEXT_LINE
-.NEG
-	INC	HL
-	CALL	@UTIL.PARSE_DEC_BYTE
-	JR	C,.SKIP
-	NEG
-	LD	(TZ),A
-	JP	SKIP_TO_NEXT_LINE
-.SKIP
-	JP	SKIP_TO_NEXT_LINE
 
 
 ; ------------------------------------------------------

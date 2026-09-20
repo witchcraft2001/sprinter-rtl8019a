@@ -199,7 +199,6 @@ NETCFG_GATEWAY		EQU 0xA20E	; 4 bytes
 NETCFG_DNS1		EQU 0xA212	; 4 bytes
 NETCFG_DNS2		EQU 0xA216	; 4 bytes
 NETCFG_NTP		EQU 0xA21A	; 32 bytes
-NETCFG_TZ		EQU 0xA23A	; 1 byte
 NETCFG_DHCP_MODE	EQU 0xA23C	; 1 byte (1 if IP=DHCP, 0 otherwise)
 NETCFG_LOAD_FH		EQU 0xA23B	; 1 byte
 NETCFG_LOAD_FILL	EQU 0xA23D	; 2 bytes: bytes held in NETCFG_LOAD_BUF
@@ -211,6 +210,12 @@ NETCFG_TMP_MAC		EQU 0xA244	; 6 bytes (parser scratch)
 NETCFG_OUR_RTL_HW	EQU 0xA24A	; 8 bytes ASCIIZ "S/#HHH" or empty
 NETCFG_OUR_RTL_RESET	EQU 0xA252	; 1 byte flag: 1 = RTL_RESET=SOFT
 NETCFG_PATH_BUF		EQU 0xA254	; 280 bytes: "<appdir>\NET.CFG",0 (APPINFO)
+; TZ is stored and published as raw ASCII text ("[+|-]H[H][:MM]", empty =
+; UTC): only NTP.EXE parses it into hours/minutes.  Placed in the free gap
+; ahead of the big file buffer (old NETCFG_TZ, a single signed byte at
+; 0xA23A wedged between NETCFG_NTP and NETCFG_LOAD_FH, had no room to grow
+; in place and could not hold minutes).
+NETCFG_TZ_STR		EQU 0xA36C	; 8 bytes ASCIIZ, e.g. "+5:30"
 ; File read buffer.  NETCFG.LOAD streams NET.CFG through it in
 ; whole-line chunks, so the file may be any size; only a single line
 ; longer than 2047 bytes is cut (its tail is dropped, never parsed as a
@@ -220,6 +225,39 @@ NETCFG_PATH_BUF		EQU 0xA254	; 280 bytes: "<appdir>\NET.CFG",0 (APPINFO)
 ; and stays below APP_BSS_BASE (0xB000).
 NETCFG_LOAD_BUF		EQU 0xA380	; 2048 bytes
 NETCFG_LOAD_BUF_SIZE	EQU 2048
+
+; netcfg_write.asm (NETCFG -w interactive wizard): per-field edit buffers
+; and the canonical-file serialization scratch.  Active only in NETCFG.EXE,
+; under IFDEF USE_NETCFG_WRITE.  Placed right after NETCFG_LOAD_BUF (which
+; ends at 0xAB80): no other library NETCFG.EXE pulls uses this range, and
+; it stays below APP_BSS_BASE (0xB000).
+NETCFGW_HW		EQU 0xAB80	; 12 bytes ASCIIZ "S/#HHH"
+NETCFGW_RESET		EQU 0xAB8C	; 8 bytes ASCIIZ AUTO|SOFT|HARD
+NETCFGW_MAC		EQU 0xAB94	; 18 bytes ASCIIZ aa:bb:cc:dd:ee:ff
+NETCFGW_IP		EQU 0xABA6	; 16 bytes ASCIIZ dotted quad or DHCP
+NETCFGW_MASK		EQU 0xABB6	; 16 bytes ASCIIZ dotted quad
+NETCFGW_GW		EQU 0xABC6	; 16 bytes ASCIIZ dotted quad
+NETCFGW_DNS1		EQU 0xABD6	; 16 bytes ASCIIZ dotted quad
+NETCFGW_DNS2		EQU 0xABE6	; 16 bytes ASCIIZ dotted quad
+NETCFGW_TZ		EQU 0xABF6	; 8 bytes ASCIIZ "[+|-]H[H][:MM]"
+NETCFGW_NTP		EQU 0xABFE	; 32 bytes ASCIIZ hostname
+NETCFGW_EDIT		EQU 0xAC1E	; 64 bytes: PROMPT_FIELD input scratch
+; NETCFGW_STATE: PROMPT_FIELD bookkeeping (must survive DSS_PUTCHAR/WAITKEY,
+; which trash A/BC/IY) plus validator scratch.  Layout (see netcfg_write.asm):
+;   +0  LABEL_PTR (2)     +2  DEST_PTR (2)      +4  VALIDATOR_PTR (2)
+;   +6  CAP (1)           +7  FLAGS (1)         +8  EFFCAP (1)
+;   +9  EDITLEN (1)       +10 OVERFLOW (1)      +11 KEYCHAR (1)
+;   +12 SCRATCH_IP (4, also reused as TZ NEG/HOURS/MINS)
+;   +16 SCRATCH_MAC (6)   +22 PATH_PTR (2)
+NETCFGW_STATE		EQU 0xAC5E	; 24 bytes: wizard control-flow state
+NETCFGW_WRITE_BUF	EQU 0xAC76	; canonical NET.CFG text before write
+NETCFGW_WRITE_BUF_SIZE	EQU 640
+; Upper bound on the serialized canonical file: header comments (140) plus
+; one "KEY=value\r\n" line per field, sized from the field buffers above
+; plus their key names and separators.
+NETCFGW_CANONICAL_MAX	EQU 140 + 16+16+27+20+25+25+22+22+12+37
+	ASSERT NETCFGW_CANONICAL_MAX <= NETCFGW_WRITE_BUF_SIZE
+	ASSERT NETCFGW_WRITE_BUF + NETCFGW_WRITE_BUF_SIZE <= APP_BSS_BASE
 
 ; dhcp_lib: parsed-field outputs.  Active only in IFUP.EXE.
 DHCP_XID		EQU 0xA800	; 4 bytes (transaction id, host order)

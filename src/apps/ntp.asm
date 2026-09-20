@@ -1129,20 +1129,23 @@ RESTORE_FROM_UTC_BACKUP
 
 
 ; ------------------------------------------------------
-; APPLY_TZ_FROM_ENV: read NET_TZ, parse "+H" / "-H" / "H",
-; then add the signed hour offset to WORK_SECS.
-; Missing / empty / unparseable NET_TZ => no-op.
+; APPLY_TZ_FROM_ENV: read NET_TZ, parse "[+|-]H[H][:MM]",
+; then add the signed offset to WORK_SECS.
+; Missing / empty / unparseable / out-of-range NET_TZ => no-op (UTC).
 ; Trashes everything.
 ; ------------------------------------------------------
 APPLY_TZ_FROM_ENV
 	XOR	A
 	LD	(TZ_NEG),A
 	LD	(TZ_HOURS),A
+	LD	(TZ_MINS),A
 	CALL	PARSE_TZ_FIELDS
-	JP	APPLY_TZ_HOURS
+	JP	APPLY_TZ_OFFSET
 
-; PARSE_TZ_FIELDS: GET_STR NET_TZ, fill TZ_NEG + TZ_HOURS.
-;   On any failure, leaves both at 0 (no-op).
+; PARSE_TZ_FIELDS: GET_STR NET_TZ, fill TZ_NEG + TZ_HOURS + TZ_MINS.
+;   Accepts "[+|-]H[H]" or "[+|-]H[H]:MM" (minutes exactly two digits,
+;   00..59, nothing after).  On any parse failure or if the combined
+;   offset falls outside -12:00..+14:00, resets all three to 0 (UTC).
 PARSE_TZ_FIELDS
 	LD	HL,N_NET_TZ
 	LD	DE,TZ_BUF
@@ -1166,14 +1169,19 @@ PARSE_TZ_FIELDS
 .DIGITS
 	XOR	A
 	LD	(TZ_HOURS),A
-.LP
+.HLOOP
 	LD	A,(HL)
 	SUB	'0'
-	RET	C
+	JR	C,.RANGE_CHECK		; non-digit, not ':' either -> done
 	CP	10
-	RET	NC
+	JR	NC,.CHECK_COLON
 	LD	B,A
 	LD	A,(TZ_HOURS)
+	; A third digit would make the hour >= 100 -- out of range whatever
+	; it is, and the 8-bit accumulator would wrap (mod 256) instead of
+	; overflowing, so "+264" would quietly become "+8".  Reject here.
+	CP	10
+	JP	NC,.INVALID
 	ADD	A,A
 	LD	C,A
 	ADD	A,A
@@ -1182,11 +1190,73 @@ PARSE_TZ_FIELDS
 	ADD	A,B
 	LD	(TZ_HOURS),A
 	INC	HL
-	JR	.LP
+	JR	.HLOOP
+.CHECK_COLON
+	LD	A,(HL)
+	CP	':'
+	JR	NZ,.RANGE_CHECK		; trailing garbage after hours -> ignore
+	INC	HL
+	; exactly two minute digits, 00..59, then end of string
+	LD	A,(HL)
+	SUB	'0'
+	JR	C,.INVALID
+	CP	10
+	JR	NC,.INVALID
+	LD	B,A			; tens digit
+	INC	HL
+	LD	A,(HL)
+	SUB	'0'
+	JR	C,.INVALID
+	CP	10
+	JR	NC,.INVALID
+	LD	C,A			; ones digit
+	INC	HL
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.INVALID
+	LD	A,B
+	ADD	A,A
+	LD	D,A
+	ADD	A,A
+	ADD	A,A
+	ADD	A,D
+	ADD	A,C
+	CP	60
+	JR	NC,.INVALID
+	LD	(TZ_MINS),A
+.RANGE_CHECK
+	; Combined offset must fall within -12:00..+14:00.
+	LD	A,(TZ_NEG)
+	OR	A
+	JR	NZ,.RANGE_NEG
+	LD	A,(TZ_HOURS)
+	CP	15
+	JR	NC,.INVALID
+	CP	14
+	RET	NZ
+	LD	A,(TZ_MINS)
+	OR	A
+	RET	Z
+	JR	.INVALID
+.RANGE_NEG
+	LD	A,(TZ_HOURS)
+	CP	13
+	JR	NC,.INVALID
+	CP	12
+	RET	NZ
+	LD	A,(TZ_MINS)
+	OR	A
+	RET	Z
+.INVALID
+	XOR	A
+	LD	(TZ_NEG),A
+	LD	(TZ_HOURS),A
+	LD	(TZ_MINS),A
+	RET
 
 
 ; ------------------------------------------------------
-; PRINT_TZ_LABEL: print sign + hours from TZ_NEG/TZ_HOURS.
+; PRINT_TZ_LABEL: print sign + hours[:mins] from TZ_NEG/TZ_HOURS/TZ_MINS.
 ; ------------------------------------------------------
 PRINT_TZ_LABEL
 	LD	A,(TZ_NEG)
@@ -1199,24 +1269,47 @@ PRINT_TZ_LABEL
 .PRINT_SIGN
 	CALL	PUTCHAR
 	LD	A,(TZ_HOURS)
-	JP	PRINT_DEC_A
-
-
-; ------------------------------------------------------
-; APPLY_TZ_HOURS: WORK_SECS += sign(TZ_NEG) * (TZ_HOURS * 3600).
-; Hours <= 14, so abs offset <= 50400 < 65536; 16-bit suffices.
-; ------------------------------------------------------
-APPLY_TZ_HOURS
-	LD	A,(TZ_HOURS)
+	CALL	PRINT_DEC_A
+	LD	A,(TZ_MINS)
 	OR	A
 	RET	Z
-	; HL = hours * 3600.
+	PUSH	AF
+	LD	A,':'
+	CALL	PUTCHAR
+	POP	AF
+	JP	PRINT_DEC2
+
+
+; ------------------------------------------------------
+; APPLY_TZ_OFFSET: WORK_SECS += sign(TZ_NEG) * (TZ_HOURS*3600 + TZ_MINS*60).
+; Hours <= 14, so abs offset <= 50400 + 3540 < 65536; 16-bit suffices.
+; ------------------------------------------------------
+APPLY_TZ_OFFSET
+	LD	A,(TZ_HOURS)
 	LD	B,A
+	LD	A,(TZ_MINS)
+	OR	B
+	RET	Z
+	; HL = hours * 3600.
 	LD	HL,0
 	LD	DE,3600
+	LD	A,B
+	OR	A
+	JR	Z,.NO_HOURS
 .MUL
 	ADD	HL,DE
 	DJNZ	.MUL
+.NO_HOURS
+	; HL += minutes * 60.
+	LD	A,(TZ_MINS)
+	OR	A
+	JR	Z,.NO_MINS
+	LD	B,A
+	LD	DE,60
+.MULM
+	ADD	HL,DE
+	DJNZ	.MULM
+.NO_MINS
 	; HL now = abs offset in seconds.
 	LD	A,(TZ_NEG)
 	OR	A
@@ -1340,10 +1433,11 @@ HOUR		EQU APP_BSS_BASE + 48		; 1
 MIN		EQU APP_BSS_BASE + 49		; 1
 SEC		EQU APP_BSS_BASE + 50		; 1
 UTC_BACKUP	EQU APP_BSS_BASE + 51		; 4 (Unix UTC backup for second pass)
-TZ_BUF		EQU APP_BSS_BASE + 55		; 8 (NET_TZ string)
+TZ_BUF		EQU APP_BSS_BASE + 55		; 8 (NET_TZ string, up to "-12:45")
 TZ_NEG		EQU APP_BSS_BASE + 63		; 1
 TZ_HOURS	EQU APP_BSS_BASE + 64		; 1
-NTP_HOST_BUF	EQU APP_BSS_BASE + 65		; NTP_HOST_BUF_SIZE (NET_NTP fallback)
+TZ_MINS		EQU APP_BSS_BASE + 65		; 1
+NTP_HOST_BUF	EQU APP_BSS_BASE + 66		; NTP_HOST_BUF_SIZE (NET_NTP fallback)
 NTP_APP_BSS_END	EQU NTP_HOST_BUF + NTP_HOST_BUF_SIZE
 
 

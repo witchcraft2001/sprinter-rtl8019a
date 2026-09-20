@@ -466,8 +466,22 @@ function runExe(exePath, args = '', inputScenario = {}) {
       }
       case 0x22: setCarry(s, false); return ret(s); // SETTIME stub
       case 0x30: { // WAITKEY (blocking; returns key in A)
-        const key = scenario.key || 'n';
-        s.a = key === 'escape' ? 0x1b : key === 'ctrl-c' ? 0x03 : key.charCodeAt(0);
+        // Real WAITKEY blocks until a key arrives, so a scripted `scenario.keys`
+        // queue must be CONSUMED here, one entry per call -- unlike SCANKEY/
+        // TESTKEY's keyReady() gate (scanCount, keyAtScan, keyIntervalScans),
+        // which models an interactive poll loop that WAITKEY-based programs
+        // never run. A program that WAITKEYs past the end of a scripted queue
+        // has a real bug (it is asking for a keystroke the test never planned
+        // to send), so that is a hard error with the transcript so far,
+        // instead of silently freezing on a fabricated key for 200M steps.
+        if (keyQueue.length) {
+          loadKeyRegs(s, keyQueue.shift());
+          setCarry(s, false); return ret(s);
+        }
+        if (scenario.keys) {
+          throw new Error(`WAITKEY: scripted key queue exhausted (stdout so far:\n${stdout})`);
+        }
+        loadKeyRegs(s, scenario.key || 'n');
         setCarry(s, false); return ret(s);
       }
       case 0x31: { // SCANKEY: ZF=1 no key; else A=E=ascii, D=scan, B=modifiers
@@ -492,6 +506,15 @@ function runExe(exePath, args = '', inputScenario = {}) {
           s.flags.Z = 0; setCarry(s, false); return ret(s);
         }
         s.a = 0; s.b = 0; s.d = 0; s.e = 0; s.flags.Z = 1; setCarry(s, false); return ret(s);
+      }
+      case 0x33: { // CTRLKEY: modifier snapshot. Peeks, never pops the ring.
+        // Chained after K_CLEAR (#35) this is "drop stale input without
+        // reading a key". The scripted queue holds only the keys a test MEANT
+        // to send, so a flush is deliberately a no-op on it -- the point of
+        // modelling #33 is that it must not eat the next scripted keystroke.
+        s.a = keyQueue.length ? 0xff : 0x00;
+        s.b = 0; s.c = 0;
+        setCarry(s, false); return ret(s);
       }
       case 0x35: { // K_CLEAR: B = chained subfunction (WAITKEY/SCANKEY)
         s.c = s.b; cpu.setState(s); return dss();
@@ -734,7 +757,12 @@ function runExe(exePath, args = '', inputScenario = {}) {
       } else cycles += cpu.run_instruction() || 0;
 
       if (++steps > limit) {
-        throw new Error(`step limit at PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} ` +
+        // A scripted run that spins here has almost always run out of keys: the
+      // wizard's cursor loop peeks with TESTKEY, which (unlike WAITKEY) has no
+      // "queue exhausted" error to raise, so say it here instead.
+      const starved = scenario.keys && !keyQueue.length
+        ? ' (scripted key queue is empty -- the program is still polling for input)' : '';
+      throw new Error(`step limit${starved} at PC=${cpu.getState().pc.toString(16)} SP=${cpu.getState().sp.toString(16)} ` +
           `trace=${pcTrace.map((v) => v.toString(16)).join(',')}`);
       }
     }

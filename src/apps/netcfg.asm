@@ -7,12 +7,15 @@
 ;   NETCFG -i       init: load NET.CFG, populate NET_* env
 ;   NETCFG -c       check NET.CFG syntax (exit 4 on error)
 ;   NETCFG -d       delete all NET_* env vars
+;   NETCFG -w       interactive wizard: create/edit NET.CFG
 ;   NETCFG /? -? -h help
 ;
 ; Exit codes:
 ;   0   OK
 ;   1   usage error
-;   4   NET.CFG missing or invalid (only with -i / -c)
+;   4   NET.CFG missing or invalid (only with -i / -c / -w)
+;   5   NET.CFG write failed (only with -w)
+;   7   -w cancelled by the user (Esc)
 ;
 ; This is the only utility in the kit that touches NET.CFG.
 ; All other tools read NET_* env vars via netenv_lib.
@@ -29,15 +32,21 @@ EXE_VERSION	EQU 1			; DSS executable format version, not app version
 
 	DEFINE USE_NETCFG_LOAD
 	DEFINE USE_UTIL_EXIT
+	DEFINE USE_NETCFG_WRITE
+	DEFINE USE_CMDL_PARSE
 
 	MODULE MAIN
 
-	ORG 0x8080
+	; Large-variant header.  NETCFG takes one short flag and used the small
+	; layout (ORG 0x8080) until the -w wizard and its per-field hints
+	; outgrew the 8 KB between 0x8080 and LIBBSS_BASE.  Code now lives in
+	; WIN1; BSS and the stack live in a claimed WIN2 page.
+	ORG 0x4100
 
 EXE_HEADER
 	DB "EXE"
 	DB EXE_VERSION
-	DW 0x0080
+	DW 0x0100
 	DW 0
 	DW 0
 	DW 0
@@ -45,13 +54,14 @@ EXE_HEADER
 	DW 0
 	DW START
 	DW START
-	DW STACK_TOP
-	DS 106, 0
+	DW 0x8000			; entry stack in WIN1 (own page);
+					; START moves it into WIN2
+	DS 234, 0
 
-	ORG 0x8100
-@STACK_TOP
+	ORG 0x4200
 
 START
+	CLAIM_RUNTIME_PAGE		; WIN2 is the caller's page until this runs
 	; DSS supplies [length,text...] through IX.  Capture it before
 	; PRINTLN (RST DSS) or any CALL can clobber IX.
 	LD	(CMDL_SOURCE_PTR),IX
@@ -74,6 +84,8 @@ START
 	JP	Z,DO_CHECK
 	CP	'd'
 	JP	Z,DO_DELETE
+	CP	'w'
+	JP	Z,DO_WRITE
 	; Default: show
 	JP	DO_SHOW
 
@@ -155,7 +167,7 @@ PARSE_FLAG
 .LOWER
 	ADD	A,'a'-'A'
 .OK
-	; Validate known flags: i, c, d, v
+	; Validate known flags: i, c, d, v, w
 	CP	'i'
 	JR	Z,.RET
 	CP	'c'
@@ -163,6 +175,8 @@ PARSE_FLAG
 	CP	'd'
 	JR	Z,.RET
 	CP	'v'
+	JR	Z,.RET
+	CP	'w'
 	JR	Z,.RET
 	; unknown flag
 .BAD
@@ -329,6 +343,17 @@ COPY_ASCIIZ
 
 
 ; ------------------------------------------------------
+; DO_WRITE: run the interactive NET.CFG wizard.
+; ------------------------------------------------------
+DO_WRITE
+	CALL	PRINT_CFG_PATH
+	CALL	@NETCFGW.RUN
+	JP	NC,@UTIL.EXIT_OK
+	LD	B,A
+	JP	@UTIL.EXIT_FAIL
+
+
+; ------------------------------------------------------
 ; DO_CHECK: call NETCFG.LOAD; on failure exit 4.
 ; ------------------------------------------------------
 DO_CHECK
@@ -444,8 +469,8 @@ DO_INIT
 	LD	IX,@NETCFG.NTP
 	CALL	SETENV_STR
 	LD	HL,N_NET_TZ
-	LD	A,(@NETCFG.TZ)
-	CALL	SETENV_TZ
+	LD	IX,@NETCFG.TZ
+	CALL	SETENV_STR
 	; NET=RTL is the backend marker a launcher reads to decide which
 	; UNET DLL to load (the Wi-Fi kit publishes NET=WIFI).  UNETRTL.DLL
 	; also accepts the legacy state -- no NET at all, but NET_IP and
@@ -793,43 +818,6 @@ SETENV_LITERAL
 
 
 ; ------------------------------------------------------
-; SETENV_TZ: build "NAME=+N" or "NAME=-N" from signed A.
-;   In: HL = name; A = signed byte.
-; ------------------------------------------------------
-SETENV_TZ
-	LD	C,A			; preserve value
-	LD	DE,SET_BUF
-	CALL	COPY_ASCIIZ
-	DEC	DE
-	LD	A,'='
-	LD	(DE),A
-	INC	DE
-	LD	A,C
-	BIT	7,A
-	JR	NZ,.NEG
-	LD	A,'+'
-	LD	(DE),A
-	INC	DE
-	LD	A,C
-	JR	.WR
-.NEG
-	LD	A,'-'
-	LD	(DE),A
-	INC	DE
-	LD	A,C
-	NEG
-.WR
-	CALL	FMT_BYTE_DEC
-	XOR	A
-	LD	(DE),A
-	LD	HL,SET_BUF
-	LD	B,ENV_SET
-	LD	C,DSS_ENVIRON
-	RST	DSS
-	RET
-
-
-; ------------------------------------------------------
 ; FMT_BYTE_DEC: format byte A as ASCII decimal at (DE),
 ; no leading zeros (single "0" for zero input). DE advances
 ; past the digits.
@@ -954,8 +942,9 @@ MSG_HELP
 	DB "  NETCFG -i       init: load NET.CFG into NET_* env",13,10
 	DB "  NETCFG -c       check NET.CFG syntax",13,10
 	DB "  NETCFG -d       delete all NET_* env vars",13,10
+	DB "  NETCFG -w       interactive wizard: create/edit NET.CFG",13,10
 	DB "  NETCFG /?       this help (-? -h also accepted)",13,10
-	DB "Exit: 0 ok, 1 usage, 2 no card, 3 NIC, 4 config",13,10,0
+	DB "Exit: 0 ok, 1 usage, 2 no card, 3 NIC, 4 config, 5 write, 7 cancel",13,10,0
 
 ; Variable name table (ASCIIZ entries; final entry = empty).
 ; Order matters only for SHOW output.
@@ -996,8 +985,19 @@ INIT_FAIL_CODE	EQU APP_BSS_BASE + 546		; 1 byte: exit code for FINISH
 	ENDMODULE
 
 
+	; netcfg_write.asm calls into MAIN/NETCFG/CMDL/UTIL/ISA/RTL, all of
+	; which are only fully defined once their own INCLUDE runs, but
+	; sjasmplus resolves labels across the whole multi-pass assembly
+	; regardless of INCLUDE order -- listed first only because that is
+	; where the wizard conceptually sits, closest to the app itself.
+	INCLUDE "netcfg_write.asm"
 	; netcfg_lib pulls UTIL helpers transitively; include before util.asm.
 	INCLUDE "netcfg_lib.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
+	INCLUDE "cmdline_lib.asm"
+	INCLUDE "win2page.asm"
+
+	ASSERT $ <= 0x7F80			; image must stay inside WIN1
+	ASSERT MAIN.INIT_FAIL_CODE + 1 < RT_STACK_TOP - 0x0100

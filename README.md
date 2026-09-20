@@ -123,8 +123,14 @@ all. Confirmed by an A/B on the same card, cable and evening: the old
 
 The `distr/sprinter-rtl8019a.zip` archive and the FAT12 floppy image both
 ship 8.3 names so they can be unpacked / copied directly onto the target
-FAT16 hard disk. After unpacking, configure networking by renaming the
-sample config:
+FAT16 hard disk. After unpacking, configure networking either
+interactively:
+
+```
+NETCFG -w
+```
+
+or by renaming the sample config and editing it by hand:
 
 ```
 REN NETSMPL.CFG NET.CFG
@@ -133,8 +139,11 @@ REN NETSMPL.CFG NET.CFG
 Then edit `NET.CFG` for your local network.  The keys are `RTL_HW`
 (ISA slot and I/O base as `S/#HHH`), `RTL_IRQ`, `RTL_RESET`, `RTL_MAC`,
 `IP` (a literal address or the keyword `DHCP`), `NETMASK`, `GATEWAY`,
-`DNS1`, `DNS2`, `TZ` and `NTP`.  The template documents each one
-inline; every key is optional except `IP`.
+`DNS1`, `DNS2`, `TZ` (local UTC offset, `[+|-]H[H][:MM]`, e.g. `+5:30`)
+and `NTP`.  The template documents each one inline; every key is
+optional except `IP`.  (`NETCFG -w` does not have an `RTL_IRQ` prompt or
+preserve comments -- see `NETCFG.TXT` for what its canonical rewrite
+does and does not keep.)
 
 Run `NETCFG -i`, then `IFUP`, and use `PING` to verify connectivity.
 For hardware troubleshooting, `NICINFO`, `ISAPROBE` and `NICEEP` are

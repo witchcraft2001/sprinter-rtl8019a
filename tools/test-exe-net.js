@@ -7,7 +7,7 @@
 const assert = require('assert');
 const path = require('path');
 const { runExe } = require('./exe-harness/harness.js');
-const { count, caseCount, checkCleanupClaimedPage } = require('./exe-harness/test-util.js');
+const { count, caseCount, checkCleanup, checkCleanupClaimedPage } = require('./exe-harness/test-util.js');
 
 const root = path.resolve(__dirname, '..');
 const exe = (name) => path.join(root, 'build', `${name}.EXE`);
@@ -443,6 +443,54 @@ const arpToDns = { mac: [2, 0, 0, 0, 0, 1] };
   assert.match(r.output, /Local time: 2023-11-14 17:13:20 \(TZ -5\)/);
   checkCleanupClaimedPage(r);
 }
+{ // NET_TZ minute offset rolls the local date/time forward past midnight
+  const r = run('NTP', '192.168.7.1', {
+    environment: { ...NET_ENV, NET_TZ: '+5:30' },
+    responders: { arp: arpToDns, ntp: { unixSeconds: 1700000000 } },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /UTC time:   2023-11-14 22:13:20/);
+  assert.match(r.output, /Local time: 2023-11-15 03:43:20 \(TZ \+5:30\)/);
+  checkCleanupClaimedPage(r);
+}
+{ // negative NET_TZ minute offset
+  const r = run('NTP', '192.168.7.1', {
+    environment: { ...NET_ENV, NET_TZ: '-3:30' },
+    responders: { arp: arpToDns, ntp: { unixSeconds: 1700000000 } },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /UTC time:   2023-11-14 22:13:20/);
+  assert.match(r.output, /Local time: 2023-11-14 18:43:20 \(TZ -3:30\)/);
+  checkCleanupClaimedPage(r);
+}
+{ // malformed minute field (single digit) falls back to UTC, does not crash
+  const r = run('NTP', '192.168.7.1', {
+    environment: { ...NET_ENV, NET_TZ: '+5:3' },
+    responders: { arp: arpToDns, ntp: { unixSeconds: 1700000000 } },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Local time: 2023-11-14 22:13:20 \(TZ \+0\)/);
+  checkCleanupClaimedPage(r);
+}
+{ // out-of-range minute field falls back to UTC, does not crash
+  const r = run('NTP', '192.168.7.1', {
+    environment: { ...NET_ENV, NET_TZ: '+5:75' },
+    responders: { arp: arpToDns, ntp: { unixSeconds: 1700000000 } },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Local time: 2023-11-14 22:13:20 \(TZ \+0\)/);
+  checkCleanupClaimedPage(r);
+}
+{ // a three-digit hour must NOT wrap the 8-bit accumulator: 264 mod 256 = 8,
+  // so an unguarded parser would silently shift the clock by +8 hours.
+  const r = run('NTP', '192.168.7.1', {
+    environment: { ...NET_ENV, NET_TZ: '+264' },
+    responders: { arp: arpToDns, ntp: { unixSeconds: 1700000000 } },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Local time: 2023-11-14 22:13:20 \(TZ \+0\)/);
+  checkCleanupClaimedPage(r);
+}
 { // no NTP reply
   const r = run('NTP', '192.168.7.1', { environment: { ...NET_ENV }, responders: { arp: arpToDns } });
   assert.strictEqual(r.exitCode, 3);
@@ -665,6 +713,12 @@ const NET_CFG_SAMPLE = 'IP=192.168.7.2\r\nNETMASK=255.255.255.0\r\nGATEWAY=192.1
   assert.strictEqual(r.environment.NET, 'RTL');
   count();
 }
+{ // TZ minute offset survives NET.CFG -> NET_TZ verbatim (previously truncated to "+5")
+  const r = run('NETCFG', '-i', netcfgFiles(NET_CFG_SAMPLE.replace('TZ=-5', 'TZ=+5:30')));
+  assert.strictEqual(r.exitCode, 0);
+  assert.strictEqual(r.environment.NET_TZ, '+5:30');
+  count();
+}
 { // IP=DHCP: only the mode flag is published; stale IP/MASK/GW/DNS are cleared
   const r = run('NETCFG', '-i', netcfgFiles('IP=DHCP\r\nRTL_MAC=02:80:19:11:22:33\r\n'));
   assert.strictEqual(r.exitCode, 0);
@@ -793,6 +847,316 @@ const NET_CFG_SAMPLE = 'IP=192.168.7.2\r\nNETMASK=255.255.255.0\r\nGATEWAY=192.1
   assert.strictEqual(r.exitCode, 1);
   assert.match(r.output, /\[E\] usage: unknown or malformed flag/);
   count();
+}
+
+// ---------------------------------------------------------------------
+// NETCFG -w (interactive wizard)
+// ---------------------------------------------------------------------
+const netcfgNoFile = () => ({ appDir: NETCFG_APPDIR, files: {} });
+// What the screen actually shows: apply the 0x08 cursor-left the wizard uses
+// for its blinking cursor and for Backspace, so assertions read the finished
+// line rather than the keystroke-by-keystroke trail that produced it.
+const rendered = (text) => {
+  const out = [];
+  for (const ch of text) { if (ch === '\x08') out.pop(); else out.push(ch); }
+  return out.join('');
+};
+const NETCFG_W_NEW_FILE =
+  '# NET.CFG -- written by NETCFG -w.  Run NETCFG -i to apply.\r\n' +
+  '# Empty value = not set.  RTL_RESET empty = AUTO (driver decides).\r\n' +
+  'RTL_HW=\r\nRTL_RESET=\r\nRTL_MAC=\r\nIP=DHCP\r\nNETMASK=\r\nGATEWAY=\r\n' +
+  'DNS1=\r\nDNS2=\r\nTZ=+3\r\nNTP=pool.ntp.org\r\n';
+{ // fresh machine, all Enter: NETSMPL.CFG-style defaults, byte-exact file
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /NET\.CFG written\.  Run NETCFG -i to apply\./);
+  assert.strictEqual(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), NETCFG_W_NEW_FILE);
+  checkCleanupClaimedPage(r);
+}
+{ // editing an existing file changes only the touched key
+  const existing = 'RTL_HW=1/#300\r\nRTL_RESET=SOFT\r\nRTL_MAC=aa:bb:cc:dd:ee:ff\r\n' +
+    'IP=10.0.0.5\r\nNETMASK=255.255.255.0\r\nGATEWAY=10.0.0.1\r\n' +
+    'DNS1=8.8.8.8\r\nDNS2=8.8.4.4\r\nTZ=+2\r\nNTP=old.example.com\r\n';
+  const r = run('NETCFG', '-w', {
+    appDir: NETCFG_APPDIR, files: { [`${NETCFG_APPDIR}\\NET.CFG`]: existing },
+    keys: ['enter', 'n', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter',
+           'new.example.com', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  const written = r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1');
+  assert.match(written, /NTP=new\.example\.com/);
+  for (const line of ['RTL_HW=1/#300', 'RTL_RESET=SOFT', 'RTL_MAC=aa:bb:cc:dd:ee:ff',
+    'IP=10.0.0.5', 'NETMASK=255.255.255.0', 'GATEWAY=10.0.0.1', 'DNS1=8.8.8.8', 'DNS2=8.8.4.4', 'TZ=+2']) {
+    assert.ok(written.includes(line + '\r\n'), `expected ${line} unchanged, got:\n${written}`);
+  }
+  checkCleanupClaimedPage(r);
+}
+{ // Esc mid-wizard: cancels (exit 7), leaves the existing file byte-identical
+  const existing = 'IP=10.0.0.1\r\nNETMASK=255.0.0.0\r\n';
+  const r = run('NETCFG', '-w', {
+    appDir: NETCFG_APPDIR, files: { [`${NETCFG_APPDIR}\\NET.CFG`]: existing },
+    keys: ['enter', 'n', 'enter', 'enter', 'escape'],
+  });
+  assert.strictEqual(r.exitCode, 7);
+  assert.match(r.output, /Cancelled -- NET\.CFG left unchanged\./);
+  assert.strictEqual(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), existing);
+  checkCleanupClaimedPage(r);
+}
+{ // @UTIL.PARSE_DEC_BYTE overflow ("999" -> 231 mod 256) must be rejected,
+  // not silently accepted as a wrapped-around address -- the field is
+  // reprompted and only the corrected value is committed.
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', '999.1.1.1', 'enter', '10.0.0.5', 'enter',
+           'enter', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /  invalid value, try again\./);
+  const invalidCount = (r.output.match(/invalid value, try again/g) || []).length;
+  assert.strictEqual(invalidCount, 1, 'error should print exactly once');
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), /IP=10\.0\.0\.5/);
+  checkCleanupClaimedPage(r);
+}
+{ // DHCP: the four static-only prompts never appear
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.doesNotMatch(r.output, /NETMASK \[/);
+  assert.doesNotMatch(r.output, /GATEWAY \[/);
+  assert.doesNotMatch(r.output, /DNS1 \[/);
+  assert.doesNotMatch(r.output, /DNS2 \[/);
+  count();
+}
+{ // hints: every step explains itself -- in particular what RTL_RESET is and
+  // that HARD can freeze the machine -- and a hint is printed ONCE per field,
+  // not again on the re-prompt that follows a rejected value
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', '999.1.1.1', 'enter', '10.0.0.5', 'enter',
+           'enter', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Esc\r?\nquits without saving/);
+  assert.match(r.output, /AUTO - decide by chip type \(recommended/);
+  assert.match(r.output, /HARD - always pulse it\.  This FREEZES the computer/);
+  assert.match(r.output, /The probe looks for the card[\s\S]*Probe for the card now \[Y\/n\]/);
+  assert.strictEqual((r.output.match(/IP address of this computer/g) || []).length, 1);
+  assert.strictEqual((r.output.match(/^IP \[/gm) || []).length, 2, 'IP prompt itself repeats');
+  for (const line of rendered(r.output).split(/\r?\n/)) assert.ok(line.length < 80, `line too wide: ${line}`);
+  checkCleanupClaimedPage(r);
+}
+{ // DHCP: hints of the skipped static-only fields are not shown either
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.doesNotMatch(r.output, /Network mask|Gateway:|DNS server/);
+  count();
+}
+{ // a blinking cursor marks every prompt, so a waiting wizard cannot be
+  // mistaken for a hung one.  It is drawn as '_' stepped back over with 0x08,
+  // and the cell is blanked again before the keystroke is echoed -- so the
+  // finished line must carry no leftover underscore.
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', '1/#300', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /RTL_RESET \[AUTO\]: _\x08/, 'cursor must appear at the field prompt');
+  assert.match(r.output, /Probe for the card now \[Y\/n\]\? _\x08/, 'and at the Y/N prompt');
+  const screen = rendered(r.output);
+  assert.match(screen, /^RTL_HW \[\]: 1\/#300$/m, 'typed text lands on a clean cell');
+  assert.match(screen, /^RTL_RESET \[AUTO\]: $/m, 'no cursor left behind on Enter');
+  assert.doesNotMatch(screen, /_$/m, 'no line may end with a leftover cursor');
+  checkCleanupClaimedPage(r);
+}
+{ // the pre-prompt flush (K_CLEAR chained to #33 CTRLKEY, which reports
+  // modifiers instead of popping the ring) must not swallow a keystroke:
+  // exactly as many keys are consumed as the script sends
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', 'enter', '+5:30', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), /TZ=\+5:30\r\n/);
+  checkCleanupClaimedPage(r);
+}
+{ // Backspace still erases, now that the cursor shares the same cell
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', '10.0.0.59', 'backspace', 'enter',
+           'enter', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(rendered(r.output), /^IP \[DHCP\]: 10\.0\.0\.5$/m);
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), /IP=10\.0\.0\.5\r\n/);
+  checkCleanupClaimedPage(r);
+}
+{ // TZ: minute offset accepted; malformed/out-of-range minutes rejected.
+  // DHCP (kept via Enter on IP) skips NETMASK/GATEWAY/DNS1/DNS2, so TZ is
+  // the very next prompt after IP.
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', 'enter',
+           '+5:3', 'enter', '+15', 'enter', '+5:30', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  const invalidCount = (r.output.match(/invalid value, try again/g) || []).length;
+  assert.strictEqual(invalidCount, 2, `expected 2 rejections, got:\n${r.output}`);
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), /TZ=\+5:30/);
+  checkCleanupClaimedPage(r);
+}
+{ // TZ: a three-digit hour is rejected rather than wrapped (264 mod 256 = 8,
+  // which would otherwise be written to NET.CFG as a plausible-looking "+8")
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'n', 'enter', 'enter', 'enter',
+           '+264', 'enter', '+5', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  const invalidCount = (r.output.match(/invalid value, try again/g) || []).length;
+  assert.strictEqual(invalidCount, 1, `expected 1 rejection, got:\n${r.output}`);
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), /TZ=\+5\r\n/);
+  checkCleanupClaimedPage(r);
+}
+{ // an invalid TZ= already in NET.CFG must not survive a plain Enter: TZ is
+  // the one field @NETCFG.LOAD hands over unparsed, so the wizard validates
+  // the loaded default itself and blanks what it cannot canonicalize.
+  const existing = 'IP=10.0.0.5\r\nNETMASK=255.255.255.0\r\nTZ=+5:3\r\n';
+  const r = run('NETCFG', '-w', {
+    appDir: NETCFG_APPDIR, files: { [`${NETCFG_APPDIR}\\NET.CFG`]: existing },
+    keys: ['enter', 'n', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter',
+           'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  const written = r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1');
+  assert.ok(written.includes('TZ=\r\n'), `expected TZ blanked, got:\n${written}`);
+  assert.ok(written.includes('IP=10.0.0.5\r\n'), 'other fields must survive');
+  checkCleanupClaimedPage(r);
+}
+{ // Esc at the probe Y/N prompt cancels the wizard, like Esc at any other
+  // prompt -- it does not silently mean "no" and carry on
+  const existing = 'IP=10.0.0.1\r\n';
+  const r = run('NETCFG', '-w', {
+    appDir: NETCFG_APPDIR, files: { [`${NETCFG_APPDIR}\\NET.CFG`]: existing },
+    keys: ['enter', 'escape'],
+  });
+  assert.strictEqual(r.exitCode, 7);
+  assert.match(r.output, /Cancelled -- NET\.CFG left unchanged\./);
+  assert.strictEqual(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), existing);
+  checkCleanupClaimedPage(r);
+}
+{ // probe finds the card and updates both RTL_HW (wizard field) and the
+  // live NET_RTL_HW env var (INIT_BASE's auto-scan side effect).  The probe
+  // runs BEFORE the RTL_HW prompt, so RTL_HW is asked exactly once, with the
+  // discovered value as its default.
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'y', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Found: MAC=02:80:19:11:22:33/);
+  assert.strictEqual((r.output.match(/RTL_HW \[/g) || []).length, 1, `RTL_HW asked more than once:\n${r.output}`);
+  assert.match(r.output, /RTL_RESET \[AUTO\][\s\S]*Probe for the card now[\s\S]*Found: MAC=[\s\S]*RTL_HW \[1\/#300\]: /);
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), /RTL_HW=1\/#300\r\n/);
+  assert.ok(r.environment.NET_RTL_HW, 'INIT_BASE auto-scan should have published NET_RTL_HW');
+  checkCleanupClaimedPage(r);
+}
+{ // the probe question's hint shows the REAL default: [Y/n] normally, and a
+  // bare Enter then probes...
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['enter', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /Probe for the card now \[Y\/n\]\? /);
+  assert.match(r.output, /Found: MAC=/);
+  checkCleanupClaimedPage(r);
+}
+{ // ...but [y/N] with a warning when RTL_RESET is HARD, and Enter skips it
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['hard', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /RTL_RESET is HARD/);
+  assert.match(r.output, /Probe for the card now \[y\/N\]\? /);
+  assert.doesNotMatch(r.output, /Found: MAC=/);
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), /RTL_RESET=HARD\r\n/);
+  checkCleanupClaimedPage(r);
+}
+{ // Esc at the RTL_HW prompt that follows a successful probe cancels too
+  const r = run('NETCFG', '-w', { ...netcfgNoFile(), keys: ['enter', 'y', 'escape'] });
+  assert.strictEqual(r.exitCode, 7);
+  assert.match(r.output, /Found: MAC=/);
+  assert.strictEqual(r.files[`${NETCFG_APPDIR}\\NET.CFG`], undefined, 'no file may be written');
+  checkCleanupClaimedPage(r);
+}
+{ // probing a clone that hangs on the reset port must not hang the harness
+  // (RTL_RESET defaults to AUTO, so the driver's own chip-ID check decides)
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    quirks: { variant: 'UM9003', hangOnResetPort: true },
+    keys: ['enter', 'y', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0);
+  count();
+}
+{ // write failure: exit 5, every opened handle still gets closed
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    fileWriteFailAt: 1,
+    keys: ['enter', 'n', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 5);
+  assert.match(r.output, /\[E\] could not write NET\.CFG\./);
+  assert.strictEqual(r.cleanup.filesClosed, true);
+  // The lowest SP of the whole run is the WIN1 entry stack (0x8000 down,
+  // used only by CLAIM_RUNTIME_PAGE before SP moves to RT_STACK_TOP); it must
+  // stay above the image ceiling the app asserts (0x7F80).
+  assert.ok(r.minimumSp >= 0x7F80, `stack ran too low: 0x${r.minimumSp.toString(16)}`);
+  count();
+}
+{ // an existing NET.CFG that cannot even be read is never overwritten
+  const r = run('NETCFG', '-w', {
+    appDir: NETCFG_APPDIR, files: { [`${NETCFG_APPDIR}\\NET.CFG`]: 'IP=10.0.0.1\r\n' },
+    fileReadFailAt: 1,
+    keys: [],
+  });
+  assert.strictEqual(r.exitCode, 4);
+  assert.match(r.output, /\[E\] NET\.CFG exists but could not be read; not overwriting it\./);
+  assert.strictEqual(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), 'IP=10.0.0.1\r\n');
+  count();
+}
+{ // round-trip: -w's own output re-parses cleanly through -i with every
+  // typed value surviving, including the TZ minute offset (Stage A) and
+  // an RTL_RESET word the on-disk format special-cases (HARD).
+  const w = run('NETCFG', '-w', {
+    ...netcfgNoFile(),
+    keys: ['hard', 'enter', 'n', '1/#320', 'enter', 'aa:bb:cc:dd:ee:ff', 'enter',
+           '10.1.1.5', 'enter', '255.255.0.0', 'enter', '10.1.1.1', 'enter',
+           '8.8.8.8', 'enter', '8.8.4.4', 'enter', '+5:45', 'enter', 'ntp.example.org', 'enter'],
+  });
+  assert.strictEqual(w.exitCode, 0);
+  const cfgText = w.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1');
+  const i = run('NETCFG', '-i', netcfgFiles(cfgText));
+  assert.strictEqual(i.exitCode, 0);
+  assert.strictEqual(i.environment.NET_RTL_HW, '1/#320');
+  assert.strictEqual(i.environment.NET_RTL_RESET, 'HARD');
+  assert.strictEqual(i.environment.NET_MAC, 'aa:bb:cc:dd:ee:ff');
+  assert.strictEqual(i.environment.NET_IP, '10.1.1.5');
+  assert.strictEqual(i.environment.NET_MASK, '255.255.0.0');
+  assert.strictEqual(i.environment.NET_GW, '10.1.1.1');
+  assert.strictEqual(i.environment.NET_DNS1, '8.8.8.8');
+  assert.strictEqual(i.environment.NET_DNS2, '8.8.4.4');
+  assert.strictEqual(i.environment.NET_TZ, '+5:45');
+  assert.strictEqual(i.environment.NET_NTP, 'ntp.example.org');
+  count(2);
 }
 
 // ---------------------------------------------------------------------

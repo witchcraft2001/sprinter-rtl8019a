@@ -103,7 +103,7 @@ The kit relies on DSS environment variables populated by
 | `NET_MAC`       | Local MAC (always populated by `NETCFG -i`)      |
 | `NET_DNS1/2`    | DNS servers                                      |
 | `NET_NTP`       | Default NTP server                               |
-| `NET_TZ`        | Timezone offset (signed integer hours)           |
+| `NET_TZ`        | Timezone offset, `[+|-]H[H][:MM]` (e.g. `+5:30`) |
 | `NET_RTL_HW`    | ISA slot + I/O base for the chip, `S/#HHH` form  |
 |                 | (e.g. `1/#300`); set by `NETCFG -i` from         |
 |                 | `RTL_HW=` or by the auto-scan in `INIT_BASE`     |
@@ -150,7 +150,9 @@ RTL_RESET=SOFT            skip the board reset port at BASE+0x1F
 DNS1=1.1.1.1              ignored when IP=DHCP
 DNS2=8.8.8.8              ignored when IP=DHCP
 NTP=pool.ntp.org          for NTP.EXE
-TZ=+3                     signed integer hours
+TZ=+3                     local offset from UTC, "[+|-]H[H][:MM]"
+TZ=+5:30                  minute offsets are supported (e.g. India,
+                          Nepal, Central Australia); range -12..+14
 ```
 
 Lines starting with `#` are comments; unknown keys are ignored.
@@ -216,7 +218,7 @@ IF ERRORLEVEL 3 GOTO NOLINK
 ECHO Network up.
 GOTO END
 :NOCFG
-ECHO NET.CFG missing or invalid; copy NETSMPL.CFG to NET.CFG.
+ECHO NET.CFG missing or invalid; run NETCFG -w or copy NETSMPL.CFG to NET.CFG.
 GOTO END
 :NOLINK
 ECHO Gateway unreachable.

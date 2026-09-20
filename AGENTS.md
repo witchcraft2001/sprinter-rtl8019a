@@ -371,8 +371,7 @@ Mandatory rule:
 
 - Use the small variant (`ORG 0x8080`) ONLY for utilities that do not
   expect a long command-line argument list. Acceptable for: `HELLO`,
-  `NICINFO`, `NICRAM`, `NICLB`, `NICTX`, `NICRX`, `NETCFG` show/set with
-  short args, `ARP` show, `NICDUMP` and similar diagnostics that take no
+  `NICINFO`, `NICRAM`, `NICLB`, `NICTX`, `NICRX`, `ARP` show, `NICDUMP` and similar diagnostics that take no
   arguments or only one short flag/value.
 - Use the large variant (`ORG 0x4100`, entry `0x4200`, SP `0xBFFF`) for
   any utility that parses URLs, host names, file paths, multi-token
@@ -380,6 +379,11 @@ Mandatory rule:
   through `IX`. Required for: `WGET`, `TFTP`, `FTP`, `NTP` (with server arg),
   `PING` (with host arg), `UDPTEST` (host/port/payload), and any future
   tool of the same shape.
+
+Size can force the move too: the small variant has only ~8 KB between
+`0x8080` and `LIBBSS_BASE` (`0xA000`).  `NETCFG` takes a single short flag
+but uses the large variant since 0.3.23, when the `-w` wizard and its
+per-field hints outgrew that space.
 
 If a utility starts as a no-arg diagnostic (small variant) and later grows
 command-line arguments, migrate it to the large variant in the same change

@@ -11,8 +11,78 @@ NETCFG          show current NET_* env values
 NETCFG -i       init: load NET.CFG into NET_* env vars
 NETCFG -c       check NET.CFG syntax (no env writes)
 NETCFG -d       delete all NET_* env vars
+NETCFG -w       interactive wizard: create/edit NET.CFG
 NETCFG /?       help (-? -h also accepted)
 ```
+
+## `-w`: interactive wizard
+
+`NETCFG -w` walks through every key in order -- `RTL_RESET`, an optional
+card probe, `RTL_HW`, `RTL_MAC`, `IP` (or `DHCP`), and, only when `IP` is
+not `DHCP`, `NETMASK`/`GATEWAY`/`DNS1`/`DNS2`, then `TZ` and `NTP` -- and
+writes a fresh, canonical `NET.CFG`. Each prompt shows the current value
+in brackets:
+
+```
+RTL_HW [1/#300]:
+```
+
+Above each prompt the wizard prints a short hint: what the key means,
+an example value, and what leaving it empty does. The two that matter
+most are spelled out in full -- `RTL_RESET` (what AUTO / SOFT / HARD do,
+and that HARD freezes the computer on some NE2000 clones) and the probe
+(safe with AUTO and SOFT; with HARD it warns first and defaults to No).
+A hint is shown once per key; a rejected value repeats only the prompt.
+
+A blinking `_` cursor sits at every prompt, including the probe
+question, so a wizard waiting for input is never mistaken for a hung
+one.
+
+Press Enter to keep it, type a new value and press Enter to replace it,
+type a lone `-` and press Enter to clear an optional field, Backspace to
+correct a typo, or Esc at any point to abandon the wizard -- the existing
+file (if any) is untouched until every field has validated and the whole
+thing is written at once.
+
+Esc means the same thing at every step, including the probe question.
+
+If no `NET.CFG` exists yet, the wizard starts from the same defaults as
+`config/NETSMPL.CFG` (`IP=DHCP`, `NTP=pool.ntp.org`, `TZ=+3`). If one
+exists but cannot be read, `-w` refuses to touch it (exit 4) rather than
+risk overwriting something the parser choked on for an unrelated reason.
+
+Defaults shown in brackets are already canonical, so pressing Enter
+through the whole wizard rewrites the file without changing its meaning.
+`TZ` is the one key the loader hands over unparsed, so the wizard
+validates it too: an existing `TZ=` line it cannot canonicalize (say
+`TZ=+5:3`) is offered as an empty default rather than written back
+unchanged, and an empty `TZ=` means UTC.
+
+**The rewrite is canonical, not an edit in place.** Comments and any key
+the wizard does not know about (`RTL_IRQ=`, for instance) are not
+preserved -- every run produces the same ten `KEY=value` lines in the
+same order. `RTL_RESET=AUTO` is written as an *empty* `RTL_RESET=` line
+(the parser treats absent and empty the same way); typing `AUTO` at the
+prompt is just the readable spelling of that.
+
+**The probe step is optional** (`Probe for the card now [Y/n]?`). The
+default is Yes, except when `RTL_RESET` is `HARD`: then the wizard warns
+that a probe pulses the board reset port, which can hang some NE2000
+clones, and the default becomes No (`[y/N]`). That is why `RTL_RESET` is
+asked first. The probe reuses `NETCFG -i`'s own MAC-from-PROM path: the
+`RTL_RESET` answer and the `RTL_HW` value already in `NET.CFG` (if any)
+are published to the environment first, exactly as `-i` does, and a
+missing or wrong `RTL_HW` falls back to the driver's auto-scan. A
+successful probe shows the MAC it found, and the discovered slot/base
+becomes the default of the `RTL_HW` prompt that follows -- `RTL_HW` is
+asked once, after the probe; a failed probe leaves that default as it
+was, to be typed by hand or left empty (auto-scan). Either way, the
+auto-scan inside `INIT_BASE` publishes `NET_RTL_HW` to the *current*
+session's environment as a side effect -- that is `INIT_BASE`'s normal
+behavior, not something `-w` does deliberately, and it does not affect
+what gets written to `NET.CFG`. **`-w` never publishes `NET_*`
+variables from what it wrote** -- run `NETCFG -i` afterwards to apply
+the new file.
 
 ## The MAC address
 
@@ -71,4 +141,6 @@ relative to the caller's current directory. `-i` and `-c` print
 | 1    | Usage                                             |
 | 2    | Card not found (`-i`, no MAC obtainable)          |
 | 3    | Card found but its PROM could not be read (`-i`)  |
-| 4    | Config error: bad/missing NET.CFG, or no MAC in PROM |
+| 4    | Config error: bad/missing NET.CFG, or no MAC in PROM; or (`-w`) an existing NET.CFG could not be read |
+| 5    | (`-w`) could not write NET.CFG                    |
+| 7    | (`-w`) cancelled by the user (Esc)                |

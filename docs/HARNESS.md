@@ -131,8 +131,30 @@ code was 0.
   files: { 'C:\\NET\\FOO.TXT': 'contents' },
   currentDir: 'C:\\NET',
   appDir: 'C:\\NET',
-  key: 'escape',             // simulated WAITKEY/SCANKEY input
+  key: 'escape',             // simulated WAITKEY/SCANKEY fallback (no `keys`,
+                             // or `keys` queue exhausted while scenario.key
+                             // is set)
+  keys: ['a', 'enter', 'escape'], // scripted sequence, one entry per key;
+                             // a multi-char string entry expands to one
+                             // keypress per character (types a line + Enter).
+                             // SCANKEY/TESTKEY pop it only when keyReady()
+                             // (see keyAtScan/keyIntervalScans below) --
+                             // WAITKEY instead CONSUMES one entry per call,
+                             // unconditionally, since a real WAITKEY blocks:
+                             // there is no poll loop to gate against. A
+                             // WAITKEY call made after the queue is empty is
+                             // a scenario/program mismatch and throws
+                             // (with the stdout captured so far), rather
+                             // than freezing on a fabricated key for the
+                             // full step budget.
   keyAtScan: 3,               // which SCANKEY poll delivers it
+  keyIntervalScans: 5,        // min SCANKEY/TESTKEY polls between two keys
+                             // from `keys` (a typing-speed knob; does not
+                             // consume it).  #33 CTRLKEY is modelled as a
+                             // peek that reports modifiers and pops nothing,
+                             // so K_CLEAR+CTRLKEY ("drop stale input") does
+                             // not eat a scripted keystroke.
+                             // apply to WAITKEY, which has no poll to space out)
   strictClosedChipAccess: true, // default; false disables invariant #8
   fastDelayLoops: true,      // default; false disables DELAY_1MS fast-forward
   poison: true,               // default; fills RAM/NIC-RAM with 0xAA first
