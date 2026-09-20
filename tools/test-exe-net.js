@@ -674,6 +674,41 @@ const NET_CFG_SAMPLE = 'IP=192.168.7.2\r\nNETMASK=255.255.255.0\r\nGATEWAY=192.1
   assert.strictEqual(r.environment.NET_GW, undefined);
   count();
 }
+{ // NET.CFG past the 2 KB read buffer: keys at the end must still be read.
+  // The loader used to do one 2047-byte read, so a commented 2079-byte file
+  // lost its trailing TZ=/NTP= (field report 2026-09-19).
+  const fs = require('fs');
+  const comment = (n) => Array.from({ length: n }, (_, i) =>
+    `# comment line ${String(i).padStart(3, '0')} padding padding padding padding\r\n`).join('');
+  const big = 'IP=192.168.7.2\r\nRTL_MAC=02:80:19:11:22:33\r\n' + comment(80) +
+    'DNS1=1.1.1.1\r\n' + comment(40) + 'TZ=+3\r\nNTP=pool.ntp.org';  // no final CRLF
+  assert.ok(big.length > 6000, `test file too small: ${big.length}`);
+  const long = 'RTL_MAC=02:80:19:11:22:33\r\n# ' + 'x'.repeat(2500) + 'IP=10.9.9.9\r\n' +
+    'IP=192.168.7.2\r\nNTP=long.example\r\n';
+  const sample = fs.readFileSync(path.join(__dirname, '..', 'config', 'NETSMPL.CFG'), 'latin1');
+  const cases = [
+    ['big', big, {}], ['big-short-reads', big, { fileReadMax: 100 }],
+    ['long-line', long, {}], ['sample', sample, {}],
+  ];
+  for (const [label, text, extra] of cases) {
+    const r = run('NETCFG', '-i', { ...netcfgFiles(text), ...extra });
+    assert.strictEqual(r.exitCode, 0, `${label}: exit ${r.exitCode}\n${r.output}`);
+    if (label === 'long-line') {
+      // The tail of the overlong comment must not be parsed as IP=10.9.9.9.
+      assert.strictEqual(r.environment.NET_IP, '192.168.7.2', label);
+      assert.strictEqual(r.environment.NET_NTP, 'long.example', label);
+    } else if (label === 'sample') {
+      assert.strictEqual(r.environment.NET_TZ, '+3', label);
+      assert.strictEqual(r.environment.NET_NTP, 'pool.ntp.org', label);
+    } else {
+      assert.strictEqual(r.environment.NET_IP, '192.168.7.2', label);
+      assert.strictEqual(r.environment.NET_DNS1, '1.1.1.1', label);
+      assert.strictEqual(r.environment.NET_TZ, '+3', label);
+      assert.strictEqual(r.environment.NET_NTP, 'pool.ntp.org', label);
+    }
+    count();
+  }
+}
 { // unknown keys and comments are silently ignored, not a syntax error
   const r = run('NETCFG', '-c', netcfgFiles('# a comment\r\nBOGUS_KEY=xyz\r\n\r\nIP=192.168.7.2\r\n'));
   assert.strictEqual(r.exitCode, 0);

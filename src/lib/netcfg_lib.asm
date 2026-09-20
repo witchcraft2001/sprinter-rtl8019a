@@ -83,6 +83,8 @@ TZ		EQU NETCFG_TZ
 DHCP_MODE	EQU NETCFG_DHCP_MODE
 LOAD_FH		EQU NETCFG_LOAD_FH
 LOAD_BUF	EQU NETCFG_LOAD_BUF
+LOAD_FILL	EQU NETCFG_LOAD_FILL
+LOAD_SKIP	EQU NETCFG_LOAD_SKIP
 OUR_RTL_HW	EQU NETCFG_OUR_RTL_HW
 OUR_RTL_RESET	EQU NETCFG_OUR_RTL_RESET
 PATH_BUF	EQU NETCFG_PATH_BUF
@@ -108,23 +110,99 @@ LOAD
 	RST	DSS
 	RET	C
 	LD	(LOAD_FH),A
-	; Read up to NETCFG_BUF_SIZE-1 bytes.
-	LD	HL,LOAD_BUF
-	LD	DE,NETCFG_BUF_SIZE - 1
+	; The file is streamed through LOAD_BUF: every read tops the buffer
+	; up behind the partial line left from the previous one, everything
+	; up to the last line end is parsed, and the partial tail moves to
+	; the front.  A single read of the buffer size used to be the whole
+	; story, and a file past 2047 bytes lost its trailing keys.
+	LD	HL,0
+	LD	(LOAD_FILL),HL
+	XOR	A
+	LD	(LOAD_SKIP),A
+.READ
+	LD	DE,(LOAD_FILL)
+	LD	HL,NETCFG_BUF_SIZE - 1
+	OR	A
+	SBC	HL,DE
+	EX	DE,HL			; DE = room left, HL = fill
+	LD	BC,LOAD_BUF
+	ADD	HL,BC			; HL = first free byte
+	LD	A,(LOAD_FH)
 	LD	C,DSS_READ_FILE
 	RST	DSS
 	JR	C,.READ_ERR
-	; DE holds actual bytes read. Null-terminate at end.
-	LD	HL,LOAD_BUF
+	; Only a zero-byte read means EOF: a short one may be a DSS quirk.
+	LD	A,D
+	OR	E
+	JR	Z,.EOF
+	LD	HL,(LOAD_FILL)
+	ADD	HL,DE
+	LD	(LOAD_FILL),HL
+	LD	B,H
+	LD	C,L			; BC = bytes held
+	LD	DE,LOAD_BUF
+	ADD	HL,DE
+	LD	(HL),0			; HL = end of data
+.SCAN
+	DEC	HL
+	LD	A,(HL)
+	CP	10
+	JR	Z,.CUT
+	CP	13
+	JR	Z,.CUT
+	DEC	BC
+	LD	A,B
+	OR	C
+	JR	NZ,.SCAN
+	; No line end yet.  Unless the buffer is full, just read on.
+	LD	HL,(LOAD_FILL)
+	LD	DE,NETCFG_BUF_SIZE - 1
+	OR	A
+	SBC	HL,DE
+	JR	NZ,.READ
+	; One line fills the whole buffer: parse what fits and drop the
+	; rest of that line, so its tail is never mistaken for a key.
+	CALL	PARSE_CHUNK
+	LD	A,1
+	LD	(LOAD_SKIP),A
+	LD	HL,0
+	LD	(LOAD_FILL),HL
+	JR	.READ
+.CUT
+	INC	HL			; HL = start of the partial tail
+	PUSH	HL
+	LD	A,(HL)
+	PUSH	AF
+	LD	(HL),0
+	CALL	PARSE_CHUNK
+	POP	AF
+	POP	DE			; DE = start of the tail
+	LD	(DE),A
+	LD	HL,(LOAD_FILL)
+	LD	BC,LOAD_BUF
+	ADD	HL,BC
+	OR	A
+	SBC	HL,DE			; HL = tail length
+	LD	(LOAD_FILL),HL
+	LD	B,H
+	LD	C,L
+	LD	A,B
+	OR	C
+	JR	Z,.READ
+	EX	DE,HL
+	LD	DE,LOAD_BUF
+	LDIR
+	JR	.READ
+.EOF
+	; Whatever is left is a last line without a line end.
+	LD	HL,(LOAD_FILL)
+	LD	DE,LOAD_BUF
 	ADD	HL,DE
 	LD	(HL),0
-	; Close.
+	CALL	PARSE_CHUNK
 	LD	A,(LOAD_FH)
 	LD	C,DSS_CLOSE_FILE
 	RST	DSS
-	; Parse buffer.
-	LD	HL,LOAD_BUF
-	CALL	PARSE
 	OR	A			; CF=0
 	RET
 .READ_ERR
@@ -294,6 +372,21 @@ MATCH_DHCP
 	XOR	A			; ZF=1
 	RET
 
+
+; ------------------------------------------------------
+; PARSE_CHUNK: parse the whole lines now held in LOAD_BUF,
+; first dropping the tail of an overlong line if LOAD_SKIP
+; says the previous chunk ended inside one.
+; ------------------------------------------------------
+PARSE_CHUNK
+	LD	HL,LOAD_BUF
+	LD	A,(LOAD_SKIP)
+	OR	A
+	JR	Z,PARSE
+	XOR	A
+	LD	(LOAD_SKIP),A
+	CALL	SKIP_TO_NEXT_LINE
+	; fall through
 
 ; ------------------------------------------------------
 ; PARSE: walks the zero-terminated buffer at HL line by
