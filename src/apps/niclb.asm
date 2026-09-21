@@ -428,6 +428,13 @@ PRINT_LOOP_DIAG
 	PRINT	MSG_NIC_MPC
 	LD	A,(TALLY_BUF + 2)
 	CALL	@UTIL.PRINT_HEX_A
+	; A clone without tally counters answers them all with one fixed
+	; value; printing that as an error rate invents a broken cable.
+	LD	A,(TALLY_BUF + 4)
+	OR	A
+	JR	Z,.REAL
+	PRINT	MSG_NIC_NA
+.REAL
 	PRINT	LINE_END
 	RET
 
@@ -499,6 +506,7 @@ MSG_FIFO_EQ	DB " FIFO=",0
 MSG_NIC_FAE	DB " NIC fae=",0
 MSG_NIC_CRC	DB " crc=",0
 MSG_NIC_MPC	DB " mpc=",0
+MSG_NIC_NA	DB " (no tally counters on this chip)",0
 MSG_L6		DB "[L6] RX HDR",0
 MSG_STS_EQ	DB " STS=",0
 MSG_NEXT_EQ	DB " NEXT=",0
@@ -541,8 +549,8 @@ RX_BUF		EQU RX_HDR + 4
 FIFO_BUF	EQU RX_BUF + FRAME_LEN	; 8-byte real-chip diagnostic FIFO capture
 LOOP_ISR	EQU FIFO_BUF + 8
 LOOP_RSR	EQU LOOP_ISR + 1
-TALLY_BUF	EQU LOOP_RSR + 1	; CNTR0..2 + RSR from SNAPSHOT_TALLY
-NICLB_BSS_END	EQU TALLY_BUF + 4
+TALLY_BUF	EQU LOOP_RSR + 1	; CNTR0..2 + RSR + "no tallies" flag
+NICLB_BSS_END	EQU TALLY_BUF + 5
 
 	ENDMODULE
 

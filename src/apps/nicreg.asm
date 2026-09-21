@@ -22,8 +22,9 @@
 ;   [G3] page-0 status registers: reported, only CR is checked.
 ;   [G4] one read + write/read-back loop against the chip
 ;        stopped, started but deaf (RCR=MON), and live on the
-;        LAN.  Counts misreads, lost and garbled writes, and
-;        dropped page switches.
+;        LAN.  Every mismatch is re-examined before it is given
+;        a name: misread, lost write, wrong content, or -- when
+;        the re-examination itself fails -- unsure.
 ;   [G5] only with -t: 3 x 20 test frames, EtherType 88B5, to be
 ;        counted on a peer:  A = minimal TX + tight ISR polling,
 ;        B = minimal TX + no chip access for 2 ms, C = the kit's
@@ -155,6 +156,7 @@ START
 	LD	A,(OPT_TX)
 	OR	A
 	CALL	NZ,PHASE_G5
+	CALL	PHASE_G6
 
 	; Leave the controller stopped, as we found it.
 	CALL	@ISA.ISA_OPEN
@@ -500,6 +502,23 @@ G1_FOLD
 	LD	(HL),D
 	DEC	HL
 	LD	(HL),E
+	; Every read of the pass wrong, and all of them alike: the register
+	; holds that value.  It never took the pattern (or a bit is stuck),
+	; which is a failed WRITE -- keep it out of the misread totals.
+	LD	HL,(ACC_BAD)
+	LD	DE,G1_BURSTS * 256
+	OR	A
+	SBC	HL,DE
+	JR	NZ,.MISREADS
+	LD	A,(ACC_AND)
+	LD	B,A
+	LD	A,(ACC_OR)
+	CP	B
+	JR	NZ,.MISREADS
+	LD	HL,G1_LOAD_BAD
+	INC	(HL)
+	RET
+.MISREADS
 	; per-residue total
 	LD	HL,G1_TOT00
 	LD	A,(PASS_RES)
@@ -531,8 +550,11 @@ G1_PRINT
 	PRINT	MSG_COND
 	LD	HL,(COND_BAD)
 	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_LOAD
+	LD	A,(G1_LOAD_BAD)
+	CALL	@UTIL.PRINT_HEX_A
 	PRINT	LINE_END
-	; any misread at all fails the run
+	; any misread at all fails the run, and so does a failed load
 	LD	HL,(G1_TOT00)
 	LD	DE,(G1_TOTFF)
 	LD	A,H
@@ -542,6 +564,8 @@ G1_PRINT
 	LD	HL,(COND_BAD)
 	OR	H
 	OR	L
+	LD	HL,G1_LOAD_BAD
+	OR	(HL)
 	CALL	NZ,SET_FAILED
 	; list the offenders (at most 6 lines: the screen is one photo)
 	XOR	A
@@ -829,14 +853,29 @@ PHASE_G3
 ;   live  started, RCR=AB: broadcasts are buffered meanwhile.
 ; Per sweep: read PAR0..5 against TEST_MAC, then write
 ; MAR0..3 (unused while RCR.AM=0) with a pattern that flips
-; every sweep and read them back.  A read-back that differs
-; is re-read twice: the wanted value now = it was a misread;
-; the previous pattern both times = the write was lost;
-; anything else = the write was garbled.
-; Every page switch goes through SET_PAGE.  Real hardware
-; has shown why: a dropped "CR := page 0" sent the BNRY
-; write of the ring drain into PAR2.
+; every sweep and read them back.
+;
+; A mismatch proves only that ONE access went wrong, not
+; which one.  G4_RECHECK therefore reads the register twice
+; more, each time right after a conditioner whose value is
+; known, and only then gives the event a name:
+;   rd-bad   the wanted value came back: the first read lied;
+;   wr-lost  MAR holds the previous sweep's pattern, and the
+;            conditioner proves that reads work right now;
+;   wr-bad   the register holds something else, reads proven
+;            the same way.  A PAR byte found like this is
+;            written back, so one event counts once;
+;   unsure   the re-examination itself failed.  Nothing is
+;            concluded and nothing is written.
+; Every page switch goes through SET_PAGE and the loop
+; never touches a register on a page it could not confirm.
+; Real hardware has shown why: a dropped "CR := page 0"
+; sent the BNRY write of the ring drain into PAR2.
 ; ======================================================
+RC_MISREAD	EQU 0
+RC_HELD		EQU 1
+RC_UNSURE	EQU 2
+
 PHASE_G4
 	PRINT	MSG_G4
 	LD	HL,TEST_MAC
@@ -883,24 +922,20 @@ G4_ROW
 	LD	(HL),0
 	LDIR
 	CALL	@ISA.ISA_OPEN
-	LD	HL,TEST_MAC
-	LD	A,0
-G4_RCR	EQU $-1
-	CALL	@RTL.INIT_NORMAL
-	LD	A,(ROW_CR_P0)
-	CALL	SET_PAGE
+	CALL	G4_SETUP
 	CALL	@ISA.ISA_CLOSE
-	LD	A,RTL_CURR_INIT
-	LD	(LAST_CURR),A
+	JP	C,G4_ABORT
 	LD	HL,G4_TICKS
 	LD	(TICKS_LEFT),HL
 G4_TICK
 	XOR	A
 	LD	(TICK_MISS),A
+	LD	(TICK_MOVED),A
 	LD	(SWEEP_NO),A
 	CALL	@ISA.ISA_OPEN
 	LD	A,(ROW_CR_P1)
 	CALL	SET_PAGE
+	JP	C,G4_PAGE_LOST
 G4_IT
 	LD	HL,(PAR_ADDR)
 	LD	DE,TEST_MAC
@@ -909,8 +944,8 @@ G4_RD
 	LD	A,(HL)			; exactly one chip read per sample
 	LD	C,A
 	LD	A,(DE)
-	XOR	C
-	CALL	NZ,G4_MISS		; A = wrong bits, C = value, B = 6 - reg
+	CP	C
+	CALL	NZ,G4_MISS		; C = value, HL = register, DE -> wanted
 	INC	HL
 	INC	DE
 	DJNZ	G4_RD
@@ -952,12 +987,25 @@ RB_WANT	EQU $-1
 	CP	G4_ITER
 	JP	NZ,G4_IT
 	CALL	DRAIN_RING
+	JR	C,G4_PAGE_LOST
 	LD	(TICK_MOVED),A
 	CALL	@ISA.ISA_CLOSE
+	JR	G4_TICK_END
+
+	; A page switch that four attempts could not confirm.  Whatever
+	; page the chip is on, this window touches no register any more:
+	; the row's state is set up from scratch instead.
+G4_PAGE_LOST
+	LD	HL,G4_PG_LOST
+	CALL	BUMP
+	CALL	G4_SETUP
+	CALL	@ISA.ISA_CLOSE		; preserves AF
+	JR	C,G4_ABORT
 
 	; Tie the failures to reception.  A frame that was still
 	; arriving when the window closed moves the ring in the
 	; NEXT tick, so a bad tick stays pending for one tick.
+G4_TICK_END
 	LD	A,(TICK_MISS)
 	OR	A
 	JR	Z,.NOMISS
@@ -990,8 +1038,14 @@ RB_WANT	EQU $-1
 	LD	A,H
 	OR	L
 	JP	NZ,G4_TICK
+	JR	G4_PRINT
 
-	; " stop 0000   00   0000    0000   0000   0000    0000     0000"
+G4_ABORT
+	LD	A,1
+	LD	(G4_ABORTED),A
+
+	; " stop 0000   00   0000    0000   0000   0000   0000    0000     0000"
+G4_PRINT
 	LD	HL,0
 G4_LABEL EQU $-2
 	PRINT_HL
@@ -1005,6 +1059,9 @@ G4_LABEL EQU $-2
 	CALL	@UTIL.PRINT_HEX_HL
 	PRINT	MSG_SP4
 	LD	HL,(G4_WR_BAD)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_SP3
+	LD	HL,(G4_UNSURE)
 	CALL	@UTIL.PRINT_HEX_HL
 	PRINT	MSG_SP3
 	LD	HL,(G4_CR_BAD)
@@ -1021,18 +1078,13 @@ G4_LABEL EQU $-2
 	PRINT	LINE_END
 
 	; Any failed access fails the run.
-	LD	HL,(G4_BAD)
-	LD	DE,(G4_CR_BAD)
-	LD	A,H
-	OR	L
-	OR	D
-	OR	E
-	LD	HL,(G4_WR_LOST)
-	LD	DE,(G4_WR_BAD)
-	OR	H
-	OR	L
-	OR	D
-	OR	E
+	LD	HL,G4_FAIL_FIRST
+	LD	B,G4_FAIL_LEN
+	XOR	A
+.ANY
+	OR	(HL)
+	INC	HL
+	DJNZ	.ANY
 	RET	Z
 	CALL	SET_FAILED
 
@@ -1067,19 +1119,30 @@ G4_LABEL EQU $-2
 	DJNZ	.SAMP
 	CALL	PUT_CRLF
 .NO_RD
-	; "  wr MAR1=C3>3C ...": register, wanted > what it holds.
+	; "  wr MAR1=D2>2D PAR2=19>4B ...": register, wanted > what it holds.
 	LD	A,(G4_NWSAMP)
 	OR	A
-	RET	Z
+	JR	Z,.NO_WR
 	PRINT	MSG_WR
 	LD	A,(G4_NWSAMP)
 	LD	B,A
 	LD	HL,G4_WSAMP
 .WSAMP
 	PUSH	BC,HL
-	PRINT	MSG_MAR
+	LD	A,(HL)			; page-1 offset: PAR = 1..6, MAR = 8..B
+	LD	HL,MSG_PAR
+	CP	RTL_MAR0_OFF
+	JR	C,.WNAME
+	LD	HL,MSG_MAR
+.WNAME
+	PRINT_HL
 	POP	HL,BC
 	LD	A,(HL)
+	CP	RTL_MAR0_OFF
+	JR	NC,.WINDEX
+	DEC	A			; PAR0 is offset 1
+.WINDEX
+	AND	0x07			; MAR0 is offset 8
 	CALL	PUT_NIBBLE
 	LD	A,'='
 	CALL	PUTCHAR
@@ -1093,7 +1156,85 @@ G4_LABEL EQU $-2
 	CALL	@UTIL.PRINT_HEX_A
 	INC	HL
 	DJNZ	.WSAMP
+	CALL	PUT_CRLF
+.NO_WR
+	CALL	PRINT_PG_LOST
+	LD	A,(G4_ABORTED)
+	OR	A
+	RET	Z
+	PRINTLN	MSG_G4_ABORTED
+	RET
+
+; ------------------------------------------------------
+; PRINT_PG_LOST: "  page lost=0001 setup retries=0002",
+; and nothing at all when both are zero.  Shared by the
+; phases that drive rows through SET_PAGE and G4_SETUP.
+; ------------------------------------------------------
+PRINT_PG_LOST
+	LD	HL,(G4_PG_LOST)
+	LD	DE,(G4_SETUP_RETRY)
+	LD	A,H
+	OR	L
+	OR	D
+	OR	E
+	RET	Z
+	PRINT	MSG_PG_LOST
+	LD	HL,(G4_PG_LOST)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_SETUP_RETRY
+	LD	HL,(G4_SETUP_RETRY)
+	CALL	@UTIL.PRINT_HEX_HL
 	JP	PUT_CRLF
+
+; ------------------------------------------------------
+; G4_SETUP: bring the chip into this row's state and PROVE
+; it: the page-1 switch is confirmed, PAR0..5 are read back
+; against TEST_MAC, the page-0 switch is confirmed.  The
+; rows count every later PAR mismatch, so a station address
+; that never went in would otherwise be counted 48000 times
+; as a misread.  Any doubt repeats the whole setup, at most
+; 4 times.
+;   Out: CF = the state could not be established.
+; ISA open.  Trashes A, BC, DE, HL, IX.  Plain RAM only.
+; Global labels: G4_RCR would capture the local-label scope.
+; ------------------------------------------------------
+G4_SETUP
+	LD	B,4
+G4_SETUP_TRY
+	PUSH	BC
+	LD	HL,TEST_MAC
+	LD	A,0
+G4_RCR	EQU $-1
+	CALL	@RTL.INIT_NORMAL
+	LD	A,RTL_CURR_INIT
+	LD	(LAST_CURR),A
+	LD	A,(ROW_CR_P1)
+	CALL	SET_PAGE
+	JR	C,G4_SETUP_AGAIN
+	LD	HL,(PAR_ADDR)
+	LD	DE,TEST_MAC
+	LD	B,6
+G4_SETUP_CHK
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,G4_SETUP_AGAIN
+	INC	HL
+	INC	DE
+	DJNZ	G4_SETUP_CHK
+	LD	A,(ROW_CR_P0)
+	CALL	SET_PAGE
+	JR	C,G4_SETUP_AGAIN
+	POP	BC
+	RET				; NC
+G4_SETUP_AGAIN
+	LD	HL,G4_SETUP_RETRY
+	CALL	BUMP
+	LD	A,1
+	LD	(TICK_MISS),A
+	POP	BC
+	DJNZ	G4_SETUP_TRY
+	SCF
+	RET
 
 ; BUMP: saturating increment of the 16-bit counter at HL.
 ; Trashes HL.  Plain RAM only.
@@ -1108,20 +1249,85 @@ BUMP
 	DEC	(HL)
 	RET
 
-; G4_MISS: count one misread, remember the bits and keep the
-; first G4_SAMPLES verbatim.  In: A = wrong bits, C = the value
-; read, B = 6 - register index.  Preserves BC, DE, HL.
-; Plain RAM only -- it runs with the ISA window open.
-G4_MISS
+; ------------------------------------------------------
+; G4_RECHECK: a read of (HL) did not return D.  Find out
+; what can honestly be said about it.  The register is read
+; twice more, each time right after a conditioner: PAR0, or
+; PAR1 when PAR0 is the suspect.  The conditioner's value is
+; known and differs from everything else this phase reads,
+; so it does two jobs: it proves that the read path works at
+; this very moment, and it replaces what is left on the bus,
+; so that a cycle the chip does not answer cannot return
+; something that looks like register content.
+;   In:  HL = register, D = wanted value.
+;   Out: A = RC_MISREAD  the wanted value came back;
+;            RC_HELD     both conditioner reads were right and
+;                        both re-reads returned E, which is
+;                        neither D nor the conditioner's value;
+;            RC_UNSURE   anything else.
+; Preserves D, HL.  Trashes BC, E, IX.  Plain RAM only.
+; ------------------------------------------------------
+G4_RECHECK
 	PUSH	HL
+	LD	IX,(PAR_ADDR)
+	LD	A,(TEST_MAC)
+	LD	(.COND_VAL),A
+	LD	BC,(PAR_ADDR)
+	OR	A
+	SBC	HL,BC
+	POP	HL
+	JR	NZ,.GO
+	INC	IX
+	LD	A,(TEST_MAC + 1)
+	LD	(.COND_VAL),A
+.GO
+	PUSH	HL
+	LD	B,(IX+0)		; conditioner
+	LD	E,(HL)			; second read of the suspect
+	LD	C,(IX+0)		; conditioner
+	LD	H,(HL)			; third read
+	LD	A,D
+	CP	E
+	JR	Z,.MISREAD
+	CP	H
+	JR	Z,.MISREAD
+	LD	A,0
+.COND_VAL EQU $-1
+	CP	B
+	JR	NZ,.UNSURE
+	CP	C
+	JR	NZ,.UNSURE
+	CP	E			; the suspect did not answer at all
+	JR	Z,.UNSURE
+	LD	A,E
+	CP	H
+	JR	NZ,.UNSURE
+	LD	A,RC_HELD
+	POP	HL
+	RET
+.MISREAD
+	XOR	A			; RC_MISREAD
+	POP	HL
+	RET
+.UNSURE
+	LD	A,RC_UNSURE
+	POP	HL
+	RET
+
+; ------------------------------------------------------
+; G4_MISS: a PAR read differed.  In: C = the value read,
+; HL = register, DE -> wanted byte, B = 6 - register index.
+; The first G4_SAMPLES are kept verbatim whatever the
+; verdict.  Content found wrong is written back: the damage
+; is counted once, not on every sweep that follows.
+; Preserves BC, DE, HL.  Plain RAM only -- the window is open.
+; ------------------------------------------------------
+G4_MISS
+	PUSH	BC
 	PUSH	DE
-	LD	HL,G4_ERRBITS
-	OR	(HL)
-	LD	(HL),A
+	PUSH	HL
 	LD	A,1
 	LD	(TICK_MISS),A
-	LD	HL,G4_BAD
-	CALL	BUMP
 	LD	A,(G4_NSAMP)
 	CP	G4_SAMPLES
 	JR	NC,.FULL
@@ -1144,66 +1350,93 @@ G4_MISS
 	LD	A,(SWEEP_NO)
 	LD	(HL),A
 .FULL
-	POP	DE
 	POP	HL
-	RET
+	POP	DE
+	PUSH	DE
+	PUSH	HL
+	LD	A,(DE)
+	LD	D,A
+	PUSH	BC			; C = the first read
+	CALL	G4_RECHECK
+	POP	BC
+	OR	A
+	JR	Z,G4_VERDICT_MISREAD
+	DEC	A
+	JR	NZ,G4_VERDICT_UNSURE
+	LD	(HL),D			; repair
+	LD	BC,G4_WR_BAD
+	JR	G4_VERDICT_HELD
 
-; G4_WMISS: a MAR read-back differed.  In: A = the value read,
-; (RB_WANT) = the value written, HL = register.  Two more reads
-; decide what happened (see the [G4] header).  Preserves BC, DE,
-; HL.  Plain RAM only.
+; ------------------------------------------------------
+; G4_WMISS: a MAR read-back differed.  In: A = the value
+; read, (RB_WANT) = the value written, HL = register.
+; Preserves BC, DE, HL.  Plain RAM only.
+; The three G4_VERDICT_* tails are shared with G4_MISS; they
+; expect BC, DE, HL of the caller on the stack, HL = register,
+; C = first read, D = wanted, E = held.
+; ------------------------------------------------------
 G4_WMISS
 	PUSH	BC
 	PUSH	DE
 	PUSH	HL
-	LD	C,A			; first read
-	LD	E,(HL)			; second read
-	LD	B,(HL)			; third read
+	LD	C,A
 	LD	A,1
 	LD	(TICK_MISS),A
 	LD	A,(RB_WANT)
 	LD	D,A
-	CP	E
-	JR	Z,.MISREAD
-	CP	B
-	JR	Z,.MISREAD
+	PUSH	BC
+	CALL	G4_RECHECK
+	POP	BC
+	OR	A
+	JR	Z,G4_VERDICT_MISREAD
+	DEC	A
+	JR	NZ,G4_VERDICT_UNSURE
+	LD	BC,G4_WR_BAD
+	LD	A,D
 	CPL				; the previous sweep's pattern
 	CP	E
-	JR	NZ,.GARBLED
-	CP	B
-	JR	NZ,.GARBLED
-	LD	HL,G4_WR_LOST
-	JR	.COUNT
-.GARBLED
-	LD	HL,G4_WR_BAD
-.COUNT
+	JR	NZ,G4_VERDICT_HELD
+	LD	BC,G4_WR_LOST
+	; fall through
+
+; BC = counter.  Keep the first G4_WSAMPLES: page-1 offset of the
+; register, wanted, held.
+G4_VERDICT_HELD
+	PUSH	HL
+	LD	H,B
+	LD	L,C
 	CALL	BUMP
+	POP	HL
 	LD	A,(G4_NWSAMP)
 	CP	G4_WSAMPLES
-	JR	NC,.DONE
+	JR	NC,G4_VERDICT_DONE
 	LD	C,A
 	INC	A
 	LD	(G4_NWSAMP),A
+	LD	A,(RTL_BASE_PTR)
+	LD	B,A
+	LD	A,L
+	SUB	B			; page-1 offset of the register
+	LD	L,A
 	LD	A,C
 	ADD	A,A
 	ADD	A,C			; 3 bytes per sample
 	LD	C,A
 	LD	B,0
+	LD	A,L
 	LD	HL,G4_WSAMP
 	ADD	HL,BC
-	EX	(SP),HL			; HL = register, sample pointer on the stack
-	LD	A,(MAR_ADDR)
-	LD	C,A
-	LD	A,L
-	SUB	C			; register index 0..3
-	EX	(SP),HL
 	LD	(HL),A
 	INC	HL
 	LD	(HL),D
 	INC	HL
 	LD	(HL),E
-	JR	.DONE
-.MISREAD
+	JR	G4_VERDICT_DONE
+G4_VERDICT_UNSURE
+	LD	HL,G4_UNSURE
+	CALL	BUMP
+	JR	G4_VERDICT_DONE
+G4_VERDICT_MISREAD
 	LD	A,C
 	XOR	D			; the bits the first read got wrong
 	LD	HL,G4_ERRBITS
@@ -1211,19 +1444,26 @@ G4_WMISS
 	LD	(HL),A
 	LD	HL,G4_BAD
 	CALL	BUMP
-.DONE
+G4_VERDICT_DONE
 	POP	HL
 	POP	DE
 	POP	BC
 	RET
 
 ; ------------------------------------------------------
-; SET_PAGE: CR := A, verified.  On this bus a started chip
-; now and then drops a write, and a dropped page switch
-; sends whatever is written next into another page.  CR is
-; read back; two wrong read-backs in a row count as a lost
-; write (cr-bad) and the write is repeated, at most 4 times.
-; A single wrong read-back is an ordinary misread (rd-bad).
+; SET_PAGE: CR := A, confirmed by TWO different registers.
+; Reading CR back is not enough on a bus where the chip now
+; and then sits out a cycle: a read it does not answer
+; returns what the previous cycle left on the bus, and after
+; a CR write that is the very value being checked for.  So
+; offset 3 is read in between.  On page 1 it is PAR2 and must
+; hold TEST_MAC2; on page 0 it is BNRY and must lie inside
+; the ring; the two ranges are disjoint, and either value
+; takes the written byte off the bus before CR is read.
+; A switch that needed a second attempt counts once in
+; cr-bad -- which of the three cycles failed is not known.
+;   Out: CF = four attempts and still not confirmed.  The
+;        caller must not touch any page-dependent register.
 ; ISA open.  Trashes A, BC, IX.  Plain RAM only.
 ; ------------------------------------------------------
 SET_PAGE
@@ -1232,48 +1472,59 @@ SET_PAGE
 	LD	B,4
 .TRY
 	LD	(IX+RTL_CR_OFF),C
+	LD	A,(IX+RTL_BNRY_OFF)
+	BIT	6,C
+	JR	Z,.PAGE0
+	CP	TEST_MAC2
+	JR	NZ,.BAD
+	JR	.CR
+.PAGE0
+	SUB	RTL_PSTART_INIT
+	CP	RTL_PSTOP_INIT - RTL_PSTART_INIT
+	JR	NC,.BAD
+.CR
 	LD	A,(IX+RTL_CR_OFF)
 	XOR	C
 	AND	CR_VERIFY_MASK
-	RET	Z
+	RET	Z			; AND left CF clear
+.BAD
 	LD	A,1
 	LD	(TICK_MISS),A
-	LD	A,(IX+RTL_CR_OFF)
-	XOR	C
-	AND	CR_VERIFY_MASK
-	JR	Z,.MISREAD
+	LD	A,B
+	CP	4
+	JR	NZ,.COUNTED
 	PUSH	HL
 	LD	HL,G4_CR_BAD
 	CALL	BUMP
 	POP	HL
+.COUNTED
 	DJNZ	.TRY
-	RET
-.MISREAD
-	PUSH	HL
-	LD	HL,G4_BAD
-	CALL	BUMP
-	POP	HL
+	SCF
 	RET
 
 ; ------------------------------------------------------
 ; DRAIN_RING: throw away whatever the receiver stored, so
 ; the ring cannot overflow while we are not reading frames:
 ; BNRY := CURR - 1.  CURR is read twice and used only when
-; both reads agree, and both page switches are verified.
+; both reads agree, and both page switches are confirmed.
 ; ISA open; uses the current row's CR values.
-;   Out: A = pages the ring moved since the last call
-;        (0 also when CURR could not be read).
+;   Out: CF = a page switch could not be confirmed; nothing
+;        was written after it.  Otherwise A = pages the ring
+;        moved since the last call (0 also when CURR could
+;        not be read).
 ; Trashes BC, IX.
 ; ------------------------------------------------------
 DRAIN_RING
 	LD	A,(ROW_CR_P1)
 	CALL	SET_PAGE
+	RET	C
 	LD	A,(IX+RTL_CURR_OFF)
 	LD	(DRAIN_CURR),A
 	LD	A,(IX+RTL_CURR_OFF)
 	LD	(DRAIN_CURR2),A
 	LD	A,(ROW_CR_P0)
 	CALL	SET_PAGE
+	RET	C
 	LD	A,0
 DRAIN_CURR2 EQU $-1
 	LD	C,0
@@ -1313,9 +1564,465 @@ DRAIN_CURR EQU $-1
 	; values [G5] reports are about the transmit and nothing else.
 	LD	(IX+RTL_ISR_OFF),ISR_PRX | ISR_RXE
 	LD	A,B
+	OR	A			; NC
 	RET
 .SKIP
 	XOR	A
+	RET
+
+
+; ======================================================
+; [G6] the remote-DMA data port.
+;
+; [G1]..[G4] only ever touch the 16-byte register file.  A
+; real utility spends almost every ISA cycle somewhere else:
+; the data port at BASE+0x10, pushed and pulled hundreds of
+; bytes at a time with no read-back anywhere.  A cycle lost
+; there is a corrupted frame, not a register worth retrying.
+;
+; Each burst writes G6_LEN bytes of "offset XOR seed" into
+; packet RAM below PSTART -- TX RAM, which the receiver never
+; touches -- and reads them straight back.  The seed changes
+; every burst so stale contents cannot pass, and neighbouring
+; bytes always differ, so a cycle the chip does not answer
+; (the bus then holds the previous byte) shows up.
+;
+; When the read-back differs the same bytes are read a second
+; time and the two counts name the event:
+;   rd-bad   the second pass was clean: the first read lied;
+;   mem-bad  the second pass found as many: what sits in
+;            packet RAM is wrong, so a write cycle was lost;
+;   unsure   the second pass agreed with neither.
+; The passes are counted, not matched offset by offset, so
+; "as many" is a strong hint and not a proof.
+;
+; There is no stopped row: every remote-DMA command carries
+; STA, so a burst starts the chip by definition.  The control
+; is [G4]'s stop row, which uses the same bus and the same
+; window discipline.
+; ======================================================
+G6_BURSTS	EQU 800
+G6_LEN		EQU 128			; bytes per burst, each way
+G6_ADDR		EQU 0x4000		; TX RAM: below PSTART, never received into
+G6_SAMPLES	EQU 4
+G6_RDC_POLLS	EQU 250
+	ASSERT G6_BURSTS == 800 && G6_LEN == 128	; MSG_G6 says so
+	ASSERT G6_ADDR + G6_LEN <= RTL_PSTART_INIT * 256
+
+PHASE_G6
+	PRINTLN	MSG_G6
+	PRINTLN	MSG_G6_HEAD
+	LD	A,RTL_DATA_OFF
+	CALL	REG_ADDR
+	LD	(G6_PORT),HL
+	LD	(G6_PORTW),HL
+	LD	HL,CR_PAGE1_START * 256 + CR_PAGE0_START
+	LD	A,RCR_MON
+	LD	DE,MSG_G4_DEAF
+	CALL	G6_ROW
+	LD	HL,CR_PAGE1_START * 256 + CR_PAGE0_START
+	LD	A,RCR_AB
+	LD	DE,MSG_G4_LIVE
+	; fall through
+
+; ------------------------------------------------------
+; G6_ROW: one row of [G6].  Same arguments as G4_ROW, and
+; the same shared row state, so SET_PAGE, G4_SETUP and
+; DRAIN_RING work here unchanged.
+; ------------------------------------------------------
+G6_ROW
+	LD	(G6_LABEL),DE
+	LD	(G4_RCR),A
+	LD	(ROW_CR_P0),HL		; L -> ROW_CR_P0, H -> ROW_CR_P1
+	LD	HL,G4_ROW_STATE		; RX_PAGES and the page-loss counters
+	LD	DE,G4_ROW_STATE + 1
+	LD	BC,G4_ROW_LEN - 1
+	LD	(HL),0
+	LDIR
+	LD	HL,G6_ROW_STATE
+	LD	DE,G6_ROW_STATE + 1
+	LD	BC,G6_ROW_LEN - 1
+	LD	(HL),0
+	LDIR
+	CALL	@ISA.ISA_OPEN
+	CALL	G4_SETUP
+	CALL	@ISA.ISA_CLOSE
+	JP	C,G6_ABORT
+	LD	HL,G6_BURSTS
+	LD	(G6_LEFT),HL
+G6_NEXT
+	XOR	A
+	LD	(G6_DIRTY),A
+	CALL	@ISA.ISA_OPEN
+	LD	A,(ROW_CR_P0)
+	CALL	SET_PAGE
+	JR	C,G6_PAGE_LOST
+	CALL	G6_BURST
+	CALL	DRAIN_RING		; keep the ring from overflowing
+	JR	C,G6_PAGE_LOST
+	CALL	@ISA.ISA_CLOSE
+	JR	G6_PACE
+
+	; Same contract as [G4]: an unconfirmed page means this window
+	; touches nothing more, and the row is set up from scratch.
+G6_PAGE_LOST
+	LD	HL,G4_PG_LOST
+	CALL	BUMP
+	CALL	G4_SETUP
+	CALL	@ISA.ISA_CLOSE		; preserves AF
+	JR	C,G6_ABORT
+G6_PACE
+	LD	A,(G6_DIRTY)
+	OR	A
+	JR	Z,.CLEAN
+	LD	HL,G6_BURSTS_BAD
+	CALL	BUMP
+.CLEAN
+	CALL	@UTIL.DELAY_1MS		; window closed: the 50 Hz IRQ gets its turn
+	LD	HL,(G6_LEFT)
+	DEC	HL
+	LD	(G6_LEFT),HL
+	LD	A,H
+	OR	L
+	JP	NZ,G6_NEXT
+	JR	G6_PRINT
+
+G6_ABORT
+	LD	A,1
+	LD	(G6_ABORTED),A
+
+	; " deaf 0000   0000   0000    0000   0000   0000   0000"
+G6_PRINT
+	LD	HL,0
+G6_LABEL EQU $-2
+	PRINT_HL
+	LD	HL,(G6_BAD)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_SP3
+	LD	HL,(G6_RD_BAD)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_SP3
+	LD	HL,(G6_MEM_BAD)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_SP4
+	LD	HL,(G6_UNSURE)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_SP3
+	LD	HL,(G6_BURSTS_BAD)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_SP3
+	LD	HL,(G6_RDC_BAD)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	MSG_SP3
+	LD	HL,(RX_PAGES)
+	CALL	@UTIL.PRINT_HEX_HL
+	PRINT	LINE_END
+
+	LD	HL,G6_FAIL_FIRST
+	LD	B,G6_FAIL_LEN
+	XOR	A
+.ANY
+	OR	(HL)
+	INC	HL
+	DJNZ	.ANY
+	JR	Z,.OK
+	CALL	SET_FAILED
+.OK
+	; "  dma 0A=5C>5D ...": offset inside the burst, the byte that
+	; was written there, the byte that came back.
+	LD	A,(G6_NSAMP)
+	OR	A
+	JR	Z,.NO_SAMP
+	PRINT	MSG_G6_DMA
+	LD	A,(G6_NSAMP)
+	LD	B,A
+	LD	HL,G6_SAMP
+.SAMP
+	PUSH	BC,HL
+	LD	A,(HL)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,'='
+	CALL	PUTCHAR
+	POP	HL,BC
+	INC	HL
+	PUSH	BC,HL
+	LD	A,(HL)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,'>'
+	CALL	PUTCHAR
+	POP	HL,BC
+	INC	HL
+	PUSH	BC,HL
+	LD	A,(HL)
+	CALL	@UTIL.PRINT_HEX_A
+	LD	A,' '
+	CALL	PUTCHAR
+	POP	HL,BC
+	INC	HL
+	DJNZ	.SAMP
+	CALL	PUT_CRLF
+.NO_SAMP
+	CALL	PRINT_PG_LOST
+	LD	A,(G6_ABORTED)
+	OR	A
+	RET	Z
+	PRINTLN	MSG_G4_ABORTED
+	RET
+
+; ------------------------------------------------------
+; G6_BURST: write G6_LEN pattern bytes through the data
+; port and read them back.  ISA open, page 0 confirmed,
+; IX = base.  Leaves the chip on page 0.
+; ------------------------------------------------------
+G6_BURST
+	; The pattern is built in plain RAM first and the comparison is
+	; done in plain RAM afterwards, so that the loop that touches the
+	; data port does nothing but move bytes -- the same three
+	; instructions, through the same fixed-address DE, as the
+	; driver's DMA_WRITE/DMA_READ.  The first version computed each
+	; byte inside the transfer loop; on a UM9003AF every burst then
+	; came back one byte behind (2026-09-21), while the driver's own
+	; 1536-byte round trips on the same card were exact.  A phase
+	; that does not access the port the way the driver does measures
+	; something no utility ever performs.
+	LD	HL,G6_SEED
+	INC	(HL)
+	LD	C,(HL)
+	LD	HL,G6_PAT
+	LD	E,0
+	LD	B,G6_LEN
+.FILL
+	LD	A,E
+	XOR	C
+	LD	(HL),A
+	INC	HL
+	INC	E
+	DJNZ	.FILL
+	LD	A,CR_DMA_WRITE
+	CALL	G6_DMA_START
+	LD	HL,G6_PAT
+	LD	DE,0
+G6_PORTW EQU $-2
+	LD	B,G6_LEN
+G6_BURST_WR				; global: G6_PORTW ended the local scope
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	DJNZ	G6_BURST_WR
+	CALL	G6_DMA_END
+	RET	C			; packet RAM holds something unknown now
+	LD	A,1
+	LD	(G6_SAMPOK),A
+	CALL	G6_READ_PASS
+	OR	A
+	RET	Z
+	LD	D,A			; mismatching bytes, first pass
+	LD	A,1
+	LD	(G6_DIRTY),A
+	LD	A,D
+	LD	HL,G6_BAD
+	CALL	ADDW
+	XOR	A
+	LD	(G6_SAMPOK),A
+	PUSH	DE
+	CALL	G6_READ_PASS
+	POP	DE
+	LD	HL,G6_UNSURE		; no LD affects the flags below
+	JR	C,G6_NAMED		; the second pass never ran
+	LD	HL,G6_RD_BAD
+	OR	A
+	JR	Z,G6_NAMED		; second pass clean: the reads lied
+	LD	HL,G6_MEM_BAD
+	CP	D
+	JR	Z,G6_NAMED		; as many again: packet RAM holds it wrong
+	LD	HL,G6_UNSURE
+G6_NAMED
+	LD	A,D
+	JP	ADDW
+
+; ------------------------------------------------------
+; G6_READ_PASS: read the burst back and compare.
+;   In:  (G6_SAMPOK) = keep samples.
+;   Out: A = mismatching bytes, saturated at 255;
+;        CF = the pass could not be run at all.
+; ISA open, IX = base.  Trashes A, BC, DE, HL.
+; ------------------------------------------------------
+G6_READ_PASS
+	LD	A,CR_DMA_READ
+	CALL	G6_DMA_START
+	LD	HL,G6_RB
+	LD	DE,0
+G6_PORT	EQU $-2
+	LD	B,G6_LEN
+G6_READ_LOOP				; global: G6_PORT ended the local scope
+	LD	A,(DE)
+	LD	(HL),A
+	INC	HL
+	DJNZ	G6_READ_LOOP
+	CALL	G6_DMA_END
+	JR	C,G6_READ_VOID
+	; Plain RAM from here on; the window is still open but nothing
+	; below touches the chip.
+	XOR	A
+	LD	(G6_NBAD),A
+	LD	HL,G6_PAT
+	LD	DE,G6_RB
+	LD	BC,G6_LEN * 256		; B = bytes left, C = offset
+G6_CMP
+	LD	A,(DE)
+	CP	(HL)
+	CALL	NZ,G6_BYTE_BAD
+	INC	HL
+	INC	DE
+	INC	C
+	DJNZ	G6_CMP
+	LD	A,(G6_NBAD)
+	OR	A			; clears CF: the pass did run
+	RET
+
+; A burst the chip did not carry out: the bytes that came back mean
+; nothing, so they are not compared at all.
+G6_READ_VOID
+	XOR	A
+	SCF
+	RET
+
+G6_DMA_FAILED
+	LD	HL,G6_RDC_BAD
+	CALL	BUMP
+	LD	A,1
+	LD	(G6_DIRTY),A
+	RET
+
+; ------------------------------------------------------
+; G6_BYTE_BAD: one byte did not match.
+;   In: A = read, (HL) = written, C = offset.
+; Preserves every register pair.  Trashes A.
+; ------------------------------------------------------
+G6_BYTE_BAD
+	PUSH	HL
+	PUSH	DE
+	PUSH	BC
+	LD	D,A			; read
+	LD	E,(HL)			; written
+	LD	A,(G6_NBAD)
+	INC	A
+	JR	Z,.SAT			; 255 stays 255
+	LD	(G6_NBAD),A
+.SAT
+	LD	A,(G6_SAMPOK)
+	OR	A
+	JR	Z,.DONE
+	LD	A,(G6_NSAMP)
+	CP	G6_SAMPLES
+	JR	NC,.DONE
+	INC	A
+	LD	(G6_NSAMP),A
+	DEC	A
+	LD	B,A
+	ADD	A,A
+	ADD	A,B			; 3 bytes per sample
+	LD	HL,G6_SAMP
+	ADD	A,L
+	LD	L,A
+	JR	NC,.NC
+	INC	H
+.NC
+	LD	(HL),C
+	INC	HL
+	LD	(HL),E
+	INC	HL
+	LD	(HL),D
+.DONE
+	POP	BC
+	POP	DE
+	POP	HL
+	RET
+
+; ------------------------------------------------------
+; G6_DMA_START: arm a remote DMA of G6_LEN bytes at G6_ADDR
+; and hand the data port straight to the transfer loop.
+;
+; Arming prefetches: the chip pulls the first byte into its
+; FIFO the moment the command lands.  Anything that happens
+; between that command and the first data cycle can leave
+; that byte in the FIFO to be popped a second time, and the
+; whole burst then reads one byte behind.  Measured twice on
+; a UM9003AF (2026-09-21), in all 800 bursts of both rows,
+; with and without traffic: first with three register reads
+; sitting in that gap, then with the chip armed a second
+; time after them.  Offset 0 matched in both cases -- the
+; stale byte is the one at G6_ADDR -- and everything after
+; it was the previous byte.  So: arm once, touch nothing,
+; transfer.  The driver does exactly that.
+;
+; Nothing is checked beforehand, because G6_DMA_END checks
+; more afterwards: CRDA landing exactly G6_LEN bytes on
+; proves RSAR, RBCR and the command all reached the chip.
+;   In: A = the CR command.  ISA open, IX = base.
+; Trashes A.  Preserves BC, DE, HL.
+; Global labels: G6_DMA_CMD would capture the local scope.
+; ------------------------------------------------------
+G6_DMA_START
+	LD	(G6_DMA_CMD),A
+	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	(IX+RTL_RBCR0_OFF),G6_LEN
+	LD	(IX+RTL_RBCR1_OFF),0
+	LD	(IX+RTL_RSAR0_OFF),G6_ADDR & 0xFF
+	LD	(IX+RTL_RSAR1_OFF),G6_ADDR >> 8
+	LD	A,0
+G6_DMA_CMD EQU $-1
+	LD	(IX+RTL_CR_OFF),A
+	RET
+
+; ------------------------------------------------------
+; G6_DMA_END: the transfer is already over by the time we get
+; here, so this only confirms that it happened -- RDC set, and
+; the DMA address exactly G6_LEN bytes on.  The second arm in
+; G6_DMA_START is the one write sequence nothing could check
+; beforehand; this is where it gets checked, after the data
+; cycles rather than in the middle of them.
+;   Out: CF = the burst did not complete.  It is counted under
+;        rdc-to and its byte comparisons are thrown away.
+; ISA open, IX = base.  Trashes A, B, HL.
+; ------------------------------------------------------
+G6_DMA_END
+	LD	B,G6_RDC_POLLS
+.LP
+	LD	A,(IX+RTL_ISR_OFF)
+	AND	ISR_RDC
+	JR	NZ,.RDC
+	DJNZ	.LP
+	JR	.BAD
+.RDC
+	LD	(IX+RTL_ISR_OFF),ISR_RDC
+	LD	A,(IX+RTL_CRDA0_OFF)
+	CP	(G6_ADDR + G6_LEN) & 0xFF
+	JR	NZ,.BAD
+	LD	A,(IX+RTL_CRDA1_OFF)
+	CP	(G6_ADDR + G6_LEN) >> 8
+	RET	Z			; equal leaves CF clear
+.BAD
+	CALL	G6_DMA_FAILED
+	LD	(IX+RTL_CR_OFF),CR_DMA_ABORT	; next burst starts clean
+	SCF
+	RET
+
+; ADDW: the 16-bit counter at HL += A, saturating at FFFF.
+; Trashes A, HL.  Plain RAM only.
+; BUMP's trick of decrementing back does not work here: the low
+; byte is not 0 after the carry, so both bytes are set outright.
+ADDW
+	ADD	A,(HL)
+	LD	(HL),A
+	RET	NC
+	INC	HL
+	INC	(HL)
+	RET	NZ
+	LD	(HL),0xFF		; FFFF stays FFFF
+	DEC	HL
+	LD	(HL),0xFF
 	RET
 
 
@@ -1599,10 +2306,17 @@ PUT_DEC2
 
 
 ; ------- in-EXE data -------
-TEST_MAC	DB 0x02, 0x80, 0x19, 0x11, 0x22, 0x33
-; [G4] write patterns, complemented on odd sweeps.  Neighbours differ,
-; so a read-back that returns the register read just before it shows.
-G4_WR_BASE	DB 0x3C, 0xC3, 0x69, 0x96
+TEST_MAC2	EQU 0x19		; SET_PAGE tells page 1 by it
+TEST_MAC	DB 0x02, 0x80, TEST_MAC2, 0x11, 0x22, 0x33
+	ASSERT TEST_MAC2 < RTL_PSTART_INIT || TEST_MAC2 >= RTL_PSTOP_INIT
+; [G4] write patterns, complemented on odd sweeps.  No value is the
+; complement of another one: a cycle the chip does not answer returns
+; what the previous cycle left on the bus, and that must never look
+; like "the previous sweep's pattern", i.e. like a lost write.  (The
+; first version used 3C C3 69 96, where MAR1 and MAR3 had exactly that
+; flaw.)  None of the eight values is a TEST_MAC byte, a ring page or
+; a CR value either.
+G4_WR_BASE	DB 0x1E, 0x2D, 0x87, 0x36
 	ASSERT $ - G4_WR_BASE == G4_WR_REGS
 
 PAYLOAD		DB "NICREG TX "
@@ -1664,13 +2378,14 @@ MSG_G1		DB "[G1] RW STORAGE stopped, 14 regs x 2048 reads",0
 MSG_G1_00	DB " bad after-00=",0
 MSG_G1_FF	DB " after-FF=",0
 MSG_COND	DB " cond=",0
+MSG_LOAD	DB " load=",0
 MSG_BAD_EQ	DB " bad=",0
 MSG_BITS_EQ	DB " bits=",0
 MSG_G2		DB "[G2] PAGE2 CONFIG  written|and/or after 00|after FF  bad=",0
 MSG_G3		DB "[G3] PAGE0 STATUS  and/or after 00|after FF  CR bad=",0
 MSG_G4		DB "[G4] PAR=",0
 MSG_G4_TAIL	DB "  per row: 288000 reads, 192000 writes",0
-MSG_G4_HEAD	DB " row  rd-bad bits wr-lost wr-bad cr-bad rxpages badticks withrx",0
+MSG_G4_HEAD	DB " row  rd-bad bits wr-lost wr-bad unsure cr-bad rxpages badticks withrx",0
 MSG_G4_STOP	DB " stop ",0
 MSG_G4_DEAF	DB " deaf ",0
 MSG_G4_LIVE	DB " live ",0
@@ -1681,6 +2396,12 @@ MSG_RD		DB "  rd",0
 MSG_WR		DB "  wr",0
 MSG_PAR		DB " PAR",0
 MSG_MAR		DB " MAR",0
+MSG_PG_LOST	DB "  page lost=",0
+MSG_SETUP_RETRY	DB " setup retries=",0
+MSG_G4_ABORTED	DB "  row aborted: the chip state could not be set up",0
+MSG_G6		DB "[G6] DMA DATA PORT, per row: 800 bursts x 128 bytes",0
+MSG_G6_HEAD	DB " row  bytes  rd-bad mem-bad unsure bursts rdc-to rxpages",0
+MSG_G6_DMA	DB "  dma ",0
 MSG_G5		DB "[G5] TX 3x20, type 88B5 -- count arrivals on the peer",0
 MSG_G5_A	DB " A poll  ptx=",0
 MSG_G5_B	DB " B quiet ptx=",0
@@ -1769,6 +2490,7 @@ TXB_TSR_AND	EQU BSS_START + 57	; 1
 TXB_TSR_OR	EQU BSS_START + 58	; 1
 TXB_DONE	EQU BSS_START + 59	; 1
 TXC_DONE	EQU BSS_START + 60	; 1
+G1_LOAD_BAD	EQU BSS_START + 63	; 1
 G1_BAD		EQU BSS_START + 64	; G1_REGS words
 G1_ERR		EQU BSS_START + 92	; G1_REGS bytes
 G2_RES		EQU BSS_START + 106	; G2_COUNT * 4
@@ -1776,30 +2498,66 @@ G3_RES		EQU BSS_START + 130	; G3_COUNT * 4
 TX_BUF		EQU BSS_START + 190	; FRAME_LEN
 ; G4_ROW clears these in one go at the start of each row.
 G4_ROW_STATE	EQU BSS_START + 250
-G4_BAD		EQU G4_ROW_STATE + 0	; 2
-G4_ERRBITS	EQU G4_ROW_STATE + 2	; 1
-RX_PAGES	EQU G4_ROW_STATE + 3	; 2
-G4_BADTICKS	EQU G4_ROW_STATE + 5	; 2
-G4_WITHRX	EQU G4_ROW_STATE + 7	; 2
-G4_NSAMP	EQU G4_ROW_STATE + 9	; 1
-MISS_PENDING	EQU G4_ROW_STATE + 10	; 1
-G4_SAMP		EQU G4_ROW_STATE + 11	; G4_SAMPLES * 3
-G4_WR_LOST	EQU G4_ROW_STATE + 29	; 2
-G4_WR_BAD	EQU G4_ROW_STATE + 31	; 2
-G4_CR_BAD	EQU G4_ROW_STATE + 33	; 2
-G4_NWSAMP	EQU G4_ROW_STATE + 35	; 1
-G4_WSAMP	EQU G4_ROW_STATE + 36	; G4_WSAMPLES * 3
-G4_ROW_LEN	EQU 48
-BSS_CLEAR_LEN	EQU 300
+RX_PAGES	EQU G4_ROW_STATE + 0	; 2
+G4_BADTICKS	EQU G4_ROW_STATE + 2	; 2
+G4_WITHRX	EQU G4_ROW_STATE + 4	; 2
+G4_NSAMP	EQU G4_ROW_STATE + 6	; 1
+MISS_PENDING	EQU G4_ROW_STATE + 7	; 1
+G4_NWSAMP	EQU G4_ROW_STATE + 8	; 1
+G4_ERRBITS	EQU G4_ROW_STATE + 9	; 1
+; G4_PRINT ORs this block together: any non-zero byte fails the run.
+G4_FAIL_FIRST	EQU G4_ROW_STATE + 10
+G4_BAD		EQU G4_FAIL_FIRST + 0	; 2
+G4_WR_LOST	EQU G4_FAIL_FIRST + 2	; 2
+G4_WR_BAD	EQU G4_FAIL_FIRST + 4	; 2
+G4_UNSURE	EQU G4_FAIL_FIRST + 6	; 2
+G4_CR_BAD	EQU G4_FAIL_FIRST + 8	; 2
+G4_PG_LOST	EQU G4_FAIL_FIRST + 10	; 2
+G4_SETUP_RETRY	EQU G4_FAIL_FIRST + 12	; 2
+G4_ABORTED	EQU G4_FAIL_FIRST + 14	; 1
+G4_FAIL_LEN	EQU 15
+G4_SAMP		EQU G4_ROW_STATE + 25	; G4_SAMPLES * 3
+G4_WSAMP	EQU G4_ROW_STATE + 43	; G4_WSAMPLES * 3
+G4_ROW_LEN	EQU 55
+; G6_ROW clears these in one go at the start of each row.
+G6_ROW_STATE	EQU BSS_START + 306
+G6_SEED		EQU G6_ROW_STATE + 0	; 1
+G6_DIRTY	EQU G6_ROW_STATE + 1	; 1
+G6_SAMPOK	EQU G6_ROW_STATE + 2	; 1
+G6_NSAMP	EQU G6_ROW_STATE + 3	; 1
+G6_LEFT		EQU G6_ROW_STATE + 4	; 2
+; G6_PRINT ORs this block together: any non-zero byte fails the run.
+G6_FAIL_FIRST	EQU G6_ROW_STATE + 6
+G6_BAD		EQU G6_FAIL_FIRST + 0	; 2
+G6_RD_BAD	EQU G6_FAIL_FIRST + 2	; 2
+G6_MEM_BAD	EQU G6_FAIL_FIRST + 4	; 2
+G6_UNSURE	EQU G6_FAIL_FIRST + 6	; 2
+G6_BURSTS_BAD	EQU G6_FAIL_FIRST + 8	; 2
+G6_RDC_BAD	EQU G6_FAIL_FIRST + 10	; 2
+G6_ABORTED	EQU G6_FAIL_FIRST + 12	; 1
+G6_FAIL_LEN	EQU 13
+G6_SAMP		EQU G6_ROW_STATE + 19	; G6_SAMPLES * 3
+G6_NBAD		EQU G6_ROW_STATE + 31	; 1, per read pass
+G6_ROW_LEN	EQU 32
+BSS_CLEAR_LEN	EQU 338
+; Written before read, every burst: outside the cleared area.
+G6_PAT		EQU BSS_START + 340	; G6_LEN, what went to the chip
+G6_RB		EQU G6_PAT + G6_LEN	; G6_LEN, what came back
 	ASSERT G1_BAD + G1_REGS * 2 <= G1_ERR
 	ASSERT G1_ERR + G1_REGS <= G2_RES
 	ASSERT G2_RES + G2_COUNT * 4 <= G3_RES
 	ASSERT G3_RES + G3_COUNT * 4 <= TX_BUF
 	ASSERT TX_BUF + FRAME_LEN <= G4_ROW_STATE
-	ASSERT G4_SAMP + G4_SAMPLES * 3 <= G4_WR_LOST
+	ASSERT G4_FAIL_FIRST + G4_FAIL_LEN <= G4_SAMP
+	ASSERT G4_SAMP + G4_SAMPLES * 3 <= G4_WSAMP
 	ASSERT G4_WSAMP + G4_WSAMPLES * 3 <= G4_ROW_STATE + G4_ROW_LEN
 	ASSERT ROW_CR_P1 == ROW_CR_P0 + 1
-	ASSERT G4_ROW_STATE + G4_ROW_LEN <= BSS_START + BSS_CLEAR_LEN
+	ASSERT G4_ROW_STATE + G4_ROW_LEN <= G6_ROW_STATE
+	ASSERT G6_FAIL_FIRST + G6_FAIL_LEN <= G6_SAMP
+	ASSERT G6_SAMP + G6_SAMPLES * 3 <= G6_NBAD
+	ASSERT G6_ROW_STATE + G6_ROW_LEN <= BSS_START + BSS_CLEAR_LEN
+	ASSERT BSS_START + BSS_CLEAR_LEN <= G6_PAT
+	ASSERT G6_RB + G6_LEN < RT_STACK_TOP - 0x200
 	ASSERT BSS_START + BSS_CLEAR_LEN < RT_STACK_TOP - 0x200
 
 	ENDMODULE

@@ -66,6 +66,12 @@ RTL_CNTR2_OFF	EQU RTL_IMR_OFF		; R: missed packet tally
 RTL_ID0_OFF	EQU RTL_RBCR0_OFF
 RTL_ID1_OFF	EQU RTL_RBCR1_OFF
 
+; Where the remote DMA currently is.  The chip loads it from RSAR when
+; the remote-read/write command takes, so reading it back proves the
+; command reached the chip.
+RTL_CRDA0_OFF	EQU RTL_RSAR0_OFF	; R: current remote DMA address lo
+RTL_CRDA1_OFF	EQU RTL_RSAR1_OFF	; R: current remote DMA address hi
+
 ; -- Page 1 register offsets (CR.PS = 01) --------------------------
 RTL_PAR0_OFF	EQU 0x01
 RTL_PAR1_OFF	EQU 0x02

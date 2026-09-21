@@ -76,7 +76,32 @@ class Rtl8019 {
       // is caught by the RDC/PTX timeouts instead, and the model's strict
       // data-port checks would stop the run on it.  offset and value narrow
       // the drop to one register write, limit caps the number of drops.
+      // burst drops that many qualifying writes in a row (default 1): four
+      // lost page switches in a row defeat a retry loop of four.
       regWriteDrop: quirks.regWriteDrop || null,
+      // The chip sits out whole bus cycles (measured on a UM9003AF with
+      // frames on the wire): every Nth register-file access starts a burst
+      // of `burst` accesses it takes no part in.  A read then returns what
+      // the previous cycle left on the bus; with kind 'both' a write is not
+      // latched either.  { everyN, burst, kind: 'read' | 'both', runningOnly }
+      busMiss: quirks.busMiss || null,
+      // One write that latches with bits flipped: the `nth` write to
+      // `offset` on `page`.  { page, offset, nth, xor }
+      regWriteFlip: quirks.regWriteFlip || null,
+      // Register content that changes behind the host's back: after that
+      // many register-file accesses PAR[index] becomes `value`.
+      // { afterAccesses, index, value }
+      regPoke: quirks.regPoke || null,
+      // The remote-DMA data port at offset 0x10, which the register-file
+      // quirks above never touch.  `dmaReadGlitch` corrupts the `nth`
+      // data-port READ of the run (1-based, counted across all transfers)
+      // without disturbing packet RAM, so reading the same bytes again
+      // returns them intact.  `dmaWriteDrop` makes the `nth` data-port
+      // WRITE not reach packet RAM while the address still advances, so
+      // that one byte stays wrong however often it is read back.
+      // { nth, xor } / { nth }
+      dmaReadGlitch: quirks.dmaReadGlitch || null,
+      dmaWriteDrop: quirks.dmaWriteDrop || null,
       // Early UMC UM9003F (measured 2026-09-17): internal loopback completes
       // PTX but the receive side posts neither PRX nor RXE and leaves the
       // ring alone; only ISR.CNT appears.
@@ -146,12 +171,22 @@ class Rtl8019 {
     this.transmitted = []; // frames that actually left the wire
     this.txAttempts = 0;
     this.rxDelivered = 0;
-    this.stats = { filteredRx: 0, oobDma: 0, overflowEvents: 0, stopEdges: 0, page3Reads: 0 };
+    // regCycles counts every register-file cycle the host spends.  It is
+    // the metric that tells a driver change apart from a model change when
+    // throughput on real hardware moves and instruction counts do not.
+    this.stats = { filteredRx: 0, oobDma: 0, overflowEvents: 0, stopEdges: 0, page3Reads: 0, regCycles: 0, dataCycles: 0 };
     this._dmaByteIndex = 0;
+    this._dmaReads = 0;
+    this._dmaWrites = 0;
     this.lastBus = 0xff;   // last value seen on the register-file data bus
     this._glitchReads = 0;
     this._rxGlitchIn = 0;  // register reads left until the rxDmaGlitch one
     this._dropWrites = 0;
+    this._dropBurstLeft = 0;
+    this._missCount = 0;
+    this._missLeft = 0;
+    this._flipWrites = 0;
+    this._accesses = 0;
 
     // Scheduled RX delivery: preloaded scenario.rxFrames plus anything a
     // protocol responder (net-builders.js, via onTransmit) schedules in
@@ -233,15 +268,31 @@ class Rtl8019 {
     if (txp) this.doTransmit();
   }
 
+  // A data-port access with no transfer behind it is normally a driver bug
+  // and stops the run.  It stops being one when the scenario is a bus that
+  // drops register writes on purpose: the command then never reached the
+  // chip, which is exactly what the program under test has to survive and
+  // report.  Real hardware answers such a cycle with the open bus and
+  // swallows the write; the count is kept so a test can still see it.
+  _strayDma(what) {
+    if (!this.quirks.busMiss && !this.quirks.regWriteDrop) {
+      throw new Error(`remote DMA data port ${what} with no active transfer (RBCR=0 or DMA idle)`);
+    }
+    this.stats.strayDma = (this.stats.strayDma || 0) + 1;
+  }
+
   // ---- remote DMA data port (offset 0x10) ----
   readData() {
     if (!this.dmaActive || this.dmaDirection !== 'read' || this.rbcr <= 0) {
-      throw new Error('remote DMA data port read with no active read transfer (RBCR=0 or DMA idle)');
+      this._strayDma('read');
+      return this.quirks.openBusValue;
     }
     let value = this.ramReadNic(this.crda);
     if (this.scenario.corruptDmaReadAt !== undefined && this._dmaByteIndex === this.scenario.corruptDmaReadAt) {
       value ^= 0x01;
     }
+    const rg = this.quirks.dmaReadGlitch;
+    if (rg && ++this._dmaReads === rg.nth) value ^= rg.xor === undefined ? 0x01 : rg.xor;
     this._dmaByteIndex++;
     this.crda = (this.crda + 1) & 0xffff;
     this.rbcr--;
@@ -251,9 +302,11 @@ class Rtl8019 {
 
   writeData(value) {
     if (!this.dmaActive || this.dmaDirection !== 'write' || this.rbcr <= 0) {
-      throw new Error('remote DMA data port write with no active write transfer (RBCR=0 or DMA idle)');
+      this._strayDma('write');
+      return;
     }
-    this.ramWriteNic(this.crda, value & 0xff);
+    const wd = this.quirks.dmaWriteDrop;
+    if (!(wd && ++this._dmaWrites === wd.nth)) this.ramWriteNic(this.crda, value & 0xff);
     this._dmaByteIndex++;
     this.crda = (this.crda + 1) & 0xffff;
     this.rbcr--;
@@ -273,7 +326,23 @@ class Rtl8019 {
   }
 
   // ---- generic page0/1/2/3 register file, offsets 0x01..0x0F ----
+  // true when the chip takes no part in this register-file cycle
+  _busMissed(isWrite) {
+    const poke = this.quirks.regPoke;
+    if (poke && ++this._accesses === poke.afterAccesses) this.par[poke.index] = poke.value;
+    const q = this.quirks.busMiss;
+    if (!q || (q.runningOnly && this.stopped)) return false;
+    if (this._missLeft > 0) this._missLeft--;
+    else if (++this._missCount % q.everyN === 0) this._missLeft = (q.burst || 1) - 1;
+    else return false;
+    if (isWrite && q.kind !== 'both') return false;
+    this.stats.missedCycles = (this.stats.missedCycles || 0) + 1;
+    return true;
+  }
+
   readReg(offset) {
+    if (offset <= 0x0f) this.stats.regCycles++; else this.stats.dataCycles++;
+    if (offset <= 0x0f && this._busMissed(false)) return this.lastBus;
     const previous = this.lastBus;
     let value = this._readRegRaw(offset) & 0xff;
     const page = (this.cr >> 6) & 3;
@@ -360,19 +429,26 @@ class Rtl8019 {
   }
 
   writeReg(offset, value) {
+    if (offset <= 0x0f) this.stats.regCycles++; else this.stats.dataCycles++;
     value &= 0xff;
     this.lastBus = value;
+    if (offset <= 0x0f && this._busMissed(true)) return undefined;
     const drop = this.quirks.regWriteDrop;
     if (drop && offset <= 0x0f && (!drop.runningOnly || !this.stopped) &&
         (drop.target === 'cr') === (offset === 0x00) &&
         (!drop.pageSwitchOnly || (value & 0x3f) === 0x22) &&
         (drop.offset === undefined || offset === drop.offset) &&
         (drop.value === undefined || value === drop.value) &&
-        (drop.limit === undefined || (this.stats.droppedWrites || 0) < drop.limit) &&
-        ++this._dropWrites % drop.everyN === 0) {
-      this.stats.droppedWrites = (this.stats.droppedWrites || 0) + 1;
-      return undefined;
+        (drop.limit === undefined || (this.stats.droppedWrites || 0) < drop.limit)) {
+      if (this._dropBurstLeft > 0 || ++this._dropWrites % drop.everyN === 0) {
+        this._dropBurstLeft = this._dropBurstLeft > 0 ? this._dropBurstLeft - 1 : (drop.burst || 1) - 1;
+        this.stats.droppedWrites = (this.stats.droppedWrites || 0) + 1;
+        return undefined;
+      }
     }
+    const flip = this.quirks.regWriteFlip;
+    if (flip && offset === flip.offset && ((this.cr >> 6) & 3) === flip.page &&
+        ++this._flipWrites === flip.nth) value ^= flip.xor;
     if (offset === 0x00) return this.writeCr(value);
     if (offset === 0x10) return this.writeData(value);
     if (offset === 0x1f) return this.writeResetPort(value);

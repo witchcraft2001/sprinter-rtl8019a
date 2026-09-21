@@ -1621,6 +1621,13 @@ PRINT_REG_DUMP
 ;                       ours to fix, not the network's.
 ;   all zero         -> the NIC saw nothing at all; the loss
 ;                       is upstream of this machine.
+;
+; None of that holds on a chip without tally counters.  A UMC
+; UM9003AF returns a fixed 0x7F for all three, which would read
+; as a wire mangling every frame; SNAPSHOT_TALLY detects it (the
+; registers are cleared by reading and these are not) and the
+; figures are then printed with an explicit disclaimer instead
+; of being taken at face value.
 ; ------------------------------------------------------
 PRINT_TALLY_DUMP
 	PRINT	MSG_TALLY
@@ -1644,6 +1651,11 @@ PRINT_TALLY_DUMP
 	CALL	PUTCHAR
 	INC	DE
 	DJNZ	.LP
+	LD	A,(TALLY_STUCK)
+	OR	A
+	JR	Z,.REAL
+	PRINT	MSG_TALLY_NA
+.REAL
 	PRINT LINE_END
 	RET
 
@@ -1704,7 +1716,8 @@ ARP_REPLIED	EQU APP_BSS_BASE + 66		; 1 byte
 FORCE_BCAST	EQU APP_BSS_BASE + 67		; 1 byte (-b diagnostic mode)
 FORCE_MCAST	EQU APP_BSS_BASE + 68		; 1 byte (-m diagnostic mode)
 REINIT_TX	EQU APP_BSS_BASE + 69		; 1 byte (-r reset/reinit before ICMP)
-TALLY_SNAP	EQU APP_BSS_BASE + 70		; 4 bytes: CNTR0, CNTR1, CNTR2, RSR
+TALLY_SNAP	EQU APP_BSS_BASE + 70		; 5 bytes: CNTR0, CNTR1, CNTR2,
+TALLY_STUCK	EQU APP_BSS_BASE + 74		; RSR, "tallies not implemented"
 ; Private copy of the common driver's TX capture.  Keep it away from the
 ; compact command/RX state above; total size is 4+2+42+2+6 = 56 bytes.
 ICMP_TX_STAGE	EQU APP_BSS_BASE + 128		; stage, ISR, TSR, CR
@@ -1781,6 +1794,7 @@ MSG_LOST_EQ	DB ", Lost = ",0
 MSG_LOSS_END	DB ".",0
 MSG_REGS	DB "REGS ",0
 MSG_TALLY	DB " NIC ",0
+MSG_TALLY_NA	DB "(no tally counters on this chip)",0
 MSG_E_RESET	DB "[E60] RESET timeout",0
 MSG_E_SEND	DB "[E61] TX failed",0
 MSG_E_ARP	DB "[E62] ARP reply timeout",0

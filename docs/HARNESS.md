@@ -121,6 +121,27 @@ code was 0.
                              // Narrowing: pageSwitchOnly (plain page selects,
                              // the writes the driver reads back), offset,
                              // value, limit (stop after that many drops).
+                             // burst: drop that many in a row (4 defeats a
+                             // retry loop of 4).
+    busMiss: null,          // { everyN, burst, kind: 'read'|'both',
+                             // runningOnly }: the chip sits out `burst`
+                             // register cycles in a row.  A read returns what
+                             // the previous cycle left on the bus; with 'both'
+                             // a write is not latched either.  NICREG must not
+                             // turn unanswered READS into "lost writes".
+    regWriteFlip: null,     // { page, offset, nth, xor }: that one write
+                             // latches with bits flipped.  NICREG must report
+                             // a failed load/setup, not thousands of misreads.
+    regPoke: null,          // { afterAccesses, index, value }: PAR[index]
+                             // changes behind the host's back.  NICREG must
+                             // count it once and write it back.
+    dmaReadGlitch: null,    // { nth, xor }: the Nth data-port READ of the run
+                             // comes back corrupted while packet RAM stays
+                             // intact.  NICREG [G6] must call it rd-bad.
+    dmaWriteDrop: null,     // { nth }: the Nth data-port WRITE never reaches
+                             // packet RAM, the address still advances.  That
+                             // byte stays wrong however often it is read
+                             // back, so [G6] must call it mem-bad.
   },
   config: { cfg0, cfg1, cfg2, cfg3, cfg4 }, // page-3 CONFIG raw bytes
   txError: true,             // or {attempts:[1,2]} to fail specific TXP attempts
@@ -327,3 +348,13 @@ NERR_HW with DE=0 and IX=0, preserve a RECV/LASTERR diagnostic, restore the
 caller's receive scope, and leave ISA closed. Existing vectors continue to
 cover foreign-channel capacity (0/536 only), pre-ACK payload and FIN, overlap
 retransmission, failed final ACK, and relocation of the DLL into WIN1 or WIN2.
+
+### Measuring the cost of a driver change
+
+`card.stats.regCycles` and `card.stats.dataCycles` count every
+register-file and data-port cycle the program spent on the chip, and
+`steps` counts executed Z80 instructions.  Together they tell a change
+in driver overhead apart from a change in the measurement: a 48 KB
+`WGET` download costs about 3600 register cycles against 54200
+data-port cycles, so even a large change to the register paths moves
+the total by a fraction of a percent.

@@ -929,15 +929,26 @@ REG_SNAPSHOT_LEN EQU 10
 ; it is only meaningful when something was received, and it
 ; is not cleared by reading.
 ;
-; In:  HL = 4-byte destination (CNTR0, CNTR1, CNTR2, RSR).
+; Not every DP8390 clone implements the tallies.  A UMC
+; UM9003AF answers 0x7F to all three no matter what, which
+; reads as a wire damaging every frame; NICREG [G3] shows
+; four identical reads in a row where a real counter would
+; have cleared itself after the first.  The fifth byte is
+; that verdict, so the caller can say "not implemented"
+; instead of printing a fabricated error rate.
+;
+; In:  HL = 5-byte destination (CNTR0, CNTR1, CNTR2, RSR,
+;      tally-not-implemented flag).
 ;      ISA window OPEN, as for every other driver primitive.
-; Out: HL advanced past the 4 bytes.  Trashes A, IX.
+; Out: HL advanced past the 5 bytes.  Trashes A, IX.
 ; ------------------------------------------------------
 SNAPSHOT_TALLY
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
+	PUSH	BC
 	LD	A,(IX+RTL_CNTR0_OFF)
 	LD	(HL),A
+	LD	C,A			; kept for the read-to-clear probe
 	INC	HL
 	LD	A,(IX+RTL_CNTR1_OFF)
 	LD	(HL),A
@@ -948,6 +959,21 @@ SNAPSHOT_TALLY
 	LD	A,(IX+RTL_RSR_OFF)
 	LD	(HL),A
 	INC	HL
+	; The read above cleared CNTR0, so a second read must come back
+	; 0.  The same non-zero value twice means the register is not a
+	; counter at all: a real one would have to tick again and land
+	; on exactly the value it just reported.
+	LD	A,(IX+RTL_CNTR0_OFF)
+	CP	C
+	LD	B,0
+	JR	NZ,.REAL
+	OR	A
+	JR	Z,.REAL
+	INC	B
+.REAL
+	LD	(HL),B
+	INC	HL
+	POP	BC
 	LD	(IX+RTL_ISR_OFF),ISR_CNT	; write-1-to-clear, CNT only
 	RET
 	ENDIF
@@ -2458,6 +2484,30 @@ SET_BNRY_FROM_NEXT_A
 ; back as written.  A missed ISA write cycle on a page switch sends
 ; every following register access to the wrong page (NICREG caught
 ; a BNRY write landing in PAR2 that way).
+;
+; The read-back is CONDITIONED by reading another register just
+; before it.  A cycle the chip does not answer returns whatever the
+; previous cycle left on the data bus -- and immediately after the
+; write above that is the very value being looked for, so a chip
+; that sat out both cycles used to pass.  The conditioner puts
+; something else there.
+;
+; The read-back is also done twice, because a misdirected read is
+; real on this hardware: NICREG measured a UM9003AF answering reads
+; from CURR while its receiver was busy, and CURR sits in the ring
+; range 0x46..0x5F, which under CR_VERIFY_MASK can look exactly like
+; a confirmed page 1.  Two conditioned reads both have to be wrong
+; the same way to let a lost CR write through.  The two conditioners
+; differ on purpose as well: if one of them happened to match the CR
+; value under the mask it would be blind, and both matching is far
+; less likely than one.
+;
+; This was briefly cut back to a single read-back on the suspicion
+; that it had cost a sixth of the FTP transfer rate.  It had not:
+; one 48 KB download costs 3628 register cycles against 54237
+; data-port cycles, and the whole hardening since 244d426 moved the
+; register figure by 540.  The throughput "drop" was the transfer
+; report rounding a 380 KB file to whole seconds.
 ;   In:  A = CR value (no TXP, no remote-DMA start); IX = base.
 ;   Out: CF=0 confirmed; CF=1 not confirmed after all tries.
 ; Trashes A.  Preserves BC, DE, HL.  ISA open.
@@ -2469,10 +2519,17 @@ SELECT_PAGE
 	LD	B,CR_SELECT_TRIES
 .TRY
 	LD	(IX+RTL_CR_OFF),C
+	LD	A,(IX+RTL_PAR0_OFF)	; conditioner: CLDA0 / PAR0 / PSTART
+	LD	A,(IX+RTL_CR_OFF)
+	XOR	C
+	AND	CR_VERIFY_MASK
+	JR	NZ,.AGAIN
+	LD	A,(IX+RTL_BNRY_OFF)	; conditioner: BNRY / PAR2
 	LD	A,(IX+RTL_CR_OFF)
 	XOR	C
 	AND	CR_VERIFY_MASK		; clears CF
 	JR	Z,.DONE
+.AGAIN
 	DJNZ	.TRY
 	SCF
 .DONE

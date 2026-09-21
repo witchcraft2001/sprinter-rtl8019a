@@ -119,6 +119,23 @@ all. Confirmed by an A/B on the same card, cable and evening: the old
 = RTL_CHIP_REALTEK`, see `IS_REALTEK`/`CAPTURE_TX_PHY_PRE` in
 `src/lib/rtl8019.asm`) sent 20/20, and v0.3.20 sent 50/50.
 
+**Reserved bits on a clone follow the bus, and a stopped clone answers
+some registers with junk.** On a UM9003AF `RCR` reads back `84` where
+`04` was written, `DCR` reads `C8` for `48`, `TCR` reads `C0` for `00`
+and `IMR` reads `80` for `00`: bits the DP8390 does not define are not
+driven at all, so they return whatever the previous bus cycle left
+behind.  Every register dump in this kit shows the raw value, and the
+driver masks those bits before comparing -- do not read a register dump
+from this card as if the reserved bits meant something.  The same goes
+for the tally counters `CNTR0..2` while the chip is **stopped**: on this
+card `NICREG` `[G3]` shows them as a steady `7F`, but with the receiver
+running `PING` reads them as `00` and they clear on reading exactly as
+the datasheet says.  Since v0.3.25 `PING` and `NICLB` test that -- the
+counters are cleared by reading -- and append `(no tally counters on
+this chip)` to the `NIC fae=` line when a non-zero value comes back
+twice, so a chip that really lacks them cannot pass off a fixed value as
+a damaged cable.  That note has not been seen on any card so far.
+
 ## Installing on Sprinter DSS
 
 The `distr/sprinter-rtl8019a.zip` archive and the FAT12 floppy image both

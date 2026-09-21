@@ -123,6 +123,11 @@ dropped on the floor by the PHY; `mpc` non-zero points at this driver
 rather than the network; all-zero says the NIC genuinely saw nothing and
 the loss is upstream of this machine.
 
+If the line ends with `(no tally counters on this chip)`, the three
+figures mean nothing: the chip answered with a fixed value and did not
+clear it on reading, so it has no counters.  Only `rsr` is still
+meaningful there.
+
 The counters are cleared by reading, and PING samples them at the end of
 *every* echo -- successful ones included.  The printed figures therefore
 cover the lost echo's wait alone, not the whole run.  `ISR` bit 5 (`CNT`)

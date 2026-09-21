@@ -442,20 +442,19 @@ function unicastFrame(payload = 'PAYLOAD') {
 // is misread (a genuine marginal-bus fault).  Every target read is preceded
 // by a read of a conditioner register preset to 00 and then to FF.
 // ---------------------------------------------------------------------
+const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000';
 { // healthy card: every pair equal, nothing transmitted without -t
   const r = run('NICREG', '');
   assert.strictEqual(r.exitCode, 0);
   assert.match(r.output, /\[G0\] Slot\/Addr: 1\/#300 chip=Realtek/);
-  assert.match(r.output, /bad after-00=0000 after-FF=0000 cond=0000/);
+  assert.match(r.output, /bad after-00=0000 after-FF=0000 cond=0000 load=00/);
   assert.match(r.output, /\[G2\] PAGE2 CONFIG .* bad=0000/);
   assert.match(r.output, /RCR   04\|04\/04\|04\/04 TCR   02\|02\/02\|02\/02/);
   assert.match(r.output, /CR    21\/21\|21\/21/);
   assert.match(r.output, /\[G4\] PAR=028019112233  per row: 288000 reads, 192000 writes/);
-  assert.match(r.output, / row  rd-bad bits wr-lost wr-bad cr-bad rxpages badticks withrx/);
-  for (const row of ['stop', 'deaf', 'live']) {
-    assert.match(r.output, new RegExp(` ${row} 0000   00   0000    0000   0000   0000    0000     0000`));
-  }
-  assert.doesNotMatch(r.output, /^  (rd|wr) /m);
+  assert.match(r.output, / row  rd-bad bits wr-lost wr-bad unsure cr-bad rxpages badticks withrx/);
+  for (const row of ['stop', 'deaf', 'live']) assert.match(r.output, new RegExp(` ${row} ${G4_CLEAN}`));
+  assert.doesNotMatch(r.output, /^  (rd|wr|page) /m);
   assert.match(r.output, /RESULT OK/);
   assert.strictEqual(r.transmittedFrames.length, 0, 'NICREG must not transmit unless asked');
   // The diagnostic leaves the controller stopped, as it found it.
@@ -488,12 +487,25 @@ function unicastFrame(payload = 'PAYLOAD') {
   assert.match(r.output, /PAR0  bad=0001 bits=80/);
   // A fault that does not care about the chip's state shows in ALL [G4]
   // rows, the stopped control included, and in ticks where the ring never
-  // moved; the misreads are kept verbatim.  No write is blamed for it.
+  // moved; the misreads are kept verbatim.  No write is blamed for it and
+  // nothing is left undecided: the re-read returns the wanted value.  A
+  // glitch that lands in a page-switch confirmation counts as cr-bad.
   for (const row of ['stop', 'deaf', 'live']) {
-    assert.match(r.output, new RegExp(` ${row} 01E5   80   0000    0000   0000   0000    01E5     0000`));
+    const m = r.output.match(new RegExp(` ${row} ([0-9A-F]{4})   80   0000    0000   0000   ([0-9A-F]{4})   0000    ([0-9A-F]{4})     0000`));
+    assert.ok(m, `${row} row`);
+    assert.strictEqual(parseInt(m[1], 16) + parseInt(m[2], 16), parseInt(m[3], 16), 'one glitch, one bad window');
+    assert.ok(parseInt(m[1], 16) > 0x1c0);
   }
-  assert.match(r.output, /  rd PAR5=B3@1B PAR3=91@01 /);
-  assert.doesNotMatch(r.output, /^  wr /m);
+  // Six samples, one register apart, two sweeps apart: the glitch strides
+  // through PAR0..5 at a fixed period.  The absolute sweep number depends on
+  // how many accesses the setup spent before the loop, which is not the
+  // point being tested here.
+  {
+    const m = r.output.match(/ {2}rd PAR0=82@([0-9A-F]{2}) PAR1=00@([0-9A-F]{2}) PAR2=99@/);
+    assert.ok(m, 'rd sample line');
+    assert.strictEqual((parseInt(m[1], 16) + 2) & 0x1f, parseInt(m[2], 16));
+  }
+  assert.doesNotMatch(r.output, /^  (wr|page) /m);
   // 0.3.18 loaded the sample counter into B and THEN printed the "  rd"
   // label; real DSS console calls trash B, and hardware printed 256 samples
   // of stray memory.  The model trashes B the same way: the line must stop
@@ -518,17 +530,17 @@ function unicastFrame(payload = 'PAYLOAD') {
   });
   assert.strictEqual(r.exitCode, 3);
   assert.match(r.output, /bad after-00=0000 after-FF=0000 cond=0000/);
-  assert.match(r.output, / stop 0000   00   0000    0000   0000   0000    0000     0000/);
-  assert.match(r.output, / deaf 0000   00   0000    0000   0000   0000    0000     0000/);
-  const live = r.output.match(/ live ([0-9A-F]{4})   FF   0000    0000   0000   ([0-9A-F]{4})    ([0-9A-F]{4})     ([0-9A-F]{4})/);
+  assert.match(r.output, new RegExp(` stop ${G4_CLEAN}`));
+  assert.match(r.output, new RegExp(` deaf ${G4_CLEAN}`));
+  const live = r.output.match(/ live ([0-9A-F]{4})   FF   0000    0000   0000   0000   ([0-9A-F]{4})    ([0-9A-F]{4})     ([0-9A-F]{4})/);
   assert.ok(live, 'live row with misreads expected');
   assert.ok(parseInt(live[1], 16) > 0);
   assert.strictEqual(live[2], live[1], 'one stored frame, one page, one misread');
   assert.strictEqual(live[3], live[1]);
   assert.strictEqual(live[4], live[1], 'every bad tick must be tied to reception');
-  // 14th register read after the frame: 6 PAR + 4 MAR read-backs, then
-  // PAR3 of the second sweep (0x11 ^ 0xFF)
-  assert.match(r.output, /  rd PAR3=EE@01 /);
+  // 14th register read after the frame: the page-identity read of SET_PAGE,
+  // 6 PAR + 4 MAR read-backs, then PAR2 of the second sweep (0x19 ^ 0xFF)
+  assert.match(r.output, /  rd PAR2=E6@01 /);
   assert.ok(r.card.stats.filteredRx > 0, 'the deaf row must have had traffic to ignore');
   checkCleanup(r);
 }
@@ -537,10 +549,10 @@ function unicastFrame(payload = 'PAYLOAD') {
   // only in the rows where the chip runs.
   const r = run('NICREG', '', { quirks: { regWriteDrop: { target: 'reg', everyN: 10007, runningOnly: true } } });
   assert.strictEqual(r.exitCode, 3);
-  assert.match(r.output, / stop 0000   00   0000    0000   0000   0000    0000     0000/);
-  assert.match(r.output, / deaf 0000   00   0013    0000   0000   0000    0013     0000/);
-  assert.match(r.output, / live 0000   00   0013    0000   0000   0000    0013     0000/);
-  assert.match(r.output, /  wr MAR2=69>96 MAR3=69>96 MAR0=C3>3C MAR1=C3>3C/);
+  assert.match(r.output, new RegExp(` stop ${G4_CLEAN}`));
+  assert.match(r.output, / deaf 0000   00   0013    0000   0000   0000   0000    0013     0000/);
+  assert.match(r.output, / live 0000   00   0013    0000   0000   0000   0000    0013     0000/);
+  assert.match(r.output, /  wr MAR2=87>78 MAR3=C9>36 MAR0=E1>1E MAR1=2D>D2/);
   // same counter-across-a-DSS-print trap as the "  rd" line: four, not 256
   const wrLines = r.output.split(/\r?\n/).filter((l) => l.startsWith('  wr'));
   assert.strictEqual(wrLines.length, 2);
@@ -554,13 +566,114 @@ function unicastFrame(payload = 'PAYLOAD') {
   // station address must survive.
   const r = run('NICREG', '', { quirks: { regWriteDrop: { target: 'cr', everyN: 1201, runningOnly: true } } });
   assert.strictEqual(r.exitCode, 3);
-  assert.match(r.output, / stop 0000   00   0000    0000   0000   0000    0000     0000/);
-  assert.match(r.output, / deaf 0000   00   0000    0000   0003   0000    0003     0000/);
-  assert.match(r.output, / live 0000   00   0000    0000   0003   0000    0003     0000/);
+  assert.match(r.output, new RegExp(` stop ${G4_CLEAN}`));
+  assert.match(r.output, / deaf 0000   00   0000    0000   0000   0003   0000    0003     0000/);
+  assert.match(r.output, / live 0000   00   0000    0000   0000   0004   0000    0004     0000/);
+  assert.doesNotMatch(r.output, /^  page /m);
   assert.ok(r.card.stats.droppedWrites >= 6);
   assert.strictEqual(r.card.par, '028019112233', 'PAR must not be hit by a stray BNRY write');
   assert.strictEqual(r.card.curr, 0x47, 'CURR must not be hit by a stray ISR write');
   assert.match(r.output, /RESULT FAIL/);
+  checkCleanup(r);
+}
+// --- the test must not manufacture its own evidence (code review, 0.3.24) ---
+{ // FOUR page switches lost in a row defeat the retry loop.  0.3.23 carried on
+  // regardless: its sweep ran on page 0, the drain wrote BNRY into PAR2, and
+  // the row reported C0 misreads and 80 garbled writes that never happened.
+  // Now the window is abandoned, the row is set up again and says so.
+  const r = run('NICREG', '', { quirks: { regWriteDrop: { target: 'cr', everyN: 1201, burst: 4, limit: 4, runningOnly: true } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.strictEqual(r.card.stats.droppedWrites, 4);
+  assert.match(r.output, / deaf 0000   00   0000    0000   0000   0001   0000    0001     0000\r?\n  page lost=0001 setup retries=0000/);
+  assert.match(r.output, new RegExp(` live ${G4_CLEAN}`));
+  assert.doesNotMatch(r.output, /^  (rd|wr) /m);
+  assert.strictEqual(r.card.par, '028019112233');
+  assert.strictEqual(r.card.curr, 0x47);
+  checkCleanup(r);
+}
+{ // The chip sits out bursts of 16 cycles, reads and writes alike, often
+  // enough to hit page switches: whatever else is reported, no register may
+  // be written on an unconfirmed page.
+  const r = run('NICREG', '', { quirks: { busMiss: { everyN: 3220, burst: 16, kind: 'both', runningOnly: true } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, /  page lost=0004 setup retries=0000/);
+  assert.strictEqual(r.card.par, '028019112233');
+  assert.strictEqual(r.card.curr, 0x47);
+  checkCleanup(r);
+}
+{ // READS the chip does not answer, three cycles in a row; every write is
+  // fine.  The unanswered read returns what the previous cycle left on the
+  // bus.  0.3.23 took two such re-reads for proof and reported 17 lost and 16
+  // garbled writes here (its MAR1/MAR3 patterns were the complements of
+  // MAR0/MAR2, so the leftover even looked like "the previous pattern").
+  // No write may be blamed now.
+  const r = run('NICREG', '', { quirks: { busMiss: { everyN: 5003, burst: 3, kind: 'read', runningOnly: true } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.ok(r.card.stats.missedCycles > 600);
+  assert.match(r.output, new RegExp(` stop ${G4_CLEAN}`));
+  for (const row of ['deaf', 'live']) {
+    assert.match(r.output, new RegExp(` ${row} 00[0-9A-F]{2}   [0-9A-F]{2}   0000    0000   [0-9A-F]{4}   [0-9A-F]{4}   0000 `));
+  }
+  assert.doesNotMatch(r.output, /^  wr /m);
+  checkCleanup(r);
+}
+{ // One bit flipped in the single write that loads PAR2 for the stop row.
+  // Every later read returns the register's true content; 0.3.23 compared it
+  // with the pattern and reported BB80 "misreads".  The setup is read back
+  // now and repeated.
+  const r = run('NICREG', '', { quirks: { regWriteFlip: { page: 1, offset: 3, nth: 5, xor: 0x01 } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, / stop 0000   00   0000    0000   0000   0001   0000    0000     0000\r?\n  page lost=0000 setup retries=0001/);
+  assert.match(r.output, new RegExp(` deaf ${G4_CLEAN}`));
+  assert.doesNotMatch(r.output, /^  (rd|wr) /m);
+  checkCleanup(r);
+}
+{ // the same flip in a [G1] pattern load: 512 identical wrong reads are a
+  // failed load, not 512 misreads
+  const r = run('NICREG', '', { quirks: { regWriteFlip: { page: 1, offset: 3, nth: 1, xor: 0x01 } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, /bad after-00=0000 after-FF=0000 cond=0000 load=01/);
+  assert.match(r.output, /PAR2  bad=0200 bits=01/);
+  checkCleanup(r);
+}
+{ // PAR2 changes behind the host's back in the middle of the deaf row.  One
+  // event, one count: the content is proven wrong (the conditioner reads
+  // right), reported as wanted>held, and written back.
+  const r = run('NICREG', '', { quirks: { regPoke: { afterAccesses: 900000, index: 2, value: 0x46 } } });
+  assert.strictEqual(r.exitCode, 3);
+  // The sweep the poke lands in depends on how many accesses the row spent
+  // setting itself up, which is not what this case is about.
+  assert.match(r.output, / deaf 0000   00   0000    0001   0000   0000   0000    0001     0000\r?\n  rd PAR2=46@[0-9A-F]{2}\r?\n  wr PAR2=19>46/);
+  assert.match(r.output, new RegExp(` live ${G4_CLEAN}`));
+  assert.strictEqual(r.card.par, '028019112233', 'the damage must be repaired');
+  checkCleanup(r);
+}
+{ // [G6]: one corrupted READ of the remote-DMA data port.  Packet RAM is
+  // untouched, so the second pass finds the byte intact -- the read lied.
+  const r = run('NICREG', '', { quirks: { dmaReadGlitch: { nth: 500, xor: 0x01 } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, / deaf 0001   0001   0000    0000   0001   0000   0000/);
+  assert.match(r.output, /^ {2}dma [0-9A-F]{2}=([0-9A-F]{2})>([0-9A-F]{2}) $/m);
+  const [, want, got] = r.output.match(/^ {2}dma [0-9A-F]{2}=([0-9A-F]{2})>([0-9A-F]{2}) $/m);
+  assert.strictEqual(parseInt(want, 16) ^ parseInt(got, 16), 0x01);
+  assert.match(r.output, / live 0000   0000   0000    0000   0000   0000/);
+  checkCleanup(r);
+}
+{ // [G6]: one WRITE that never reached packet RAM.  Both read passes find the
+  // same byte wrong, so the content is blamed and not the reads.
+  const r = run('NICREG', '', { quirks: { dmaWriteDrop: { nth: 700 } } });
+  assert.strictEqual(r.exitCode, 3);
+  assert.match(r.output, / deaf 0001   0000   0001    0000   0001   0000   0000/);
+  assert.match(r.output, / live 0000   0000   0000    0000   0000   0000/);
+  checkCleanup(r);
+}
+{ // [G6]: the whole run is clean on a healthy chip, and the phase must not
+  // touch the receive ring it shares the chip with.
+  const r = run('NICREG', '');
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /\[G6\] DMA DATA PORT, per row: 800 bursts x 128 bytes/);
+  assert.match(r.output, / deaf 0000   0000   0000    0000   0000   0000   0000/);
+  assert.doesNotMatch(r.output, /^ {2}dma /m);
   checkCleanup(r);
 }
 { // a misread page-2 DEFINED bit fails too (reserved ones never do)
@@ -583,7 +696,7 @@ function unicastFrame(payload = 'PAYLOAD') {
   assert.match(r.output, / A poll  ptx=20 /);
   assert.match(r.output, / B quiet ptx=20 /);
   assert.match(r.output, / C drv   ptx=20/);
-  assert.match(r.output, / live 0000   00   0000    0000   0000   (?!0000)[0-9A-F]{4}    0000     0000/);
+  assert.match(r.output, / live 0000   00   0000    0000   0000   0000   (?!0000)[0-9A-F]{4}    0000     0000/);
   assert.strictEqual(r.transmittedFrames.length, 60);
   const marks = r.transmittedFrames.map((h) => {
     const f = Buffer.from(h, 'hex');
