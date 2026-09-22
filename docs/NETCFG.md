@@ -18,7 +18,7 @@ NETCFG /?       help (-? -h also accepted)
 ## `-w`: interactive wizard
 
 `NETCFG -w` walks through every key in order -- `RTL_RESET`, an optional
-card probe, `RTL_HW`, `RTL_MAC`, `IP` (or `DHCP`), and, only when `IP` is
+card probe, `RTL_HW`, `RTL_TYPE`, `RTL_MAC`, `IP` (or `DHCP`), and, only when `IP` is
 not `DHCP`, `NETMASK`/`GATEWAY`/`DNS1`/`DNS2`, then `TZ` and `NTP` -- and
 writes a fresh, canonical `NET.CFG`. Each prompt shows the current value
 in brackets:
@@ -84,6 +84,13 @@ what gets written to `NET.CFG`. **`-w` never publishes `NET_*`
 variables from what it wrote** -- run `NETCFG -i` afterwards to apply
 the new file.
 
+`RTL_TYPE=NE1000` selects packet RAM at `2000h..3FFFh`; `NE2000` selects
+`4000h..5FFFh`. An empty value is AUTO. AUTO probes both RAM windows and
+publishes `NET_RTL_TYPE` only for an unambiguous result. A classic NE1000
+does not carry the Realtek `Pp` ID, so its slot/base must be pinned with
+`RTL_HW=S/#HHH`; the broad ISA scan intentionally accepts only the Realtek
+ID to avoid mistaking a floating bus for a card.
+
 ## The MAC address
 
 With no `RTL_MAC=` line in `NET.CFG`, `NETCFG -i` reads the address out of
@@ -91,6 +98,11 @@ the card's own PROM and publishes it as `NET_MAC`.  That probe needs to
 find the card, so `-i` publishes `NET_RTL_HW` and `NET_RTL_RESET` to the
 environment *before* touching the hardware -- the driver reads both while
 locating the chip.
+
+AUTO type detection still touches the card when `RTL_MAC` is supplied. The
+override is preserved; the access is needed to determine and publish the
+packet-RAM layout. Set an explicit `RTL_TYPE` as well when configuration
+must be applied without touching hardware.
 
 If the address cannot be obtained, `NETCFG -i` **fails**: without
 `NET_MAC` nothing downstream can run, so leaving the environment in that

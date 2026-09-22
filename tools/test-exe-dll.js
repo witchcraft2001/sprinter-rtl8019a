@@ -81,6 +81,19 @@ const dllScenario = (extra = {}) => ({
   assert.ok(r.cleanup.isaClosed && r.cleanup.filesClosed);
   count();
 }
+{ // The same public ABI and TCP path on an NE1000.  This also exercises
+  // the DLL's scatter/gather writer.
+  const scenario = dllScenario({
+    quirks: { variant: 'NE1000' },
+    responders: { arp: arpToServer, tcp: { body: 'ne1000', status: 200 } },
+  });
+  scenario.environment.NET_RTL_TYPE = 'NE1000';
+  const r = run('UNETTEST', '192.168.7.1 80', scenario);
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /HTTP\/1\.1 200 OK/);
+  assert.strictEqual(r.card.tpsrValue, 0x20);
+  count();
+}
 { // -u UDP echo: PING through the cold overlay, then a byte-exact
   // UDPOPEN/SEND/RECV round-trip of the 21-byte default payload.
   // (Regression guard for the PUT_DEC_HL DE-clobber that used to send

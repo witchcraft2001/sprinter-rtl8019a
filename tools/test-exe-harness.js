@@ -178,6 +178,43 @@ for (const base of [0x200, 0x320, 0x3e0]) {
   assert.doesNotMatch(r.output, /\[N7\]|\[N8\]|\[W0[345]\]/);
   checkCleanup(r);
 }
+{ // NICINFO is a non-publishing verifier: without NET_RTL_TYPE the selected
+  // default disagrees with an NE1000 RAM probe and produces W06.
+  const r = run('NICINFO', '', {
+    quirks: { variant: 'NE1000' },
+    environment: { NET_RTL_HW: '1/#300' },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /CARD_TYPE=NE2000/);
+  assert.match(r.output, /TYPE_PROBE=NE1000/);
+  assert.match(r.output, /\[W06\]/);
+  assert.match(r.output, /PROM_LAYOUT=direct/);
+  assert.strictEqual(r.environment.NET_RTL_TYPE, undefined);
+  checkCleanup(r);
+}
+{ // An explicit matching type is still verified and remains warning-free.
+  const r = run('NICINFO', '', {
+    quirks: { variant: 'NE1000' },
+    environment: { NET_RTL_HW: '1/#300', NET_RTL_TYPE: 'NE1000' },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /CARD_TYPE=NE1000/);
+  assert.match(r.output, /TYPE_PROBE=NE1000/);
+  assert.doesNotMatch(r.output, /\[W06\]/);
+  assert.doesNotMatch(r.output, /\[E02\]|\[W02\]/);
+  assert.strictEqual(r.environment.NET_RTL_TYPE, 'NE1000');
+  checkCleanup(r);
+}
+{ // A stale explicit NE2000 setting is diagnosed rather than trusted.
+  const r = run('NICINFO', '', {
+    quirks: { variant: 'NE1000' },
+    environment: { NET_RTL_HW: '1/#300', NET_RTL_TYPE: 'NE2000' },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /TYPE_PROBE=NE1000/);
+  assert.match(r.output, /\[W06\]/);
+  checkCleanup(r);
+}
 { // a genuine RTL8019AS still gets the page-3 decode
   const r = run('NICINFO', '');
   assert.match(r.output, /\[N6\] P3 9346=/);
@@ -725,6 +762,24 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   const n = run('NICREG', '', { cardPresent: false });
   assert.strictEqual(n.exitCode, 2);
   checkCleanup(n);
+}
+
+// ---------------------------------------------------------------------
+// NE1000 runtime layout with the direct remote-DMA write sequence used by
+// the Crynwr NE1000/NE2000 packet drivers and stock MAME.
+// ---------------------------------------------------------------------
+for (const app of ['NICRAM', 'NICLB', 'NICTX', 'NICREG']) {
+  const r = run(app, '', {
+    environment: { NET_RTL_HW: '1/#300', NET_RTL_TYPE: 'NE1000' },
+    quirks: {
+      variant: 'NE1000', chipPreStarted: true,
+    },
+  });
+  assert.strictEqual(r.exitCode, 0, `${app}: ${r.output}`);
+  assert.match(r.output, /RESULT OK/);
+  if (app === 'NICRAM') assert.match(r.output, /ADDR=3F00 LEN=0100 OK/);
+  checkCleanup(r);
+  count();
 }
 
 console.log(`Actual DSS EXE harness: ${caseCount()} header, self-test, NICINFO/NICRAM/NICLB/NICTX/NICRX, ISAPROBE and NICREG checks passed`);

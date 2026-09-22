@@ -96,6 +96,9 @@ ICMP_BSS_BASE		EQU 0xAEA0
 	DEFINE USE_CMDL
 	DEFINE USE_RESOLVE
 	DEFINE USE_TCP
+	; NETCFG/IFUP publish NET_RTL_HW before Telnet starts.  Keep the
+	; large interactive client independent of the optional base scan.
+	DEFINE RTL_NO_AUTOSCAN
 
 	MODULE MAIN
 
@@ -108,7 +111,9 @@ ICMP_BSS_BASE		EQU 0xAEA0
 	; matches LOAD_ADDR in sibling sprinter_wifi/network (whose header
 	; ORG is 0x3F00, below WIN1 entirely -- proof the header address is
 	; file bookkeeping and nothing more).
-	ORG 0x4000
+	; Header sits one page below the code, leaving the complete 16K WIN1
+	; range available to the client after DSS strips the header.
+	ORG 0x3F00
 
 EXE_HEADER
 	DB "EXE"
@@ -124,7 +129,7 @@ EXE_HEADER
 	DW STACK_TOP
 	DS 234,0
 
-	ORG 0x4100
+	ORG 0x4000
 
 START
 	; Save the DSS PSP pointer before the allocation syscall can clobber IX.

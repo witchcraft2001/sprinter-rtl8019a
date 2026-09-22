@@ -66,6 +66,8 @@ START
 	XOR	A
 	LD	(CANCELLED),A
 	LD	(MODE_DHCP),A
+	LD	(AUTO_TYPE),A
+	LD	(AUTO_WARN),A
 
 	CALL	@CMDL.PARSE
 	CALL	@CMDL.IS_HELP
@@ -103,6 +105,55 @@ START
 	JP	C,@UTIL.EXIT_NO_NIC
 	CALL	@RTL.RESET
 	JP	C,RESET_FAIL
+	; When NET_RTL_TYPE is absent, probe both standard packet-RAM
+	; windows before INIT_NORMAL programs the receive ring.
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_ENV
+	JR	NZ,.TYPE_READY
+	CALL	@RTLDET.ENTER_PROBE_MODE
+	CALL	@RTLDET.DETECT
+	JR	NC,.DETECT_OK
+	JP	DETECT_FAIL
+.DETECT_OK
+	CP	RTL_DET_NE1000
+	JR	NZ,.NOT_AUTO_1000
+	LD	A,1
+	LD	(AUTO_TYPE),A
+	LD	A,RTL_LAYOUT_NE1000
+	JR	Z,.APPLY_TYPE
+.NOT_AUTO_1000
+	CP	RTL_DET_NE2000
+	JR	NZ,.AUTO_UNCERTAIN
+	LD	A,2
+	LD	(AUTO_TYPE),A
+	JR	.AUTO_FALLBACK
+.AUTO_UNCERTAIN
+	CP	RTL_DET_AMBIGUOUS
+	LD	A,2			; unknown warning
+	JR	NZ,.STORE_WARN
+	DEC	A			; ambiguous warning
+.STORE_WARN
+	LD	(AUTO_WARN),A
+.AUTO_FALLBACK
+	XOR	A			; ambiguous/unknown use the safe NE2000 fallback
+.APPLY_TYPE
+	CALL	@RTL.SET_LAYOUT
+.TYPE_READY
+	; Diagnostics require DSS output, so close and reopen around it.
+	LD	A,(AUTO_WARN)
+	OR	A
+	JR	Z,.TYPE_WARN_DONE
+	CALL	@ISA.ISA_CLOSE
+	LD	A,(AUTO_WARN)
+	DEC	A
+	JR	NZ,.WARN_UNKNOWN
+	PRINTLN MSG_W_AMBIG
+	JR	.WARN_REOPEN
+.WARN_UNKNOWN
+	PRINTLN MSG_W_UNKNOWN
+.WARN_REOPEN
+	CALL	@ISA.ISA_OPEN
+.TYPE_WARN_DONE
 	LD	HL,OUR_MAC
 	; RCR_AB (broadcast + PAR-filtered unicast), NOT promiscuous:
 	; the DHCP OFFER/ACK come back broadcast (we set the BOOTP
@@ -119,6 +170,8 @@ START
 
 	; -- STATIC: just announce.
 	CALL	@ISA.ISA_CLOSE
+	CALL	PUBLISH_CARD_TYPE
+	JP	C,TYPE_PUBLISH_FAIL
 	PRINT LINE_END
 	PRINT MSG_STATIC_PRE
 	LD	HL,STATIC_IP
@@ -132,6 +185,8 @@ START
 	LD	(RETRY_LEFT),A
 .DISCOVER_TRY
 	CALL	@ISA.ISA_CLOSE
+	CALL	PUBLISH_CARD_TYPE
+	JP	C,TYPE_PUBLISH_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_DISCOVER
 	CALL	@ISA.ISA_OPEN
@@ -250,6 +305,24 @@ RESET_FAIL
 	PRINT LINE_END
 	PRINTLN MSG_E_RESET
 	CALL	PRINT_REG_DUMP
+	LD	B,EX_NET_ERR
+	JP	@UTIL.EXIT_FAIL
+
+; DETECT has already captured the failed remote-DMA state and attempted its
+; own STOP_AND_CHECK.  Do not touch chip registers here: CHIP_FAULT means
+; the controller's state is untrusted, and the snapshot must remain the one
+; taken at the point of failure.
+DETECT_FAIL
+	PUSH	AF
+	CALL	@ISA.ISA_CLOSE
+	POP	AF
+	CP	RTL_DET_DMA_ERROR
+	JR	NZ,.CHIP
+	PRINTLN MSG_E_DETECT_DMA
+	JR	.FAIL
+.CHIP
+	PRINTLN MSG_E_DETECT_CHIP
+.FAIL
 	LD	B,EX_NET_ERR
 	JP	@UTIL.EXIT_FAIL
 
@@ -491,7 +564,50 @@ PUBLISH_NET_MARKER
 	RST	DSS
 	RET
 
+; Publish an unambiguous auto-detection result and verify the final value.
+; AUTO_TYPE: 0 = do not publish, 1 = NE1000, 2 = NE2000.
+PUBLISH_CARD_TYPE
+	LD	A,(AUTO_TYPE)
+	OR	A
+	RET	Z
+	LD	HL,S_NET_TYPE_1000
+	LD	DE,V_NET_TYPE_1000
+	DEC	A
+	JR	Z,.SET
+	LD	HL,S_NET_TYPE_2000
+	LD	DE,V_NET_TYPE_2000
+.SET
+	PUSH	DE
+	LD	B,ENV_SET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	LD	HL,N_NET_RTL_TYPE
+	CALL	@NETENV.GET_RAW
+	POP	DE
+	RET	C
+.CMP
+	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,.BAD
+	OR	A
+	RET	Z
+	INC	DE
+	INC	HL
+	JR	.CMP
+.BAD
+	SCF
+	RET
+
+TYPE_PUBLISH_FAIL
+	PRINTLN MSG_E_TYPE_ENV
+	LD	B,EX_CFG_ERR
+	JP	@UTIL.EXIT_FAIL
+
 S_NET_RTL	DB "NET=RTL",0
+S_NET_TYPE_1000 DB "NET_RTL_TYPE=NE1000",0
+S_NET_TYPE_2000 DB "NET_RTL_TYPE=NE2000",0
+V_NET_TYPE_1000 DB "NE1000",0
+V_NET_TYPE_2000 DB "NE2000",0
 
 
 DO_SETENV
@@ -757,6 +873,7 @@ N_NET_DNS1	DB "NET_DNS1",0
 N_NET_DNS2	DB "NET_DNS2",0
 N_NET_DHCP_SRV	DB "NET_DHCP_SRV",0
 N_NET_LEASE_SEC	DB "NET_LEASE_SEC",0
+N_NET_RTL_TYPE	DB "NET_RTL_TYPE",0
 
 ; ------- runtime BSS ------
 OUR_MAC		EQU APP_BSS_BASE		; 6 bytes
@@ -770,6 +887,8 @@ DEC_BUF		EQU APP_BSS_BASE + 17		; 4 bytes
 SRC_BUF		EQU APP_BSS_BASE + 21		; 16 bytes (NET_IP_SRC reader)
 RETRY_LEFT	EQU APP_BSS_BASE + 37		; 1 byte
 SET_BUF		EQU APP_BSS_BASE + 40		; 64 bytes (NAME=VALUE for SETENV)
+AUTO_TYPE	EQU APP_BSS_BASE + 104		; unambiguous detector result
+AUTO_WARN	EQU APP_BSS_BASE + 105		; 1=ambiguous, 2=unknown
 
 
 ; ------- messages -------
@@ -789,6 +908,11 @@ MSG_ABORTED	DB "Aborted by user (Esc/Ctrl+C).",0
 MSG_E_RESET	DB "[E90] RESET timeout",0
 MSG_E_SEND	DB "[E91] DMA write or PTX timeout",0
 MSG_E_DHCP	DB "DHCP timed out (no OFFER/ACK from any server).",0
+MSG_E_TYPE_ENV	DB "[E09] cannot publish NET_RTL_TYPE",0
+MSG_E_DETECT_DMA DB "[E07] remote DMA does not complete; interface NOT up",0
+MSG_E_DETECT_CHIP DB "[E08] chip not responding after DMA abort",0
+MSG_W_AMBIG	DB "[W05] packet RAM answers at both 2000 and 4000; assuming NE2000",0
+MSG_W_UNKNOWN	DB "[W04] card type not detected; assuming NE2000; set RTL_TYPE",0
 MSG_HELP
 	DB "Usage:",13,10
 	DB "  IFUP        bring interface up per NET_IP_SRC",13,10
@@ -810,6 +934,8 @@ LINE_END	DB 13,10,0
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
+	DEFINE USE_RTL_DETECT
+	INCLUDE "rtl_detect.asm"
 
 
 IFUP_IMAGE_END

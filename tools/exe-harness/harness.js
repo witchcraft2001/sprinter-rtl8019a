@@ -83,6 +83,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
     s.a = s.e;
   };
   const closedChipAccesses = [];
+  const chipTrace = [];
   // Off by default: the chip is only ever reachable through the isaOpen-gated
   // path below (by construction), so a closed-window access at this address
   // is never a "forgot to open ISA" bug -- it is ordinary window-3 DSS paged
@@ -101,11 +102,12 @@ function runExe(exePath, args = '', inputScenario = {}) {
       const off = cardWindowOffset(address);
       const inChipAperture = off >= 0 && off < 0x20;
       if (isaOpen) {
+        if (scenario.traceChip) chipTrace.push({ cycles, pc: cpu.getState().pc, address, dir: 'read' });
         if (inChipAperture) {
           if (cpu.getState().iff1) {
             throw new Error(`interrupts enabled (IFF1=1) during chip access at PC=${cpu.getState().pc.toString(16)}`);
           }
-          if (selectedSlot === card.slot && card.present) return card.readReg(off);
+          if (selectedSlot === card.slot && card.present) return card.readReg(off, cycles);
           return card.quirks.openBusValue;
         }
         return card.quirks.openBusValue;
@@ -125,11 +127,12 @@ function runExe(exePath, args = '', inputScenario = {}) {
       const off = cardWindowOffset(address);
       const inChipAperture = off >= 0 && off < 0x20;
       if (isaOpen) {
+        if (scenario.traceChip) chipTrace.push({ cycles, pc: cpu.getState().pc, address, dir: 'write', value });
         if (inChipAperture) {
           if (cpu.getState().iff1) {
             throw new Error(`interrupts enabled (IFF1=1) during chip access at PC=${cpu.getState().pc.toString(16)}`);
           }
-          if (selectedSlot === card.slot && card.present) card.writeReg(off, value);
+          if (selectedSlot === card.slot && card.present) card.writeReg(off, value, cycles);
           return;
         }
         return;
@@ -797,6 +800,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
     card: {
       slot: card.slot, base: card.base, present: card.present, mac: hex(card.mac),
       par: hex(card.par), cr: card.cr, isr: card.isr, bnry: card.bnry, curr: card.curr,
+      tpsrValue: card.tpsrValue, pstart: card.pstart, pstop: card.pstop,
       rxHalted: card.rxHalted, txAttempts: card.txAttempts, rxDelivered: card.rxDelivered,
       stats: { ...card.stats },
     },
@@ -804,6 +808,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
     currentDir,
     files: Object.fromEntries([...files].map(([name, data]) => [name, Buffer.from(data)])),
     ...(scenario.traceDss ? { dssEvents } : {}),
+    ...(scenario.traceChip ? { chipTrace } : {}),
     ...(scenario.dumpMemory ? {
       memory: Object.fromEntries(scenario.dumpMemory.map(([start, length]) => [
         start.toString(16), hex(Array.from({ length }, (_, i) => rd((start + i) & 0xffff))),

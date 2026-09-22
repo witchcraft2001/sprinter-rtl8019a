@@ -77,8 +77,21 @@ START
 	LD	D,(HL)
 	INC	HL
 	LD	A,D
-	OR	E
-	JP	Z,ALL_OK		; 0 marks list end
+	CP	0xFF
+	JR	NZ,.NOT_END
+	LD	A,E
+	CP	0xFF
+	JP	Z,ALL_OK
+.NOT_END
+	; Entries are offsets from the runtime TX page, so the same tests
+	; cover the 0x40 NE2000 and 0x20 NE1000 packet-RAM layouts.
+	PUSH	HL
+	LD	A,(RTL_TPSR_PAGE)
+	LD	H,A
+	LD	L,0
+	ADD	HL,DE
+	EX	DE,HL
+	POP	HL
 	LD	(CUR_ADDR),DE
 	LD	C,(HL)
 	INC	HL
@@ -399,16 +412,16 @@ REG_NAMES
 
 ; ------- valid byte-mode packet-RAM address/length pairs -------
 TEST_CASES
-	DW 0x4000,16
-	DW 0x4000,64
-	DW 0x4000,256
-	DW 0x4000,1536
-	DW 0x4600,64
-	DW 0x4600,256
-	DW 0x4600,1536
-	DW 0x5A00,256
-	DW 0x5F00,256
-	DW 0
+	DW 0x0000,16
+	DW 0x0000,64
+	DW 0x0000,256
+	DW 0x0000,1536
+	DW 0x0600,64
+	DW 0x0600,256
+	DW 0x0600,1536
+	DW 0x1A00,256
+	DW 0x1F00,256
+	DW 0xFFFF,0
 
 
 ; ------- messages -------

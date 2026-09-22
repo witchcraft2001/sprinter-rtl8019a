@@ -51,6 +51,12 @@ and `NETCFG -i` publishes `NET_RTL_RESET=SOFT` after it meets a clone so
 the DLL normally gets an explicit answer anyway.  An explicit
 `RTL_RESET=HARD` is still honoured here.
 
+The DLL also reads the canonical `NET_RTL_TYPE=NE1000|NE2000` value written
+by `NETCFG -i` or `IFUP`.  NE1000 selects packet RAM at `2000h` and enables
+the DP8390 remote-write preparation sequence.  A missing value keeps the
+legacy NE2000 default; an invalid value makes `NETINIT` fail with
+`NERR_NONET`.  The DLL accepts only canonical `NET_RTL_HW` syntax.
+
 ## Loading
 
 ```

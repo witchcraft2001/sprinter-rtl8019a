@@ -1077,14 +1077,23 @@ FORMAT_HEX_A
 ; Requires: @ISA.ISA_CLOSE, EX_NO_HW (rtl8019.inc).
 ; ------------------------------------------------------
 EXIT_NO_NIC
+	CP	RTL_INIT_BAD_TYPE
+	JR	Z,.BAD_TYPE
 	CALL	@ISA.ISA_CLOSE
 	LD	HL,_EXIT_S_NO_NIC
 	LD	C,DSS_PCHARS
 	RST	DSS
 	LD	B,EX_NO_HW
 	JR	EXIT_FAIL
+.BAD_TYPE
+	LD	HL,_EXIT_S_BAD_TYPE
+	LD	C,DSS_PCHARS
+	RST	DSS
+	LD	B,EX_CFG_ERR
+	JR	EXIT_FAIL
 _EXIT_S_NO_NIC	DB 13,10,"[E] RTL8019AS not detected at I/O base 0x300.",13,10
 		DB     "    Card missing, wrong base, or ISA bus not driven.",13,10,0
+_EXIT_S_BAD_TYPE DB 13,10,"[E] env var NET_RTL_TYPE missing or invalid; run NETCFG -i",13,10,0
 	ENDIF
 
 	ENDMODULE

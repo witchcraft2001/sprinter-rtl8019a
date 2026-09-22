@@ -42,6 +42,11 @@ the archive and floppy image.
 RAM layout, and register snapshot. If the card is not detected normally,
 use `ISAPROBE.EXE` with the procedures in `ISAPROBE.TXT`.
 
+For a classic NE1000, set `RTL_HW=S/#HHH` and either leave `RTL_TYPE=` empty
+for the RAM probe or set `RTL_TYPE=NE1000`.  `NETCFG -i` publishes the
+canonical `NET_RTL_TYPE`; malformed values stop utilities with exit code 4.
+NE1000 uses packet RAM pages `20h..3Fh`; NE2000/RTL8019 uses `40h..5Fh`.
+
 For driver-level details, NIC register descriptions, and MAME
 network setup see `sprinter_rtl8019_soft.md` and
 `docs/MAME_NETWORK.md` in the source tree.

@@ -1,8 +1,8 @@
 ; ======================================================
 ; netcfg_write.asm -- interactive wizard for NETCFG -w.
 ;
-; Walks the user through RTL_RESET / (optional card probe) /
-; RTL_HW / RTL_MAC / IP (or DHCP) / NETMASK / GATEWAY / DNS1 /
+; Walks the user through RTL_RESET / RTL_HW / (optional card probe) /
+; RTL_TYPE / RTL_MAC / IP (or DHCP) / NETMASK / GATEWAY / DNS1 /
 ; DNS2 / TZ / NTP, then rewrites NET.CFG as a canonical file
 ; (comments and unrecognized keys such as RTL_IRQ are NOT
 ; preserved -- this is a full rewrite, not an edit in place).
@@ -62,6 +62,8 @@ FLAG_ALLOW_DASH	EQU 1				; "-" clears an optional field
 WORD_AUTO	DB "AUTO",0
 WORD_SOFT	DB "SOFT",0
 WORD_HARD	DB "HARD",0
+WORD_NE1000	DB "NE1000",0
+WORD_NE2000	DB "NE2000",0
 MSG_DHCP	DB "DHCP",0
 
 
@@ -72,6 +74,7 @@ MSG_DHCP	DB "DHCP",0
 RUN
 	XOR	A
 	LD	(.NEWFILE),A
+	LD	(NETCFGW_PROBE_VALID),A
 	CALL	@NETCFG.LOAD
 	JR	NC,.LOADED
 	CP	E_FILE_NOT_FOUND
@@ -92,15 +95,36 @@ RUN
 
 	PRINTLN	MSG_INTRO
 
-	; RTL_RESET comes first: the probe pulses (or skips) the board reset
-	; port according to it.  RTL_HW is asked AFTER the probe, exactly
-	; once, so a successful probe simply becomes its default.
+	; Probe first so a detected address becomes the RTL_HW default.  A second
+	; probe after a manually entered address is handled by NETCFG -i.
 	LD	IX,F_RESET
 	CALL	ASK
 	JP	C,.CANCELLED
 	CALL	PROMPT_PROBE
 	JP	C,.CANCELLED
 	LD	IX,F_HW
+	CALL	ASK
+	JP	C,.CANCELLED
+	; If the first broad scan failed, retry immediately with the address the
+	; user just supplied.  If a successful probe's address was edited, discard
+	; the old MAC/type and probe the new card instead of carrying stale data.
+	LD	A,(NETCFGW_PROBE_VALID)
+	OR	A
+	JR	Z,.REPROBE
+	LD	HL,NETCFGW_HW
+	LD	DE,NETCFGW_PROBED_HW
+	CALL	STREQ
+	JR	Z,.PROBE_DONE
+	XOR	A
+	LD	(NETCFGW_MAC),A
+	LD	(NETCFGW_TYPE),A
+	LD	(NETCFGW_PROBE_VALID),A
+.REPROBE
+	LD	A,(NETCFGW_HW)
+	OR	A
+	CALL	NZ,DO_PROBE
+.PROBE_DONE
+	LD	IX,F_TYPE
 	CALL	ASK
 	JP	C,.CANCELLED
 	LD	IX,F_MAC
@@ -194,6 +218,7 @@ ASK
 
 F_RESET	FIELD	HINT_RESET, MSG_LBL_RTL_RESET, NETCFGW_RESET, 8,  0,               VALIDATE_RESET
 F_HW	FIELD	HINT_HW,    MSG_LBL_RTL_HW,    NETCFGW_HW,    12, FLAG_ALLOW_DASH, VALIDATE_RTL_HW
+F_TYPE	FIELD	HINT_TYPE,  MSG_LBL_RTL_TYPE,  NETCFGW_TYPE,  8,  FLAG_ALLOW_DASH, VALIDATE_RTL_TYPE
 F_MAC	FIELD	HINT_MAC,   MSG_LBL_RTL_MAC,   NETCFGW_MAC,   18, FLAG_ALLOW_DASH, VALIDATE_MAC
 F_IP	FIELD	HINT_IP,    MSG_LBL_IP,        NETCFGW_IP,    16, 0,               VALIDATE_IP
 F_MASK	FIELD	HINT_MASK,  MSG_LBL_NETMASK,   NETCFGW_MASK,  16, FLAG_ALLOW_DASH, VALIDATE_IPV4
@@ -244,6 +269,9 @@ SEED_NEW_FILE_DEFAULTS
 FIELDS_FROM_BINARY
 	LD	HL,@NETCFG.OUR_RTL_HW
 	LD	DE,NETCFGW_HW
+	CALL	@MAIN.COPY_ASCIIZ
+	LD	HL,@NETCFG.OUR_RTL_TYPE
+	LD	DE,NETCFGW_TYPE
 	CALL	@MAIN.COPY_ASCIIZ
 
 	LD	A,(@NETCFG.OUR_RTL_RESET)
@@ -692,6 +720,16 @@ PROMPT_PROBE
 ; On failure NETCFGW_HW is untouched.
 ;   Out: CF=0 always.  Trashes everything.
 DO_PROBE
+	LD	A,(NETCFGW_HW)
+	OR	A
+	LD	A,0
+	JR	Z,.PIN_FLAG
+	INC	A
+.PIN_FLAG
+	LD	(NETCFGW_PROBE_PINNED),A	; 1 when a pinned address must match
+	LD	HL,NETCFGW_HW
+	LD	DE,NETCFGW_PROBED_HW
+	CALL	@MAIN.COPY_ASCIIZ
 	LD	HL,@MAIN.N_NET_RTL_HW
 	LD	IX,NETCFGW_HW
 	CALL	@MAIN.SETENV_STR
@@ -716,7 +754,44 @@ DO_PROBE
 	CP	EX_OK
 	JR	NZ,.FAIL
 
+	LD	A,(NETCFGW_PROBE_PINNED)
+	OR	A
+	JR	Z,.AUTO_HW
+	; INIT_BASE may self-heal a wrong pinned address by auto-scanning.  That
+	; is useful for normal utilities but not for this wizard: it must not
+	; replace a newly typed address with some other responding card.
+	LD	HL,@MAIN.N_NET_RTL_HW
+	LD	DE,NETCFGW_EDIT
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A
+	JR	Z,.WRONG_HW
+	LD	HL,NETCFGW_EDIT
+	LD	DE,NETCFGW_PROBED_HW
+	CALL	STREQ
+	JR	Z,.HW_MATCH
+.WRONG_HW
+	XOR	A
+	LD	(@NETCFG.OUR_MAC),A
+	LD	(NETCFGW_TYPE),A
+	JR	.FAIL
+.AUTO_HW
 	CALL	BUILD_HW_FROM_PROBE
+.HW_MATCH
+	LD	HL,NETCFGW_HW
+	LD	DE,NETCFGW_PROBED_HW
+	CALL	@MAIN.COPY_ASCIIZ
+	LD	A,1
+	LD	(NETCFGW_PROBE_VALID),A
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_NE1000
+	LD	HL,WORD_NE2000
+	JR	Z,.TYPE_FOUND
+	LD	HL,WORD_NE1000
+.TYPE_FOUND
+	LD	DE,NETCFGW_TYPE
+	CALL	@MAIN.COPY_ASCIIZ
 	PRINT	MSG_PROBE_FOUND
 	LD	HL,@NETCFG.OUR_MAC
 	CALL	PRINT_MAC_HL
@@ -877,6 +952,41 @@ VALIDATE_RTL_HW
 	RET
 .BAD
 	SCF
+	RET
+
+VALIDATE_RTL_TYPE
+	LD	A,(HL)
+	OR	A
+	JR	Z,.AUTO
+	PUSH	HL
+	LD	DE,WORD_AUTO
+	CALL	MATCH_WORD_CI
+	POP	HL
+	JR	Z,.AUTO
+	PUSH	HL
+	LD	DE,WORD_NE1000
+	CALL	MATCH_WORD_CI
+	POP	HL
+	JR	Z,.N1000
+	LD	DE,WORD_NE2000
+	CALL	MATCH_WORD_CI
+	JR	Z,.N2000
+	SCF
+	RET
+.AUTO
+	LD	DE,(ST_DEST)
+	XOR	A
+	LD	(DE),A
+	RET
+.N1000
+	LD	HL,WORD_NE1000
+	JR	.STORE
+.N2000
+	LD	HL,WORD_NE2000
+.STORE
+	LD	DE,(ST_DEST)
+	CALL	@MAIN.COPY_ASCIIZ
+	OR	A
 	RET
 
 
@@ -1148,7 +1258,12 @@ MATCH_WORD_CI
 	JR	Z,.ATEND
 	LD	B,A
 	LD	A,(HL)
+	CP	'a'
+	JR	C,.CMP
+	CP	'z'+1
+	JR	NC,.CMP
 	AND	0xDF
+.CMP
 	CP	B
 	JR	NZ,.MISS
 	INC	HL
@@ -1279,6 +1394,7 @@ SERIALIZE
 .CURSOR		DW 0
 .K_RTL_HW	DB "RTL_HW=",0
 .K_RTL_RESET	DB "RTL_RESET=",0
+.K_RTL_TYPE	DB "RTL_TYPE=",0
 .K_RTL_MAC	DB "RTL_MAC=",0
 .K_IP		DB "IP=",0
 .K_NETMASK	DB "NETMASK=",0
@@ -1292,6 +1408,7 @@ SERIALIZE
 .TABLE
 	DW	.K_RTL_HW,    NETCFGW_HW
 	DW	.K_RTL_RESET, NETCFGW_RESET
+	DW	.K_RTL_TYPE,  NETCFGW_TYPE
 	DW	.K_RTL_MAC,   NETCFGW_MAC
 	DW	.K_IP,        NETCFGW_IP
 	DW	.K_NETMASK,   NETCFGW_MASK
@@ -1300,7 +1417,7 @@ SERIALIZE
 	DW	.K_DNS2,      NETCFGW_DNS2
 	DW	.K_TZ,        NETCFGW_TZ
 	DW	.K_NTP,       NETCFGW_NTP
-.TABLE_LEN	EQU 10
+.TABLE_LEN	EQU 11
 
 
 ; ------------------------------------------------------
@@ -1364,6 +1481,7 @@ SAVE
 ; ------------------------------------------------------
 MSG_LBL_RTL_HW		DB "RTL_HW",0
 MSG_LBL_RTL_RESET	DB "RTL_RESET",0
+MSG_LBL_RTL_TYPE	DB "RTL_TYPE",0
 MSG_LBL_RTL_MAC		DB "RTL_MAC",0
 MSG_LBL_IP		DB "IP",0
 MSG_LBL_NETMASK		DB "NETMASK",0
@@ -1410,6 +1528,9 @@ HINT_PROBE	DB 13,10
 HINT_HW		DB 13,10
 		DB "ISA slot and I/O base of the card as S/#HHH, e.g. 1/#300.",13,10
 		DB "Empty = find the card automatically at every start.",13,10,0
+HINT_TYPE	DB 13,10
+		DB "Packet RAM layout: NE1000, NE2000, or AUTO/empty to detect it.",13,10
+		DB "Use NE1000 for an 8 KB card whose RAM starts at page 20h.",13,10,0
 HINT_MAC	DB 13,10
 		DB "MAC address override, aa:bb:cc:dd:ee:ff.  Leave empty to use",13,10
 		DB "the card's own address (recommended).",13,10,0

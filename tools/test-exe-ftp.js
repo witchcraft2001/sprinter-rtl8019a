@@ -13,6 +13,8 @@
 // the bulk-download vector, make the disk write cost wire time so the peer
 // really does stream into the advertised window while the client is away
 // flushing -- the condition under which the transfer used to die.
+// PUT is covered with a file larger than one application buffer so an upload
+// cannot silently overwrite the fixed library BSS at 0xA000.
 // SPDX-License-Identifier: BSD-3-Clause
 'use strict';
 
@@ -137,6 +139,24 @@ const MODLAND_GREETING = [
   assert.strictEqual(r.exitCode, 0);
   assert.ok(r.files['C:\\NET\\LOCAL.BIN'] || r.files['C:\\LOCAL.BIN'],
     'expected -o to choose the local output name');
+  checkCleanupClaimedPage(r);
+}
+
+{ // PUT crosses multiple file-buffer fills and preserves every source byte.
+  // A former 8192-byte buffer started at 0x8054 and ended at 0xA054, so every
+  // full read overwrote RTL_BASE_PTR and the first 84 bytes of library state.
+  const file = payload(14090);
+  const ftp = {};
+  const r = run('192.168.7.1 PUT FTP.EXE -o FTP_TEST.EXE', {
+    environment: { ...NET_ENV }, files: { 'FTP.EXE': file },
+    stepLimit: 900_000_000,
+    responders: { arp: arpToServer, ftp },
+  });
+  assert.strictEqual(r.exitCode, 0, 'multi-block FTP upload must complete');
+  assert.match(r.output, /Done\. 14090 bytes sent\./);
+  assert.match(r.output, /RESULT OK/);
+  assert.ok(ftp.uploads?.['FTP_TEST.EXE'], 'server must receive the STOR target');
+  assert.ok(ftp.uploads['FTP_TEST.EXE'].equals(file), 'uploaded file must be byte-identical');
   checkCleanupClaimedPage(r);
 }
 

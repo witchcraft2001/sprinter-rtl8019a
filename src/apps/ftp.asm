@@ -2267,7 +2267,7 @@ FTP_APP_BSS_END	EQU DOTS_FLAG + 1
 	ASSERT FTP_APP_BSS_END < RT_STACK_TOP - 0x0100
 
 NO_HANDLE	EQU 0xFF
-FTP_DATA_BUF_SIZE EQU 8192		; matches WGET; halves DSS_WRITE count
+FTP_DATA_BUF_SIZE EQU 8192		; full 8 KB DSS file-I/O block
 FTP_PUT_CHUNK	  EQU 536		; one reliable outbound chunk per STOR send
 
 
@@ -2348,13 +2348,23 @@ RX_BUF_SIZE	EQU 1518
 	MODULE MAIN
 
 TX_BUF		EQU FTP_IMAGE_END
-RX_HDR		EQU TX_BUF + TCP_MAX_FRAME
-RX_BUF		EQU RX_HDR + 4
-FTP_DATA_BUF	EQU RX_BUF + RX_BUF_SIZE
+; The claimed WIN2 page has one exact 8 KB hole below LIBBSS_BASE.  Keep the
+; file buffer there and move RX after the shared RTL/cmdline state instead of
+; shortening the file-I/O block.  NETCFG/DHCP own parts of the intervening
+; A200..A8FF range in their own executables; FTP links neither library, so its
+; RX frame can safely occupy A17C..A76D before RESOLVE_BSS_BASE at A900.
+FTP_DATA_BUF	EQU 0x8000
 FTP_BSS_END	EQU FTP_DATA_BUF + FTP_DATA_BUF_SIZE
+RX_HDR		EQU LIBBSS_BASE + LIBBSS_SIZE
+RX_BUF		EQU RX_HDR + 4
 
-	; The runtime stack lives at the top of the same WIN2 page.
-	ASSERT FTP_BSS_END < RT_STACK_TOP - 0x0100
+	; Reject code growth or memory-map changes before either can create another
+	; silent overlap.  Every bound is exclusive at its right-hand side.
+	ASSERT FTP_DATA_BUF_SIZE = 8192
+	ASSERT TX_BUF + TCP_MAX_FRAME <= FTP_DATA_BUF
+	ASSERT FTP_BSS_END = LIBBSS_BASE
+	ASSERT RX_HDR >= LIBBSS_BASE + LIBBSS_SIZE
+	ASSERT RX_BUF + RX_BUF_SIZE <= RESOLVE_BSS_BASE
 
 	ENDMODULE
 

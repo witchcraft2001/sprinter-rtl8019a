@@ -11,7 +11,22 @@ const { count, caseCount, checkCleanup, checkCleanupClaimedPage } = require('./e
 
 const root = path.resolve(__dirname, '..');
 const exe = (name) => path.join(root, 'build', `${name}.EXE`);
-const run = (name, args, scenario = {}) => runExe(exe(name), args, scenario);
+const run = (name, args, scenario = {}) => {
+  // NETCFG -w gained RTL_TYPE immediately after RTL_HW.  Legacy wizard
+  // vectors below keep their intent by accepting AUTO at that new prompt;
+  // explicit RTL_TYPE cases supply the extra key themselves.
+  if (name === 'NETCFG' && args === '-w' && scenario.keys && !scenario.keysIncludeRtlType) {
+    const keys = [...scenario.keys];
+    let firstEnter = keys.indexOf('enter'); // terminates RTL_RESET
+    if (firstEnter >= 0) {
+      const probeKey = firstEnter + 1;
+      const hwEnter = keys.indexOf('enter', probeKey + 1);
+      if (hwEnter >= 0) keys.splice(hwEnter + 1, 0, 'enter');
+    }
+    scenario = { ...scenario, keys };
+  }
+  return runExe(exe(name), args, scenario);
+};
 
 const NET_ENV = { NET_IP: '192.168.7.2', NET_MAC: '02:80:19:11:22:33' };
 
@@ -52,13 +67,13 @@ const NET_ENV = { NET_IP: '192.168.7.2', NET_MAC: '02:80:19:11:22:33' };
 { // missing NET_IP -> config error, exit 4
   const r = run('ARP', '192.168.7.1', { environment: { NET_MAC: NET_ENV.NET_MAC } });
   assert.strictEqual(r.exitCode, 4);
-  assert.match(r.output, /\[E\] env var NET_IP not set; run NETCFG -i first/);
+  assert.match(r.output, /\[E\] env var NET_IP missing or invalid; run NETCFG -i/);
   checkCleanupClaimedPage(r);
 }
 { // missing NET_MAC -> config error, exit 4
   const r = run('ARP', '192.168.7.1', { environment: { NET_IP: NET_ENV.NET_IP } });
   assert.strictEqual(r.exitCode, 4);
-  assert.match(r.output, /\[E\] env var NET_MAC not set; run NETCFG -i first/);
+  assert.match(r.output, /\[E\] env var NET_MAC missing or invalid; run NETCFG -i/);
   checkCleanupClaimedPage(r);
 }
 { // usage error: missing target
@@ -71,6 +86,17 @@ const NET_ENV = { NET_IP: '192.168.7.2', NET_MAC: '02:80:19:11:22:33' };
   const r = run('ARP', '192.168.7.1', { environment: { ...NET_ENV }, cardPresent: false });
   assert.strictEqual(r.exitCode, 2);
   checkCleanupClaimedPage(r);
+}
+for (const badType of ['XX1', 'N', 'ne1000', 'NE1000X']) {
+  const r = run('ARP', '192.168.7.1', {
+    environment: { ...NET_ENV, NET_RTL_HW: '1/#300', NET_RTL_TYPE: badType },
+  });
+  assert.strictEqual(r.exitCode, 4, badType);
+  assert.match(r.output, /NET_RTL_TYPE missing or invalid; run NETCFG -i/);
+  assert.strictEqual(r.card.pstart, 0, `${badType}: no ring programming`);
+  assert.strictEqual(r.card.pstop, 0, `${badType}: no ring programming`);
+  checkCleanupClaimedPage(r);
+  count();
 }
 
 // ---------------------------------------------------------------------
@@ -231,7 +257,7 @@ for (const app of ['PING', 'PINGALT']) {
     const environment = { ...NET_ENV }; delete environment[missing];
     const r = run(app, '192.168.7.1', { environment });
     assert.strictEqual(r.exitCode, 4);
-    assert.match(r.output, new RegExp(`\\[E\\] env var ${missing} not set; run NETCFG -i first`));
+    assert.match(r.output, new RegExp(`\\[E\\] env var ${missing} missing or invalid; run NETCFG -i`));
     checkCleanupClaimedPage(r);
   }
   { // usage error: missing target
@@ -257,6 +283,20 @@ for (const app of ['PING', 'PINGALT']) {
   });
   assert.match(r.output, /\[D\] TX=46 RX=4C\.\.5F \(alternate packet RAM layout\)/);
   checkCleanupClaimedPage(r);
+}
+{ // Full ARP + ICMP exchange on the NE1000 packet-RAM layout.
+  const r = run('PING', '-n 2 192.168.7.1', {
+    environment: { ...NET_ENV, NET_RTL_HW: '1/#300', NET_RTL_TYPE: 'NE1000' },
+    quirks: { variant: 'NE1000' },
+    responders: { arp: { mac: [2, 0, 0, 0, 0, 1] }, icmp: {} },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /Packets: Sent = 2, Received = 2, Lost = 0\./);
+  assert.strictEqual(r.card.tpsrValue, 0x20);
+  assert.strictEqual(r.card.pstart, 0x26);
+  assert.strictEqual(r.card.pstop, 0x40);
+  checkCleanupClaimedPage(r);
+  count();
 }
 
 // ---------------------------------------------------------------------
@@ -342,7 +382,7 @@ for (const missing of ['NET_IP', 'NET_MAC']) {
   const environment = { ...NET_ENV }; delete environment[missing];
   const r = run('UDPTEST', '192.168.7.1 7777', { environment });
   assert.strictEqual(r.exitCode, 4);
-  assert.match(r.output, new RegExp(`\\[E\\] env var ${missing} not set; run NETCFG -i first`));
+  assert.match(r.output, new RegExp(`\\[E\\] env var ${missing} missing or invalid; run NETCFG -i`));
   checkCleanupClaimedPage(r);
 }
 {
@@ -671,13 +711,53 @@ for (const missing of ['NET_IP', 'NET_MAC']) {
 { // static mode still requires NET_IP
   const r = run('IFUP', '', { environment: { NET_MAC: NET_ENV.NET_MAC, NET_IP_SRC: 'STATIC' } });
   assert.strictEqual(r.exitCode, 4);
-  assert.match(r.output, /\[E\] env var NET_IP not set; run NETCFG -i first/);
+  assert.match(r.output, /\[E\] env var NET_IP missing or invalid; run NETCFG -i/);
   count();
 }
 { // NET_MAC is required in every mode
   const r = run('IFUP', '', { environment: { NET_IP_SRC: 'STATIC', NET_IP: '192.168.7.50' } });
   assert.strictEqual(r.exitCode, 4);
-  assert.match(r.output, /\[E\] env var NET_MAC not set; run NETCFG -i first/);
+  assert.match(r.output, /\[E\] env var NET_MAC missing or invalid; run NETCFG -i/);
+  count();
+}
+{ // A failed AUTO probe is fatal even for static mode: no interface marker
+  // may be published after remote DMA failed.
+  const r = run('IFUP', '', {
+    environment: {
+      NET_MAC: NET_ENV.NET_MAC, NET_IP_SRC: 'STATIC', NET_IP: '192.168.7.50',
+      NET_RTL_HW: '1/#300',
+    },
+    quirks: {
+      variant: 'NE1000',
+      remoteDmaStall: true,
+    },
+  });
+  assert.strictEqual(r.exitCode, 3, r.output);
+  assert.match(r.output, /\[E07\] remote DMA does not complete; interface NOT up/);
+  assert.strictEqual(r.environment.NET, undefined);
+  assert.strictEqual(r.transmittedFrames.length, 0);
+  count();
+}
+{ // If the controller stops answering after the stalled transfer, DETECT
+  // upgrades the failure to CHIP_FAULT and IFUP must stop touching it.
+  const r = run('IFUP', '', {
+    environment: {
+      NET_MAC: NET_ENV.NET_MAC, NET_IP_SRC: 'STATIC', NET_IP: '192.168.7.50',
+      NET_RTL_HW: '1/#300',
+    },
+    quirks: {
+      variant: 'NE1000',
+      remoteDmaStall: true, chipDeadAfterStall: true,
+    },
+    traceChip: true,
+  });
+  assert.strictEqual(r.exitCode, 3, r.output);
+  assert.match(r.output, /\[E08\] chip not responding after DMA abort/);
+  assert.strictEqual(r.environment.NET, undefined);
+  assert.strictEqual(r.transmittedFrames.length, 0);
+  const last = r.chipTrace[r.chipTrace.length - 1];
+  assert.strictEqual(last.dir, 'read');
+  assert.strictEqual(last.address & 0x1f, 0x00, 'final detector access must be failed CR check');
   count();
 }
 {
@@ -782,6 +862,17 @@ const NET_CFG_SAMPLE = 'IP=192.168.7.2\r\nNETMASK=255.255.255.0\r\nGATEWAY=192.1
   assert.strictEqual(r.environment.NET_MAC, '02:80:19:11:22:33');
   count();
 }
+{ // AUTO still probes the RAM layout when RTL_MAC is explicit.  The MAC
+  // override must survive, while the detected family is published.
+  const r = run('NETCFG', '-i', {
+    ...netcfgFiles('IP=192.168.7.2\r\nRTL_HW=1/#300\r\nRTL_MAC=02:11:22:33:44:55\r\n'),
+    quirks: { variant: 'NE1000' },
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.strictEqual(r.environment.NET_MAC, '02:11:22:33:44:55');
+  assert.strictEqual(r.environment.NET_RTL_TYPE, 'NE1000');
+  count();
+}
 { // no card at all -> exit 2, but NET.CFG's other values are still published
   const r = run('NETCFG', '-i', { ...netcfgFiles('IP=192.168.7.2\r\n'), cardPresent: false });
   assert.strictEqual(r.exitCode, 2);
@@ -864,7 +955,7 @@ const rendered = (text) => {
 const NETCFG_W_NEW_FILE =
   '# NET.CFG -- written by NETCFG -w.  Run NETCFG -i to apply.\r\n' +
   '# Empty value = not set.  RTL_RESET empty = AUTO (driver decides).\r\n' +
-  'RTL_HW=\r\nRTL_RESET=\r\nRTL_MAC=\r\nIP=DHCP\r\nNETMASK=\r\nGATEWAY=\r\n' +
+  'RTL_HW=\r\nRTL_RESET=\r\nRTL_TYPE=\r\nRTL_MAC=\r\nIP=DHCP\r\nNETMASK=\r\nGATEWAY=\r\n' +
   'DNS1=\r\nDNS2=\r\nTZ=+3\r\nNTP=pool.ntp.org\r\n';
 { // fresh machine, all Enter: NETSMPL.CFG-style defaults, byte-exact file
   const r = run('NETCFG', '-w', {
@@ -875,6 +966,18 @@ const NETCFG_W_NEW_FILE =
   assert.match(r.output, /NET\.CFG written\.  Run NETCFG -i to apply\./);
   assert.strictEqual(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), NETCFG_W_NEW_FILE);
   checkCleanupClaimedPage(r);
+}
+{ // RTL_TYPE is case-insensitive at input and canonical in NET.CFG.
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(), keysIncludeRtlType: true,
+    keys: ['enter', 'n', '1/#300', 'enter', 'ne1000', 'enter',
+           'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'),
+    /RTL_HW=1\/#300\r\nRTL_RESET=\r\nRTL_TYPE=NE1000\r\n/);
+  checkCleanupClaimedPage(r);
+  count();
 }
 { // editing an existing file changes only the touched key
   const existing = 'RTL_HW=1/#300\r\nRTL_RESET=SOFT\r\nRTL_MAC=aa:bb:cc:dd:ee:ff\r\n' +
@@ -1067,6 +1170,21 @@ const NETCFG_W_NEW_FILE =
   assert.ok(r.environment.NET_RTL_HW, 'INIT_BASE auto-scan should have published NET_RTL_HW');
   checkCleanupClaimedPage(r);
 }
+{ // An NE1000 is deliberately invisible to the broad Realtek-ID scan.
+  // After the user enters a pinned address, the wizard retries there and
+  // carries the detected family into the following RTL_TYPE field.
+  const r = run('NETCFG', '-w', {
+    ...netcfgNoFile(), keysIncludeRtlType: true,
+    quirks: { variant: 'NE1000' },
+    keys: ['enter', 'y', '1/#300', 'enter', 'enter', 'enter', 'enter', 'enter', 'enter'],
+  });
+  assert.strictEqual(r.exitCode, 0, r.output);
+  assert.match(r.output, /Probe failed; set RTL_HW by hand\.[\s\S]*Found: MAC=00:00:1b:11:22:33/i);
+  assert.match(r.output, /RTL_TYPE \[NE1000\]: /);
+  assert.match(r.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1'), /RTL_TYPE=NE1000\r\n/);
+  checkCleanupClaimedPage(r);
+  count();
+}
 { // the probe question's hint shows the REAL default: [Y/n] normally, and a
   // bare Enter then probes...
   const r = run('NETCFG', '-w', {
@@ -1144,7 +1262,7 @@ const NETCFG_W_NEW_FILE =
   });
   assert.strictEqual(w.exitCode, 0);
   const cfgText = w.files[`${NETCFG_APPDIR}\\NET.CFG`].toString('latin1');
-  const i = run('NETCFG', '-i', netcfgFiles(cfgText));
+  const i = run('NETCFG', '-i', { ...netcfgFiles(cfgText), base: 0x320 });
   assert.strictEqual(i.exitCode, 0);
   assert.strictEqual(i.environment.NET_RTL_HW, '1/#320');
   assert.strictEqual(i.environment.NET_RTL_RESET, 'HARD');

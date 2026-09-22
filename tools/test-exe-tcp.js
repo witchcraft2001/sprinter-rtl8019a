@@ -277,7 +277,7 @@ for (const order of [[1, 2, 0], [2, 1, 0]]) {
     // Capture the actual HL/BC slices supplied to the parser, not merely
     // its final Content-Length result, so a duplicate/skip/reorder cannot
     // pass this vector accidentally.
-    cpuProbes: { 0x4448: ({ state, read }) => {
+    cpuProbes: { 0x4460: ({ state, read }) => {
       const ptr = (state.h << 8) | state.l;
       const len = (state.b << 8) | state.c;
       parserBytes.push(Buffer.from(Array.from({ length: len }, (_, i) => read((ptr + i) & 0xffff))));

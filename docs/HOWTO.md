@@ -111,6 +111,9 @@ The kit relies on DSS environment variables populated by
 | `NET_RTL_RESET` | `SOFT` -> the driver skips the NE2000 board      |
 |                 | reset port at `BASE+0x1F`; absent -> standard    |
 |                 | hard reset.  Set by `NETCFG -i` from `RTL_RESET=`|
+| `NET_RTL_TYPE`  | `NE1000` (RAM `2000h..3FFFh`) or `NE2000`        |
+|                 | (RAM `4000h..5FFFh`); published by `NETCFG -i`   |
+|                 | or by IFUP after an unambiguous AUTO probe        |
 | `NET_DHCP_SRV`  | DHCP server that issued the lease (DHCP only)    |
 | `NET_LEASE_SEC` | Remaining lease seconds (DHCP only)              |
 
@@ -147,6 +150,9 @@ RTL_RESET=SOFT            skip the board reset port at BASE+0x1F
                           there); RTL_RESET=HARD always pulses it;
                           omit to let the driver decide from the
                           chip ID -- this is what you want
+RTL_TYPE=NE1000           classic 8 KB NE1000 packet-RAM layout
+RTL_TYPE=NE2000           RTL8019AS/NE2000 packet-RAM layout
+RTL_TYPE=                 AUTO: probe both standard RAM windows
 DNS1=1.1.1.1              ignored when IP=DHCP
 DNS2=8.8.8.8              ignored when IP=DHCP
 NTP=pool.ntp.org          for NTP.EXE
@@ -156,6 +162,12 @@ TZ=+5:30                  minute offsets are supported (e.g. India,
 ```
 
 Lines starting with `#` are comments; unknown keys are ignored.
+
+An NE1000 has no Realtek `Pp` ID, so AUTO cannot safely discover its I/O
+base among all ISA addresses. Set `RTL_HW=S/#HHH` (normally `1/#300`). You
+may leave `RTL_TYPE=` empty for the RAM probe, or set `RTL_TYPE=NE1000` to
+skip that probe. An invalid `NET_RTL_TYPE` is a configuration error (4),
+and no packet-RAM layout is selected from a partial string.
 
 ### `RTL_RESET`
 

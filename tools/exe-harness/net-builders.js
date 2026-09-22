@@ -651,8 +651,9 @@ function armRto(session, card, tcp, mss, window, total) {
 // interference bugs was invisible to the test suite.
 //
 // Control port 21 speaks the minimal dialogue FTP.EXE drives: greeting,
-// USER/PASS, TYPE, SIZE, PASV, RETR, QUIT. The data connection streams the
-// file with the same window-filling sender and RTO timer as streamAhead.
+// USER/PASS, TYPE, SIZE, PASV, RETR/STOR, QUIT. Downloads use the same
+// window-filling sender and RTO timer as streamAhead; uploads acknowledge and
+// retain every in-sequence data segment so tests can compare the stored file.
 // ---------------------------------------------------------------------
 function ftpReply(session, card, ftp, text) {
   const bytes = Buffer.from(text + '\r\n', 'latin1');
@@ -713,7 +714,35 @@ function respondFtp(frame, card, ftp) {
   }
 
   if (!session.control) {
-    // Data connection: pure streaming, plus the 226 once the client has
+    // STOR data connection: retain each in-sequence byte and cumulatively ACK
+    // it. Duplicate TCP segments are ACKed again without duplicating data.
+    if (ftp._storIssued) {
+      if (seg.payload.length && seg.seq === session.clientNext) {
+        session.uploadChunks = session.uploadChunks || [];
+        session.uploadChunks.push(Buffer.from(seg.payload));
+        session.clientNext = (session.clientNext + seg.payload.length) >>> 0;
+      }
+      if (seg.payload.length || (seg.flags & TF_FIN)) {
+        if ((seg.flags & TF_FIN) && seg.seq === session.clientNext) {
+          session.clientNext = (session.clientNext + 1) >>> 0;
+          ftp.uploads = ftp.uploads || {};
+          ftp.uploads[ftp._storName] = Buffer.concat(session.uploadChunks || []);
+        }
+        const ack = buildTcpSegment(session, {
+          flags: TF_ACK, seq: session.serverSeq, ack: session.clientNext,
+        });
+        card.generated.push(ack);
+        card.schedule(ftp.dataAckDelayMs ?? 1, ack);
+      }
+      if ((seg.flags & TF_FIN) && !ftp._sent226) {
+        ftp._sent226 = true;
+        const ctrl = Object.values(ftp._sessions).find((s) => s.control);
+        if (ctrl) ftpReply(ctrl, card, ftp, '226 Transfer complete.');
+      }
+      return;
+    }
+
+    // RETR data connection: pure streaming, plus the 226 once the client has
     // acknowledged everything (the server closes the data connection first).
     if (session.streaming && !(seg.flags & TF_FIN)) {
       tcpStreamAhead(session, card, ftp, seg);
@@ -754,6 +783,10 @@ function respondFtp(frame, card, ftp) {
         ftpReply(session, card, ftp, `150 Opening BINARY mode data connection for '${line.slice(5)}' (${ftp._fileBytes.length} bytes).`);
         ftp._retrIssued = true;
         ftpStartData(card, ftp);
+      } else if (verb === 'STOR') {
+        ftp._storName = line.slice(5);
+        ftp._storIssued = true;
+        ftpReply(session, card, ftp, `150 Opening BINARY mode data connection for '${ftp._storName}'.`);
       } else if (verb === 'LIST' || verb === 'NLST') {
         // A listing is streamed over the same data connection; the client
         // prints it straight to the console instead of writing a file.

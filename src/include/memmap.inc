@@ -152,6 +152,12 @@ RTL_CHIP_CLONE	EQU 2			; anything else: no page 3
 ; on every commit -- it is what keeps the receive DMA off unread
 ; frames.  Same 0x139..0x13F gap, LIBBSS_SIZE unchanged.
 RTL_BNRY_SHADOW	EQU LIBBSS_BASE + 0x13B	; 1 byte
+; Runtime packet-RAM layout and remote-write policy.  These bytes occupy the
+; historical gap and keep the DLL relocation map and LIBBSS_SIZE unchanged.
+RTL_CARD_FLAGS	EQU LIBBSS_BASE + 0x13C	; bit0=NE1000, bit7=env
+RTL_TPSR_PAGE	EQU LIBBSS_BASE + 0x13D
+RTL_PSTART_PAGE	EQU LIBBSS_BASE + 0x13E
+RTL_PSTOP_PAGE	EQU LIBBSS_BASE + 0x13F
 RTL_TX_VERIFY_BUF	EQU LIBBSS_BASE + 0x140	; 42 bytes read back from NIC packet RAM
 RTL_TX_VERIFY_SIZE	EQU 42
 RTL_TX_LAST_CLDA	EQU LIBBSS_BASE + 0x16A	; 2 bytes, page-0 CLDA0/1 after TX
@@ -209,6 +215,7 @@ NETCFG_TMP_IP		EQU 0xA240	; 4 bytes (parser scratch)
 NETCFG_TMP_MAC		EQU 0xA244	; 6 bytes (parser scratch)
 NETCFG_OUR_RTL_HW	EQU 0xA24A	; 8 bytes ASCIIZ "S/#HHH" or empty
 NETCFG_OUR_RTL_RESET	EQU 0xA252	; 1 byte flag: 1 = RTL_RESET=SOFT
+NETCFG_OUR_RTL_TYPE	EQU 0xAEF6	; 8 bytes ASCIIZ NE1000/NE2000 or empty
 NETCFG_PATH_BUF		EQU 0xA254	; 280 bytes: "<appdir>\NET.CFG",0 (APPINFO)
 ; TZ is stored and published as raw ASCII text ("[+|-]H[H][:MM]", empty =
 ; UTC): only NTP.EXE parses it into hours/minutes.  Placed in the free gap
@@ -252,12 +259,16 @@ NETCFGW_EDIT		EQU 0xAC1E	; 64 bytes: PROMPT_FIELD input scratch
 NETCFGW_STATE		EQU 0xAC5E	; 24 bytes: wizard control-flow state
 NETCFGW_WRITE_BUF	EQU 0xAC76	; canonical NET.CFG text before write
 NETCFGW_WRITE_BUF_SIZE	EQU 640
+NETCFGW_TYPE		EQU NETCFGW_WRITE_BUF + NETCFGW_WRITE_BUF_SIZE ; 8 bytes
+NETCFGW_PROBED_HW	EQU APP_BSS_BASE + 560	; 12-byte last successful probe address
+NETCFGW_PROBE_VALID	EQU APP_BSS_BASE + 572	; 1 byte
+NETCFGW_PROBE_PINNED	EQU APP_BSS_BASE + 573	; 1 byte
 ; Upper bound on the serialized canonical file: header comments (140) plus
 ; one "KEY=value\r\n" line per field, sized from the field buffers above
 ; plus their key names and separators.
-NETCFGW_CANONICAL_MAX	EQU 140 + 16+16+27+20+25+25+22+22+12+37
+NETCFGW_CANONICAL_MAX	EQU 140 + 16+16+17+27+20+25+25+22+22+12+37
 	ASSERT NETCFGW_CANONICAL_MAX <= NETCFGW_WRITE_BUF_SIZE
-	ASSERT NETCFGW_WRITE_BUF + NETCFGW_WRITE_BUF_SIZE <= APP_BSS_BASE
+	ASSERT NETCFGW_TYPE + 8 <= APP_BSS_BASE
 
 ; dhcp_lib: parsed-field outputs.  Active only in IFUP.EXE.
 DHCP_XID		EQU 0xA800	; 4 bytes (transaction id, host order)
@@ -505,6 +516,14 @@ TCP_TUNE_BSS_SIZE	EQU 83
 ; Each app lays out its own scratch starting at this base.
 ; Apps never share BSS (different EXEs, different sessions).
 APP_BSS_BASE		EQU 0xB000
+
+; rtl_detect.asm: destructive packet-RAM family probe scratch.  The detector
+; is linked only by diagnostics/configuration apps, so it may use app-private
+; RAM, but the address still belongs in the common map rather than in the
+; library source.
+RTLDET_BSS_BASE		EQU APP_BSS_BASE + 600
+RTLDET_BSS_SIZE		EQU 45
+	ASSERT RTLDET_BSS_BASE + RTLDET_BSS_SIZE <= 0xC000
 
 ; ----- Runtime stack top ---------------------------------
 

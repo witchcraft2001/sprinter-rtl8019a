@@ -493,8 +493,14 @@ AUTOLOAD_FAILED
 NO_ID_OPEN
 	CALL	@ISA.ISA_CLOSE
 NO_NIC
+	CP	RTL_INIT_BAD_TYPE
+	JR	Z,.BAD_TYPE
 	PRINTLN MSG_E_NIC
 	LD	B,NICMODE_EX_NO_NIC
+	JP	FAIL_EXIT
+.BAD_TYPE
+	PRINTLN MSG_E_BAD_TYPE
+	LD	B,EX_CFG_ERR
 	JP	FAIL_EXIT
 
 USAGE_ERROR
@@ -545,6 +551,7 @@ MSG_E_CFG_MISMATCH DB "[E13] EEPROM CONFIG3 byte is missing/ambiguous; no write"
 MSG_E_VERIFY	DB "[E14] EEPROM verify mismatch; power off and inspect card",0
 MSG_E_AUTOLOAD	DB "[E15] EEPROM verified but auto-load did not apply; power cycle",0
 MSG_E_NIC	DB "[E01] RTL8019AS not detected",0
+MSG_E_BAD_TYPE	DB "[E] env var NET_RTL_TYPE missing or invalid; run NETCFG -i",0
 MSG_E_USAGE	DB "[E02] usage error; run NICMODE /?",0
 MSG_HELP
 	DB "Usage:",13,10

@@ -46,6 +46,12 @@ from the environment if set (see `NETCFG.TXT`), otherwise an auto-scan.
 `NET_RTL_RESET` is honoured, and a card that does not report the Realtek ID
 never has its reset port touched.  Page 3 is never accessed.
 
+`NET_RTL_TYPE=NE1000` moves all packet-RAM checks, including the G6 remote
+DMA test, from `4000h` to `2000h`. Remote writes use the same direct
+RBCR/RSAR, command, data-port sequence as the Crynwr NE1000/NE2000 drivers.
+G3 accepts the documented DP8390 read-back where STA can remain set after
+STP; that state is not counted as an unstable CR read.
+
 The run takes about 15 seconds in turbo mode and about three times as long
 at 7 MHz.  **Run it in both modes** (F12+Ctrl+Shift toggles turbo): a fault
 that disappears at 7 MHz is a bus-timing fault.

@@ -70,6 +70,9 @@ START
 	; it, so clear it here for every other path.
 	XOR	A
 	LD	(INIT_FAIL_CODE),A
+	LD	(AUTO_TYPE),A
+	DEC	A
+	LD	(AUTO_DET_RESULT),A
 	PRINTLN MSG_BANNER
 
 	CALL	PARSE_FLAG
@@ -411,11 +414,32 @@ DO_INIT
 .RESET_ENV
 	LD	HL,N_NET_RTL_RESET
 	CALL	SETENV_STR
+	LD	HL,N_NET_RTL_TYPE
+	LD	IX,@NETCFG.OUR_RTL_TYPE
+	CALL	SETENV_STR
 
 	; If NET.CFG had no RTL_MAC= line (or it was empty), the MAC
 	; field is all-zero -- read the PROM and use that.
 	CALL	FILL_MAC_FROM_PROM
 	PUSH	AF
+	CALL	REPORT_CARD_TYPE
+	; Auto-detection selected the runtime layout.  Publish only an
+	; unambiguous detector result; AMBIGUOUS/UNKNOWN keep the variable
+	; absent and use NE2000 only as the runtime fallback.
+	LD	A,(@NETCFG.OUR_RTL_TYPE)
+	OR	A
+	JR	NZ,.TYPE_PUBLISHED
+	LD	A,(AUTO_TYPE)
+	OR	A
+	JR	Z,.TYPE_PUBLISHED
+	CP	1
+	LD	IX,V_RTL_TYPE_2000
+	JR	NZ,.TYPE_STORE
+	LD	IX,V_RTL_TYPE_1000
+.TYPE_STORE
+	LD	HL,N_NET_RTL_TYPE
+	CALL	SETENV_STR
+.TYPE_PUBLISHED
 	; FILL_MAC_FROM_PROM ran RTL.RESET, which resolves an AUTO mode in
 	; place.  If it came back SOFT while NET.CFG said nothing, the card
 	; did not identify as a Realtek and the board reset port was skipped
@@ -548,12 +572,10 @@ PRINT_CFG_PATH
 
 
 ; ------------------------------------------------------
-; FILL_MAC_FROM_PROM: if the parsed MAC field is all zero
-; (no RTL_MAC line in NET.CFG), find the chip on ISA slot
-; 1 or 0, read 32 bytes of PROM, detect direct vs doubled
-; layout (each byte aliased twice in 16-bit-mode PROM read),
-; and copy bytes 0..5 of the resulting MAC into NETCFG's
-; OUR_MAC field.  Failure is silent.
+; FILL_MAC_FROM_PROM: touch the card when either the parsed MAC is empty
+; or RTL_TYPE is AUTO.  An AUTO run detects and selects the packet-RAM
+; layout even when RTL_MAC was supplied; PROM is read only when the MAC is
+; empty.  Return A = EX_* and always close ISA before returning.
 ; ------------------------------------------------------
 ; ------------------------------------------------------
 ; MAC_IS_ZERO: Z if NETCFG's MAC field is all zero.
@@ -576,17 +598,26 @@ MAC_IS_ZERO
 
 
 FILL_MAC_FROM_PROM
-	; Already configured (RTL_MAC= in NET.CFG)?  Skip.
+	; No hardware is needed only when both values are explicit.
 	CALL	MAC_IS_ZERO
-	LD	A,EX_OK			; LD does not disturb Z
+	JR	Z,.NEED_HW
+	LD	A,(@NETCFG.OUR_RTL_TYPE)
+	OR	A
+	LD	A,EX_OK
 	RET	NZ
+.NEED_HW
 	; INIT_BASE handles ISA slot 1 then 0 and base auto-scan;
 	; on success ISA stays open with the right slot/base set.
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@RTL.INIT_BASE
 	JR	NC,.FOUND
+	CP	RTL_INIT_BAD_TYPE
+	JR	Z,.BAD_CFG
 	LD	A,EX_NO_HW
+	RET
+.BAD_CFG
+	LD	A,EX_CFG_ERR
 	RET
 .FOUND
 	; Belt and braces.  The caller now publishes NET_RTL_RESET before
@@ -598,7 +629,43 @@ FILL_MAC_FROM_PROM
 	LD	A,(@NETCFG.OUR_RTL_RESET)
 	LD	(RTL_SOFT_RESET),A
 	CALL	@RTL.RESET
-	JR	C,.NIC_ERR
+	JP	C,.NIC_ERR
+	CALL	@RTLDET.ENTER_PROBE_MODE
+	; AUTO type: distinguish the 8 KB NE1000 RAM window from the
+	; NE2000/RTL8019 layout before the PROM read.  An explicit
+	; NET_RTL_TYPE skips the destructive probe and uses that layout.
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_ENV
+	JR	NZ,.TYPE_READY
+	CALL	@RTLDET.DETECT
+	LD	(AUTO_DET_RESULT),A	; LD preserves detector CF
+	JP	C,.NIC_ERR
+	CP	RTL_DET_NE1000
+	JR	NZ,.NOT_AUTO_1000
+	LD	A,1
+	LD	(AUTO_TYPE),A
+	LD	A,RTL_LAYOUT_NE1000
+	JR	.APPLY_TYPE
+.NOT_AUTO_1000
+	CP	RTL_DET_NE2000
+	JR	NZ,.AUTO_FALLBACK
+	LD	A,2
+	LD	(AUTO_TYPE),A
+.AUTO_FALLBACK
+	XOR	A			; ambiguous/unknown fall back to NE2000
+.APPLY_TYPE
+	CALL	@RTL.SET_LAYOUT
+.TYPE_READY
+	; A configured MAC must survive AUTO detection unchanged.  DETECT has
+	; already established the stopped postcondition required before close.
+	CALL	MAC_IS_ZERO
+	JR	Z,.READ_PROM
+	CALL	@RTLDET.STOP_AND_CHECK
+	JP	C,.NIC_ERR
+	CALL	@ISA.ISA_CLOSE
+	LD	A,EX_OK
+	RET
+.READ_PROM
 	; Set DCR=0x48 directly via the new IX-relative base.
 	; (RTL_BASE_PTR is already populated by INIT_BASE.)
 	LD	IX,(RTL_BASE_PTR)
@@ -608,13 +675,27 @@ FILL_MAC_FROM_PROM
 	; is no longer needed.
 	LD	HL,NETCFG_LOAD_BUF
 	CALL	@RTL.READ_PROM
-	JR	C,.NIC_ERR
-	; Detect doubled layout: PROM[0]==PROM[1].
-	LD	HL,NETCFG_LOAD_BUF
-	LD	A,(HL)
-	INC	HL
-	CP	(HL)
-	JR	NZ,.DIRECT
+	JP	C,.NIC_ERR
+	LD	HL,NETCFG_LOAD_BUF+32
+	CALL	@RTL.READ_PROM
+	JP	C,.NIC_ERR
+	CALL	PROM_READS_EQUAL
+	JR	Z,.PROM_STABLE
+	; One retry prevents a single bus glitch from changing the selected
+	; direct/doubled interpretation.
+	LD	HL,NETCFG_LOAD_BUF+32
+	CALL	@RTL.READ_PROM
+	JP	C,.NIC_ERR
+	CALL	PROM_READS_EQUAL
+	JP	NZ,.NIC_ERR
+.PROM_STABLE
+	CALL	@RTLDET.STOP_AND_CHECK
+	JP	C,.NIC_ERR
+	CALL	DECODE_PROM_LAYOUT
+	CP	2
+	JR	Z,.PROM_CFG_ERR
+	OR	A
+	JR	Z,.DIRECT
 	; Doubled: copy PROM[0,2,4,6,8,10] -> OUR_MAC.
 	LD	HL,NETCFG_LOAD_BUF
 	LD	DE,@NETCFG.OUR_MAC
@@ -638,14 +719,161 @@ FILL_MAC_FROM_PROM
 	; The card answered and its PROM was read, but a PROM full of zeros
 	; still yields no usable address.  That one is the user's to fix
 	; with RTL_MAC=, hence a config error rather than a NIC error.
-	CALL	MAC_IS_ZERO
-	LD	A,EX_OK			; LD does not disturb Z
-	RET	NZ
+	CALL	PROM_MAC_VALID
+	LD	A,EX_OK
+	RET	NC
+	LD	A,EX_CFG_ERR
+	RET
+.PROM_CFG_ERR
+	CALL	@ISA.ISA_CLOSE
 	LD	A,EX_CFG_ERR
 	RET
 .NIC_ERR
 	CALL	@ISA.ISA_CLOSE
 	LD	A,EX_NIC_ERR
+	RET
+
+; Report the configured or detected family after ISA has been closed.
+; AUTO warnings intentionally do not publish a fallback type.
+REPORT_CARD_TYPE
+	LD	A,(@NETCFG.OUR_RTL_TYPE)
+	OR	A
+	JR	Z,.AUTO
+	PRINT MSG_CARD_TYPE
+	LD	A,(@NETCFG.OUR_RTL_TYPE+2)
+	CP	'1'
+	JR	NZ,.CFG_2000
+	PRINT MSG_NE1000
+	JR	.CFG_DONE
+.CFG_2000
+	PRINT MSG_NE2000
+.CFG_DONE
+	PRINTLN MSG_TYPE_CFG
+	RET
+.AUTO
+	LD	A,(AUTO_DET_RESULT)
+	CP	RTL_DET_NE1000
+	JR	Z,.AUTO_1000
+	CP	RTL_DET_NE2000
+	JR	Z,.AUTO_2000
+	CP	RTL_DET_AMBIGUOUS
+	JR	Z,.AMBIG
+	CP	RTL_DET_UNKNOWN
+	RET	NZ
+	PRINTLN MSG_W_TYPE_UNKNOWN
+	RET
+.AMBIG
+	PRINTLN MSG_W_TYPE_AMBIG
+	RET
+.AUTO_1000
+	PRINT MSG_CARD_TYPE
+	PRINT MSG_NE1000
+	PRINTLN MSG_TYPE_AUTO_20
+	RET
+.AUTO_2000
+	PRINT MSG_CARD_TYPE
+	PRINT MSG_NE2000
+	PRINTLN MSG_TYPE_AUTO_40
+	RET
+
+; Z when the two 32-byte PROM reads match.
+PROM_READS_EQUAL
+	LD	HL,NETCFG_LOAD_BUF
+	LD	DE,NETCFG_LOAD_BUF+32
+	LD	B,32
+.LP
+	LD	A,(DE)
+	CP	(HL)
+	RET	NZ
+	INC	HL
+	INC	DE
+	DJNZ	.LP
+	RET
+
+; A=0 direct, A=1 doubled, A=2 ambiguous.  This implements the format
+; rules from NE1000_PLAN 4.9 and never infers doubling from one equal pair.
+DECODE_PROM_LAYOUT
+	LD	HL,NETCFG_LOAD_BUF
+	LD	B,16
+.PAIR
+	LD	A,(HL)
+	INC	HL
+	CP	(HL)
+	JR	NZ,.DIRECT
+	INC	HL
+	DJNZ	.PAIR
+	; All pairs match.  Record the two possible logical signature sites.
+	XOR	A
+	LD	C,A			; bit0 direct signature, bit1 doubled
+	LD	A,(NETCFG_LOAD_BUF+14)
+	LD	D,A
+	LD	A,(NETCFG_LOAD_BUF+15)
+	CP	D
+	JR	NZ,.SIG_X
+	CP	0x57
+	JR	Z,.SET_D
+	CP	0x42
+	JR	NZ,.SIG_X
+.SET_D
+	SET	0,C
+.SIG_X
+	LD	A,(NETCFG_LOAD_BUF+28)
+	LD	D,A
+	LD	A,(NETCFG_LOAD_BUF+30)
+	CP	D
+	JR	NZ,.REDUCE
+	CP	0x57
+	JR	Z,.SET_X
+	CP	0x42
+	JR	NZ,.REDUCE
+.SET_X
+	SET	1,C
+.REDUCE
+	LD	A,C
+	CP	1
+	JR	Z,.DIRECT
+	CP	2
+	JR	NZ,.NE1000_EVIDENCE
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_NE1000
+	LD	A,2
+	RET	NZ			; contradictory: NE1000 but doubled-only
+	LD	A,1
+	RET
+.NE1000_EVIDENCE
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_NE1000
+	LD	A,2
+	RET	Z
+.DIRECT
+	XOR	A
+	RET
+
+; CF=0 for a usable unicast MAC; CF=1 for zero, broadcast or multicast.
+PROM_MAC_VALID
+	LD	HL,@NETCFG.OUR_MAC
+	BIT	0,(HL)
+	JR	NZ,.BAD
+	LD	B,6
+	XOR	A
+.OR
+	OR	(HL)
+	INC	HL
+	DJNZ	.OR
+	JR	Z,.BAD
+	LD	HL,@NETCFG.OUR_MAC
+	LD	B,6
+.FF
+	LD	A,(HL)
+	CP	0xFF
+	JR	NZ,.OK
+	INC	HL
+	DJNZ	.FF
+.BAD
+	SCF
+	RET
+.OK
+	OR	A
 	RET
 
 
@@ -960,6 +1188,7 @@ N_NET_NTP	DB "NET_NTP",0
 N_NET_TZ	DB "NET_TZ",0
 N_NET_RTL_HW	DB "NET_RTL_HW",0
 N_NET_RTL_RESET	DB "NET_RTL_RESET",0
+N_NET_RTL_TYPE	DB "NET_RTL_TYPE",0
 N_NET		DB "NET",0
 		DB 0			; table terminator
 
@@ -973,6 +1202,16 @@ V_RESET_NONE	DB 0
 V_STATIC	DB "STATIC",0
 V_DHCP		DB "DHCP",0
 V_RTL		DB "RTL",0
+V_RTL_TYPE_1000	DB "NE1000",0
+V_RTL_TYPE_2000	DB "NE2000",0
+MSG_CARD_TYPE	DB "card type: ",0
+MSG_NE1000	DB "NE1000",0
+MSG_NE2000	DB "NE2000",0
+MSG_TYPE_CFG	DB " (NET.CFG)",0
+MSG_TYPE_AUTO_20 DB " (auto: RAM at 2000)",0
+MSG_TYPE_AUTO_40 DB " (auto: RAM at 4000 or Realtek ID)",0
+MSG_W_TYPE_UNKNOWN DB "[W04] card type not detected; assuming NE2000; set RTL_TYPE",0
+MSG_W_TYPE_AMBIG DB "[W05] packet RAM answers at both 2000 and 4000; assuming NE2000",0
 
 LINE_END	DB 13,10,0
 
@@ -981,6 +1220,8 @@ LINE_END	DB 13,10,0
 SET_BUF		EQU APP_BSS_BASE		; "NAME=value\0", up to 290 bytes
 SHOW_VAL_BUF	EQU APP_BSS_BASE + 290		; GETENV destination, 256 bytes
 INIT_FAIL_CODE	EQU APP_BSS_BASE + 546		; 1 byte: exit code for FINISH
+AUTO_TYPE	EQU APP_BSS_BASE + 547		; 0=no publish, 1=NE1000, 2=NE2000
+AUTO_DET_RESULT EQU APP_BSS_BASE + 548	; RTL_DET_* or FF if not probed
 
 	ENDMODULE
 
@@ -996,8 +1237,10 @@ INIT_FAIL_CODE	EQU APP_BSS_BASE + 546		; 1 byte: exit code for FINISH
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
+	DEFINE USE_RTL_DETECT
+	INCLUDE "rtl_detect.asm"
 	INCLUDE "cmdline_lib.asm"
 	INCLUDE "win2page.asm"
 
 	ASSERT $ <= 0x7F80			; image must stay inside WIN1
-	ASSERT MAIN.INIT_FAIL_CODE + 1 < RT_STACK_TOP - 0x0100
+	ASSERT MAIN.AUTO_DET_RESULT + 1 < RT_STACK_TOP - 0x0100

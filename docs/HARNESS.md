@@ -22,7 +22,9 @@ Molly Howell -- see `THIRD_PARTY.md`), with strict host-side models of:
   register file (all 4 CR pages), PROM (direct/doubled layout), remote DMA,
   the TX path (including padding/verify), the RX ring (wrap, overflow +
   recovery), and clone quirks (`UM9003`, MAME-vs-real-hardware loopback and
-  ISR.RST-on-STOP behavior).
+  ISR.RST-on-STOP behavior), plus an NE1000 variant with 8 KB RAM at
+  `2000h`, a 16-byte direct PROM, sticky STA after STP, status-only
+  ISR.RST, and the stock DP8390 remote-DMA data-port behavior.
 - **DSS/BIOS**: the function surface these utilities actually use (file
   I/O, `ENVIRON`, `APPINFO`, `GETMEM`/`SETWIN`, `WAITKEY`/`SCANKEY`, console
   output, `EXIT`) plus the RST 8 `EMM_FN4` call.
@@ -85,7 +87,12 @@ code was 0.
   promLayout: 'direct',     // 'direct' | 'doubled' | 'unknown'
   promSignature: 0x57,      // 0x57 ('W','W') or 0x42 ('B','B')
   quirks: {
-    variant: 'RTL8019AS',   // or 'UM9003' (id0/id1 read as 0x20/0x01,
+    variant: 'RTL8019AS',   // also 'NE1000' or 'UM9003'
+    staStickyOnStop: false, // defaults true for NE1000
+    rstStatusOnly: false,   // defaults true for NE1000
+    remoteDmaStall: false,  // transfer completes but RDC never arrives
+    chipDeadAfterStall: false, // register reads become FF after that stall
+                             // UM9003 id0/id1 read as 0x20/0x01,
                              // measured on the card -- not 0xFF, which is
                              // the open-bus value an absent card gives)
     loopbackToRing: true,   // MAME: loopback frame lands in the RX ring + PRX.

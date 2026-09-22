@@ -284,18 +284,18 @@ GET_U16
 REQUIRE_IP
 	PUSH	HL			; save name ptr for error msg
 	CALL	GET_IP
-	JR	C,_MISSING
+	JR	C,DIE_BAD_VAR
 	POP	HL
 	RET
 
 REQUIRE_MAC
 	PUSH	HL
 	CALL	GET_MAC
-	JR	C,_MISSING
+	JR	C,DIE_BAD_VAR
 	POP	HL
 	RET
 
-_MISSING
+DIE_BAD_VAR
 	; Stack top = name ptr.
 	LD	HL,_MSG_PRE
 	LD	C,DSS_PCHARS
@@ -310,7 +310,7 @@ _MISSING
 	JP	@UTIL.EXIT_FAIL
 
 _MSG_PRE	DB "[E] env var ",0
-_MSG_POST	DB " not set; run NETCFG -i first",13,10,0
+_MSG_POST	DB " missing or invalid; run NETCFG -i",13,10,0
 	ENDIF
 
 

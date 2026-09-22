@@ -189,7 +189,7 @@ CR_PAGE3_STOP	EQU 0xE1	; page 3, stop, DMA abort
 CR_PAGE3_START	EQU 0xE2	; page 3, start, DMA abort
 ; CR bits a page-select write must read back unchanged: page select
 ; plus STA/STP.  RD2 and TXP are excluded -- both clear on their own.
-CR_VERIFY_MASK	EQU 0xC3
+CR_VERIFY_MASK	EQU 0xC1
 
 ; Remote DMA commands (low 6 bits, OR with page select bits if needed).
 ; All include STA so the chip stays running.
@@ -262,6 +262,34 @@ RTL_PSTOP_INIT	EQU 0x60		; RX ring end (exclusive, WTS=0)
 RTL_BNRY_INIT	EQU 0x46		; initial RX boundary
 RTL_CURR_INIT	EQU 0x47		; initial CURR (BNRY+1, marks empty ring)
 	ENDIF
+
+; Both card families use the same offsets inside their packet-RAM window.
+; RTL_ALT_TX_LAYOUT moves the TX/RX split but keeps these expressions valid.
+RTL_RAM_BASE_NE2000	EQU RTL_TPSR_INIT
+RTL_RAM_BASE_NE1000	EQU RTL_TPSR_INIT - 0x20
+RTL_TX_PAGES		EQU RTL_PSTART_INIT - RTL_TPSR_INIT
+RTL_RAM_PAGES		EQU 0x20
+RTL_RX_PAGES		EQU RTL_PSTOP_INIT - RTL_PSTART_INIT
+
+RTL_LAYOUT_NE2000	EQU 0
+RTL_LAYOUT_NE1000	EQU 1
+RTL_LAYOUT_FLAG_NE1000	EQU 0x01
+RTL_LAYOUT_FLAG_ENV	EQU 0x80
+RTL_INIT_NO_CHIP	EQU 1
+RTL_INIT_BAD_TYPE	EQU 2
+
+; RTL.DETECT result codes (A on return, CF=1 only for a DMA fault).
+RTL_DET_NE2000		EQU 0
+RTL_DET_NE1000		EQU 1
+RTL_DET_AMBIGUOUS	EQU 2
+RTL_DET_DMA_ERROR	EQU 3
+RTL_DET_UNKNOWN		EQU 4
+RTL_DET_CHIP_FAULT	EQU 5
+
+RTL_PROBE_MISMATCH	EQU 0
+RTL_PROBE_OK		EQU 1
+RTL_PROBE_UNSTABLE	EQU 2
+RTL_PROBE_TIMEOUT	EQU 3
 
 ; -- Ethernet frame size limits ------------------------------------
 ETH_FRAME_MIN	EQU 60			; pad TX to this many bytes (no FCS)

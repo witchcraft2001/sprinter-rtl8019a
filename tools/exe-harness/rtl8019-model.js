@@ -45,9 +45,10 @@ class Rtl8019 {
     this.present = scenario.cardPresent !== false;
     this.slot = scenario.slot === 0 ? 0 : 1;
     this.base = scenario.base !== undefined ? scenario.base : 0x300;
-    this.mac = Array.from(scenario.mac || DEFAULT_MAC);
     const quirks = scenario.quirks || {};
     this.variant = quirks.variant || 'RTL8019AS';
+    this.mac = Array.from(scenario.mac || (this.variant === 'NE1000'
+      ? [0x00, 0x00, 0x1b, 0x11, 0x22, 0x33] : DEFAULT_MAC));
     this.quirks = {
       loopbackToRing: quirks.loopbackToRing !== false, // MAME default: true
       isrRstOnStop: quirks.isrRstOnStop === true, // real HW: true; MAME default: false
@@ -108,19 +109,33 @@ class Rtl8019 {
       loopbackSilent: quirks.loopbackSilent === true,
       // FIFO-path loopback whose RXE lands this many ms after PTX.
       loopbackStatusDelayMs: quirks.loopbackStatusDelayMs || 0,
+      // DP8390/NE1000 keeps STA set in the read-back value after STP.
+      staStickyOnStop: quirks.staStickyOnStop !== undefined
+        ? quirks.staStickyOnStop === true : this.variant === 'NE1000',
+      rstStatusOnly: quirks.rstStatusOnly !== undefined
+        ? quirks.rstStatusOnly === true : this.variant === 'NE1000',
+      remoteDmaStall: quirks.remoteDmaStall === true,
+      chipDeadAfterStall: quirks.chipDeadAfterStall === true,
     };
     this.promLayout = scenario.promLayout || 'direct';
     this.prom = buildProm(this.mac, this.promLayout, scenario.promSignature);
+    if (this.variant === 'NE1000') {
+      // The original NE1000 has a 16-byte PROM.  READ_PROM still requests
+      // 32 bytes; the upper half is open bus on the ISA card.
+      const p = new Array(32).fill(0xff);
+      for (let i = 0; i < 16; i++) p[i] = this.prom[i];
+      this.prom = p;
+    }
     // 8019ID0/ID1.  A real UM9003AF answers 0x20/0x01, measured on the
     // card -- NOT 0xff, which is also the open-bus value and would let a
     // "clone rejected" test pass for the wrong reason (absent card rather
     // than wrong signature).
-    this.id0 = this.variant === 'UM9003' ? 0x20 : 0x50;
-    this.id1 = this.variant === 'UM9003' ? 0x01 : 0x70;
+    this.id0 = this.variant === 'UM9003' ? 0x20 : (this.variant === 'NE1000' ? 0xff : 0x50);
+    this.id1 = this.variant === 'UM9003' ? 0x01 : (this.variant === 'NE1000' ? 0xff : 0x70);
 
     // Page-0 registers (write side / configured value).
-    this.cr = 0x21; // PAGE0_STOP
-    this.isr = 0;
+    this.cr = scenario.chipPreStarted ? 0x22 : 0x21;
+    this.isr = this.quirks.rstStatusOnly && !scenario.chipPreStarted ? ISR_RST : 0;
     this.imrValue = 0;
     this.dcrValue = 0;
     this.tcrValue = 0;
@@ -162,10 +177,14 @@ class Rtl8019 {
 
     // RX ring halted after an unrecovered overflow.
     this.rxHalted = false;
-    this.stopped = false;
+    this.stopped = !scenario.chipPreStarted;
+    this.everStarted = scenario.chipPreStarted === true;
 
-    // 16 KB of NIC-local packet RAM, addresses 0x4000..0x7FFF.
-    this.ram = new Uint8Array(0x4000);
+    // NE1000 has 8 KB at 0x2000..0x3FFF; NE2000-compatible cards use the
+    // 8 KB slice at 0x4000..0x5FFF in this project.
+    this.ramBase = this.variant === 'NE1000' ? 0x2000 : 0x4000;
+    this.ramLimit = this.ramBase + 0x2000;
+    this.ram = new Uint8Array(0x2000);
     if (scenario.poison !== false) this.ram.fill(0xaa);
 
     this.transmitted = []; // frames that actually left the wire
@@ -187,6 +206,7 @@ class Rtl8019 {
     this._missLeft = 0;
     this._flipWrites = 0;
     this._accesses = 0;
+    this.chipDead = false;
 
     // Scheduled RX delivery: preloaded scenario.rxFrames plus anything a
     // protocol responder (net-builders.js, via onTransmit) schedules in
@@ -237,6 +257,10 @@ class Rtl8019 {
     }
     this.cr = 0x21;
     this.isr |= ISR_RST;
+    this.stopped = true;
+    this.everStarted = false;
+    this.dmaActive = false;
+    this.dmaDirection = null;
     return 0xff;
   }
 
@@ -250,14 +274,17 @@ class Rtl8019 {
     if (stp) {
       if (!this.stopped) this.stats.stopEdges++; // running -> offline
       this.stopped = true;
-      if (this.quirks.isrRstOnStop) this.isr |= ISR_RST;
+      if (this.quirks.isrRstOnStop || this.quirks.rstStatusOnly) this.isr |= ISR_RST;
     } else if (sta && this.stopped) {
       this.stopped = false;
+      this.everStarted = true;
+      if (this.quirks.rstStatusOnly) this.isr &= ~ISR_RST;
       this.rxHalted = false; // RECOVER_OVERFLOW's STP->STA edge restarts the RX engine
     }
     const rdField = (value >> 3) & 7;
     if (rdField === 1 || rdField === 2) {
-      if (!this.dmaActive) { this.crda = this.rsar; this._dmaByteIndex = 0; }
+      this.crda = this.rsar;
+      this._dmaByteIndex = 0;
       this.dmaDirection = rdField === 1 ? 'read' : 'write';
       this.dmaActive = true;
       if (this.rbcr === 0) { this.isr |= ISR_RDC; this.dmaActive = false; this.dmaDirection = null; }
@@ -296,7 +323,11 @@ class Rtl8019 {
     this._dmaByteIndex++;
     this.crda = (this.crda + 1) & 0xffff;
     this.rbcr--;
-    if (this.rbcr === 0) { this.isr |= ISR_RDC; this.dmaActive = false; this.dmaDirection = null; }
+    if (this.rbcr === 0) {
+      if (!this.quirks.remoteDmaStall) this.isr |= ISR_RDC;
+      else if (this.quirks.chipDeadAfterStall) this.chipDead = true;
+      this.dmaActive = false; this.dmaDirection = null;
+    }
     return value;
   }
 
@@ -310,18 +341,22 @@ class Rtl8019 {
     this._dmaByteIndex++;
     this.crda = (this.crda + 1) & 0xffff;
     this.rbcr--;
-    if (this.rbcr === 0) { this.isr |= ISR_RDC; this.dmaActive = false; this.dmaDirection = null; }
+    if (this.rbcr === 0) {
+      if (!this.quirks.remoteDmaStall) this.isr |= ISR_RDC;
+      else if (this.quirks.chipDeadAfterStall) this.chipDead = true;
+      this.dmaActive = false; this.dmaDirection = null;
+    }
   }
 
   ramReadNic(addr) {
-    if (addr < 0x4000) return this.prom[addr % this.prom.length];
-    if (addr < 0x8000) return this.ram[addr - 0x4000];
+    if (addr >= this.ramBase && addr < this.ramLimit) return this.ram[addr - this.ramBase];
+    if (addr < this.ramBase) return this.prom[addr % this.prom.length];
     this.stats.oobDma++;
     return this.quirks.openBusValue;
   }
 
   ramWriteNic(addr, value) {
-    if (addr >= 0x4000 && addr < 0x8000) { this.ram[addr - 0x4000] = value; return; }
+    if (addr >= this.ramBase && addr < this.ramLimit) { this.ram[addr - this.ramBase] = value; return; }
     this.stats.oobDma++;
   }
 
@@ -340,8 +375,9 @@ class Rtl8019 {
     return true;
   }
 
-  readReg(offset) {
+  readReg(offset, cycles) {
     if (offset <= 0x0f) this.stats.regCycles++; else this.stats.dataCycles++;
+    if (this.chipDead) return 0xff;
     if (offset <= 0x0f && this._busMissed(false)) return this.lastBus;
     const previous = this.lastBus;
     let value = this._readRegRaw(offset) & 0xff;
@@ -369,7 +405,7 @@ class Rtl8019 {
   }
 
   _readRegRaw(offset) {
-    if (offset === 0x00) return this.cr;
+    if (offset === 0x00) return this.quirks.staStickyOnStop && this.stopped && this.everStarted ? (this.cr | 0x02) : this.cr;
     if (offset === 0x10) return this.readData();
     if (offset === 0x1f) return this.readResetPort();
     const page = (this.cr >> 6) & 3;
@@ -428,8 +464,9 @@ class Rtl8019 {
     }
   }
 
-  writeReg(offset, value) {
+  writeReg(offset, value, cycles) {
     if (offset <= 0x0f) this.stats.regCycles++; else this.stats.dataCycles++;
+    if (this.chipDead) return undefined;
     value &= 0xff;
     this.lastBus = value;
     if (offset <= 0x0f && this._busMissed(true)) return undefined;
@@ -461,7 +498,12 @@ class Rtl8019 {
         case 0x04: this.tpsrValue = value; return;
         case 0x05: this.tbcr = (this.tbcr & 0xff00) | value; return;
         case 0x06: this.tbcr = (this.tbcr & 0x00ff) | (value << 8); return;
-        case 0x07: this.isr &= (~value) & 0xff; return; // write-1-to-clear
+        case 0x07: {
+          const rst = this.isr & ISR_RST;
+          this.isr &= (~value) & 0xff;
+          if (this.quirks.rstStatusOnly && this.stopped) this.isr |= rst || ISR_RST;
+          return;
+        }
         case 0x08: this.rsar = (this.rsar & 0xff00) | value; return;
         case 0x09: this.rsar = (this.rsar & 0x00ff) | (value << 8); return;
         case 0x0a: this.rbcr = (this.rbcr & 0xff00) | value; return;
@@ -492,7 +534,7 @@ class Rtl8019 {
   doTransmit() {
     this.txAttempts++;
     if (this.pstop <= this.tpsrValue) throw new Error('PSTOP must exceed TPSR in 8-bit mode');
-    const start = this.tpsrValue * 256 - 0x4000;
+    const start = this.tpsrValue * 256 - this.ramBase;
     const frame = Array.from(this.ram.slice(start, start + this.tbcr));
     const loopbackActive = (this.tcrValue & 0x06) !== 0 && (this.dcrValue & 0x08) === 0;
     const txError = this.scenario.txError;

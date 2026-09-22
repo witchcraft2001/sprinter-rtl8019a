@@ -105,6 +105,14 @@ port stalls the ISA bus cycle on this card and would freeze the machine.
 `docs/HOWTO.md` covers the explicit overrides, and `docs/ISAPROBE.md`
 what to do when a card is not found at all.
 
+Classic 8 KB NE1000 cards are supported with `RTL_TYPE=NE1000`; their
+packet RAM occupies pages `20h..3Fh`.  `RTL_TYPE=NE2000` selects pages
+`40h..5Fh`; an empty value lets `NETCFG -i` or `IFUP` probe the two RAM
+windows.  A card without the Realtek `Pp` ID must also have a pinned
+`RTL_HW=S/#HHH`, because the broad ISA scan deliberately rejects an
+unidentified/floating bus.  NE1000 support is covered by the host model;
+MAME and physical-card acceptance records remain in `docs/evidence/`.
+
 **Never select page 3 on a chip that did not answer the Realtek ID
 probe, least of all next to a transmit.** Page 3 is a Realtek
 extension; a UM9003 mirrors page 1 there instead of exposing PHY
@@ -154,7 +162,7 @@ REN NETSMPL.CFG NET.CFG
 ```
 
 Then edit `NET.CFG` for your local network.  The keys are `RTL_HW`
-(ISA slot and I/O base as `S/#HHH`), `RTL_IRQ`, `RTL_RESET`, `RTL_MAC`,
+(ISA slot and I/O base as `S/#HHH`), `RTL_IRQ`, `RTL_RESET`, `RTL_TYPE`, `RTL_MAC`,
 `IP` (a literal address or the keyword `DHCP`), `NETMASK`, `GATEWAY`,
 `DNS1`, `DNS2`, `TZ` (local UTC offset, `[+|-]H[H][:MM]`, e.g. `+5:30`)
 and `NTP`.  The template documents each one inline; every key is

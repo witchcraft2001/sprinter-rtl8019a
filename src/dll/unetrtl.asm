@@ -181,14 +181,15 @@ DLL_IMAGE_ORIGIN	EQU $
 ; EQU chains for mkdll's two-pass byte diff to trip over.
 ;
 ; Offsets are literals on purpose (see the layout notes above).  The
-; region sizes come from memmap.inc: LIBBSS_SIZE 0x176, resolve 0x29,
+; region sizes come from memmap.inc: LIBBSS_SIZE 0x17C, resolve 0x29,
 ; tcp 0x35, udp 0x18, icmp 0x10.
 ; ======================================================
 ; TX_BUF/RX_BUF sizes below assume zero-copy TX (SEND_FRAME_SG in
 ; rtl8019.asm, IFDEF UNET_DLL): UDP/TCP-data payloads stream straight
 ; from the caller's own buffer and are never copied into TX_BUF, so
-; TX_BUF only needs to hold the largest frame still built whole --
-; the DNS query via resolve_lib, bounded by RESOLVE_MAX_FRAME (320).
+; TX_BUF only needs to hold the largest frame still built whole.  With the
+; DLL's 128-byte host-name limit a DNS query is at most 188 bytes
+; (Ethernet+IPv4+UDP+DNS+encoded name); keep 192 bytes for alignment/margin.
 ; RX_BUF grows to the standard IPv4 MTU (14+20+8+1472=1514) now that
 ; TX_BUF's shrink pays for it inside the libman 0x38C7 image budget.
 ; BSS_TCP grew 0x035->0x037 (TCP_ADV_WIN_HI/LO, see memmap.inc) --
@@ -219,19 +220,19 @@ BSS_OUR_MAC	EQU 0x020A		; 6
 BSS_CANCELLED	EQU 0x0210		; 1
 BSS_LASTERR_FROZEN EQU 0x0211		; 1: LASTERR_BUF holds a failed call's frozen line
 BSS_LASTERR	EQU 0x0212		; 0x048 formatted diagnostic line
-BSS_TX_BUF	EQU 0x025A		; 0x140 320 = RESOLVE_MAX_FRAME (largest whole-built frame)
-BSS_RX_HDR	EQU 0x039A		; 4     NE2000 RX ring header
-BSS_RX_BUF	EQU 0x039E		; 0x5EA 1514 = 14+20+8+1472 (standard UDP MTU)
-BSS_CH_TCP	EQU 0x0988		; 0x35 inactive TCP context (salt + adv-win excluded)
-BSS_CH_UDP	EQU 0x09BD		; 0x18 inactive-channel UDP context
-BSS_PEND_LEN	EQU 0x09D5		; 2 words
-BSS_PEND_OFF	EQU 0x09D9		; 2 words
-BSS_CLOSED	EQU 0x09DD		; 2 bytes
-BSS_LOST	EQU 0x09DF		; 2 bytes
-BSS_PEND_BUF	EQU 0x09E1		; 2 * 536-byte TCP receive queues
-BSS_COLD_CTX	EQU 0x0E11		; CCTX_SIZE (18): WIN0COLD.RUN parameter block
-DLL_BSS_SIZE	EQU 0x0E23		; 3619 total
-	ASSERT	BSS_TX_BUF + 0x140 <= BSS_RX_HDR
+BSS_TX_BUF	EQU 0x025A		; 0x0C0 192-byte whole-frame scratch
+BSS_RX_HDR	EQU 0x031A		; 4     NE2000 RX ring header
+BSS_RX_BUF	EQU 0x031E		; 0x5EA 1514 = 14+20+8+1472 (standard UDP MTU)
+BSS_CH_TCP	EQU 0x0908		; 0x35 inactive TCP context (salt + adv-win excluded)
+BSS_CH_UDP	EQU 0x093D		; 0x18 inactive-channel UDP context
+BSS_PEND_LEN	EQU 0x0955		; 2 words
+BSS_PEND_OFF	EQU 0x0959		; 2 words
+BSS_CLOSED	EQU 0x095D		; 2 bytes
+BSS_LOST	EQU 0x095F		; 2 bytes
+BSS_PEND_BUF	EQU 0x0961		; 2 * 536-byte TCP receive queues
+BSS_COLD_CTX	EQU 0x0D91		; CCTX_SIZE (18): WIN0COLD.RUN parameter block
+DLL_BSS_SIZE	EQU 0x0DA3		; 3491 total
+	ASSERT	BSS_TX_BUF + 0x0C0 <= BSS_RX_HDR
 
 DLL_BSS
 	DS	DLL_BSS_SIZE, 0
@@ -246,10 +247,10 @@ UDP_BSS_BASE		EQU DLL_BSS + BSS_UDP
 ICMP_BSS_BASE		EQU DLL_BSS + BSS_ICMP
 
 	INCLUDE "memmap.inc"
-	; TX_BUF must still fit the largest frame BUILD_FRAME-style
-	; routines assemble whole (only resolve_lib's DNS query does,
-	; under zero-copy TX -- see the layout comment above).
-	ASSERT	RESOLVE_MAX_FRAME <= 0x140
+	; DNS query maximum: Ethernet/IP/UDP (42), DNS header (12), an
+	; encoded <=128-byte name (at most input+2), and QTYPE/QCLASS (4).
+DLL_DNS_FRAME_MAX	EQU 42 + 12 + MAX_HOST_LEN + 2 + 4
+	ASSERT	DLL_DNS_FRAME_MAX <= 0x0C0
 	; CH_TCP_CTX must hold SELECT_CHANNEL's full two-slice swap or the
 	; second SWAP_BYTES call overruns into CH_UDP_CTX -- which the same
 	; call is swapping too, so both get corrupted on every channel
@@ -406,9 +407,9 @@ F_NETINIT
 	LD	(STAGE),A
 	CALL	CLOSE_LINK			; a repeated NETINIT is safe
 	CALL	RESET_CHANNEL_STATE
-	CALL	ENV_IS_UP
-	JP	C,RET_NONET
-	; NET_IP / NET_MAC into the @MAIN contract slots.
+	; Parse NET_IP / NET_MAC directly into the live slots, then validate the
+	; optional backend marker.  This keeps each environment value to one read
+	; through NETENV's shared buffer.
 	LD	HL,ENVN_IP
 	LD	DE,@MAIN.OUR_IP
 	CALL	@NETENV.GET_IP
@@ -416,6 +417,8 @@ F_NETINIT
 	LD	HL,ENVN_MAC
 	LD	DE,@MAIN.OUR_MAC
 	CALL	@NETENV.GET_MAC
+	JP	C,RET_NONET
+	CALL	ENV_BACKEND_OK
 	JP	C,RET_NONET
 	LD	HL,@MAIN.OUR_MAC
 	LD	(@ARP.OUR_MAC_PTR),HL
@@ -2208,13 +2211,14 @@ RESET_CHANNEL_STATE
 	; = DLL_BSS_SIZE - BSS_TCP - 1.  Literal, NOT a computed
 	; difference (relocation rule); recompute by hand and update
 	; this comment's numbers whenever DLL_BSS_SIZE or BSS_TCP moves.
-	; 0x0E23 - 0x01A5 - 1 = 0x0C7D.
-	LD	BC,0x0C7D		; TCP BSS .. end of DLL BSS, minus first byte
+	; 0x0DA3 - 0x01A5 - 1 = 0x0BFD.
+	LD	BC,0x0BFD		; TCP BSS .. end of DLL BSS, minus first byte
 	LDIR
 	LD	A,0xFF			; 0xFF = no live context selected
 	LD	(ACTIVE_CH),A
 	LD	(FOREIGN_HINT),A
 	RET
+	ASSERT BSS_TCP + 1 + 0x0BFD == DLL_BSS_SIZE
 
 ; ------------------------------------------------------
 ; RELEASE_OR_REARM: close ARG_CH's channel slot, or -- if it is the
@@ -2366,19 +2370,31 @@ BUILD_COLD_CTX
 ;   Out: CF=0 up; CF=1 not configured.  Trashes A, BC, DE, HL.
 ; ------------------------------------------------------
 ENV_IS_UP
-	LD	HL,ENVN_NET
-	CALL	@NETENV.GET_RAW
-	JR	C,.no_marker			; unset: fall back to legacy
-	LD	DE,VAL_RTL
-	CALL	STRMATCH
-	JR	NZ,.bad				; NET is set to something else
-.no_marker
+	CALL	ENV_BACKEND_OK
+	RET	C
 	LD	HL,ENVN_IP
 	CALL	@NETENV.GET_RAW
 	JR	C,.bad
 	LD	HL,ENVN_MAC
 	CALL	@NETENV.GET_RAW
 	JR	C,.bad
+	OR	A				; CF=0
+	RET
+.bad
+	SCF
+	RET
+
+; Validate the optional NET backend marker without touching the address
+; fields.  Missing NET remains compatible with configurations made by older
+; builds; a present marker must select this backend explicitly.
+ENV_BACKEND_OK
+	LD	HL,ENVN_NET
+	CALL	@NETENV.GET_RAW
+	JR	C,.ok				; unset: legacy configuration
+	LD	DE,VAL_RTL
+	CALL	STRMATCH
+	JR	NZ,.bad				; NET is set to something else
+.ok
 	OR	A				; CF=0
 	RET
 .bad

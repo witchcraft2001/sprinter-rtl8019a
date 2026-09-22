@@ -121,6 +121,10 @@ INIT_BASE
 	ENDIF
 	LD	A,RCR_AB		; sane default until INIT_NORMAL runs
 	LD	(RTL_RCR_SHADOW),A
+	; A fresh process starts in the historical NE2000 layout.  The
+	; environment override is applied after the card has been located.
+	XOR	A
+	CALL	SET_LAYOUT
 	IFDEF	RTL_SOFT_RESET_SUPPORTED
 	; Must happen here: DSS_ENVIRON is a DSS call and ISA is still
 	; CLOSED at this point.
@@ -128,6 +132,32 @@ INIT_BASE
 	ENDIF
 
 	; Stage 1: env override.
+	IFDEF RTL_DIAG_FIXED_BASE
+	LD	A,1
+	LD	(@ISA.ISA_SLOT),A
+	LD	HL,ISA_BASE_A + 0x300
+	LD	(RTL_BASE_PTR),HL
+	CALL	@ISA.ISA_OPEN
+	LD	IX,(RTL_BASE_PTR)
+	CALL	PROBE_AT_IX
+	JR	C,.FIXED_FAIL
+.FIXED_OK
+	CALL	@ISA.ISA_CLOSE
+	CALL	READ_CARD_TYPE
+	JR	C,.FIXED_TYPE_FAIL
+	CALL	@ISA.ISA_OPEN
+	OR	A
+	RET
+.FIXED_TYPE_FAIL
+	; READ_CARD_TYPE leaves ISA closed and A carries BAD_TYPE.
+	SCF
+	RET
+.FIXED_FAIL
+	CALL	@ISA.ISA_CLOSE
+	LD	A,RTL_INIT_NO_CHIP
+	SCF
+	RET
+	ELSE
 	CALL	TRY_ENV_OVERRIDE
 	IFDEF	UNET_DLL
 	; UNETRTL.DLL takes the env fast path only (image-budget reasons --
@@ -138,20 +168,38 @@ INIT_BASE
 	; same in all three cases (run IFUP/NETCFG once to populate/refresh
 	; the env), so F_NETINIT maps this to NERR_NONET rather than
 	; NERR_HW. Every stand-alone utility keeps the full auto-scan.
-	RET
+	RET	C
+	CALL	@ISA.ISA_CLOSE
+	CALL	READ_CARD_TYPE
+	RET	C
+	JP	@ISA.ISA_OPEN
 	ELSE
-	RET	NC			; ISA OPEN, base accepted
+	JR	C,.SCAN_NEEDED
+	CALL	@ISA.ISA_CLOSE
+	CALL	READ_CARD_TYPE
+	JR	C,.OVERRIDE_TYPE_BAD
+	CALL	@ISA.ISA_OPEN
+	OR	A
+	RET
+.OVERRIDE_TYPE_BAD
+	SCF
+	RET
+.SCAN_NEEDED
 
 	; Stage 2: auto-scan currently-selected slot, then the other.
+	IFDEF RTL_NO_AUTOSCAN
+	SCF
+	RET
+	ELSE
 	CALL	@ISA.ISA_OPEN
-	CALL	.SCAN_BASES
+	CALL	SCAN_BASES
 	JR	NC,.SCAN_OK
 	CALL	@ISA.ISA_CLOSE
 	LD	A,(@ISA.ISA_SLOT)
 	XOR	1
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@ISA.ISA_OPEN
-	CALL	.SCAN_BASES
+	CALL	SCAN_BASES
 	JR	NC,.SCAN_OK
 	CALL	@ISA.ISA_CLOSE
 	SCF
@@ -167,9 +215,115 @@ INIT_BASE
 	; call (DSS env data lives at 0xE400 which is in PAGE3, our
 	; ISA window).
 	CALL	WRITE_ENV_HW
+	; Environment reads are DSS calls and therefore require the ISA
+	; window to be closed.  Select the packet-RAM layout before any
+	; caller can initialize the chip.
+	CALL	@ISA.ISA_CLOSE
+	CALL	READ_CARD_TYPE
+	JR	C,.SCAN_TYPE_BAD
+	CALL	@ISA.ISA_OPEN
 	OR	A
 	RET
+.SCAN_TYPE_BAD
+	; READ_CARD_TYPE already left the window closed.
+	SCF
+	RET
 	ENDIF
+	ENDIF
+	ENDIF
+
+; ------------------------------------------------------
+; SET_LAYOUT: select the packet-RAM layout for subsequent driver calls.
+; In: A = RTL_LAYOUT_NE2000 or RTL_LAYOUT_NE1000.
+; Out: CF=0; preserves BC, DE, HL, IX.
+; ------------------------------------------------------
+SET_LAYOUT
+	CP	RTL_LAYOUT_NE1000
+	JR	Z,.NE1000
+	XOR	A
+	LD	(RTL_CARD_FLAGS),A
+	LD	A,RTL_RAM_BASE_NE2000
+	JR	.DONE
+.NE1000
+	LD	A,RTL_LAYOUT_FLAG_NE1000
+	LD	(RTL_CARD_FLAGS),A
+	LD	A,RTL_RAM_BASE_NE1000
+.DONE
+	LD	(RTL_TPSR_PAGE),A
+	ADD	A,RTL_TX_PAGES
+	LD	(RTL_PSTART_PAGE),A
+	ADD	A,RTL_RX_PAGES
+	LD	(RTL_PSTOP_PAGE),A
+	OR	A
+	RET
+
+; ------------------------------------------------------
+; READ_CARD_TYPE: read the canonical NET_RTL_TYPE environment value.
+; Missing/empty means legacy NE2000.  Invalid values return CF=1,A=2.
+; ISA must be closed because this routine calls DSS ENVIRON.
+; ------------------------------------------------------
+READ_CARD_TYPE
+	IFDEF UNET_DLL
+	; The DLL already links NETENV.GET_RAW.  Reuse it instead of carrying
+	; a second DSS ENVIRON wrapper; NETCFG stores this value canonically.
+	LD	HL,N_RTL_TYPE
+	CALL	@NETENV.GET_RAW
+	JR	C,.DEFAULT
+	ELSE
+	LD	HL,N_RTL_TYPE
+	LD	DE,NETENV_VAL_BUF
+	LD	B,ENV_GET
+	LD	C,DSS_ENVIRON
+	RST	DSS
+	OR	A
+	JR	Z,.DEFAULT
+	LD	HL,NETENV_VAL_BUF
+	LD	A,(HL)
+	OR	A
+	JR	Z,.DEFAULT
+	ENDIF
+	; Compare complete canonical strings, including the terminator.
+	LD	DE,TYPE_NE1000
+	CALL	.MATCH
+	JR	Z,.SET1000
+	LD	HL,NETENV_VAL_BUF
+	LD	DE,TYPE_NE2000
+	CALL	.MATCH
+	JR	Z,.SET2000
+	LD	A,RTL_INIT_BAD_TYPE
+	SCF
+	RET
+.SET1000
+	LD	A,RTL_LAYOUT_NE1000
+	JR	.SET_TYPE
+.SET2000
+	LD	A,RTL_LAYOUT_NE2000
+.SET_TYPE
+	CALL	SET_LAYOUT
+	LD	HL,RTL_CARD_FLAGS
+	SET	7,(HL)
+	XOR	A
+	RET
+.DEFAULT
+	XOR	A
+	RET
+.MATCH
+	; HL source, DE canonical string. Z iff strings are identical.
+.ML
+	LD	A,(HL)
+	LD	C,A
+	LD	A,(DE)
+	CP	C
+	RET	NZ
+	OR	A
+	RET	Z
+	INC	HL
+	INC	DE
+	JR	.ML
+
+N_RTL_TYPE	DB "NET_RTL_TYPE",0
+TYPE_NE1000	DB "NE1000",0
+TYPE_NE2000	DB "NE2000",0
 
 ; Helper: walk SCAN_TABLE, set RTL_BASE_PTR to first hit.
 ; Out: CF=0 + IX = base on hit; CF=1 if nothing responds.
@@ -177,7 +331,9 @@ INIT_BASE
 ; Excluded from UNETRTL.DLL (image budget): only reachable from
 ; Stage 2 above, which the DLL does not compile.
 	IFNDEF	UNET_DLL
-.SCAN_BASES
+	IFNDEF RTL_DIAG_FIXED_BASE
+	IFNDEF RTL_NO_AUTOSCAN
+SCAN_BASES
 	LD	HL,SCAN_TABLE
 .SLP
 	LD	E,(HL)
@@ -196,8 +352,8 @@ INIT_BASE
 	POP	HL			; restore table cursor
 	JR	C,.SLP
 	; A floating or mirrored ISA window can pass the register R/W test
-	; above, so the AUTO-SCAN additionally demands the Realtek 8019 ID
-	; before claiming a hit.  An explicitly pinned base
+	; above, so the AUTO-SCAN additionally demands the Realtek 8019 ID.
+	; An explicitly pinned base
 	; (TRY_ENV_OVERRIDE) deliberately skips this check: the user has
 	; already said WHERE the card is, so there is no address to guess
 	; wrong, and requiring the Realtek signature there would lock out
@@ -221,20 +377,27 @@ INIT_BASE
 	LD	A,(HL)
 	CP	RTL_ID1_VAL
 .ID_DONE
-	POP	HL			; POP does not disturb Z
-	JR	NZ,.SLP
+	JR	NZ,.ID_REJECT
+	POP	HL			; discard table cursor, preserve IX
 	; Hit: IX still = window addr.
 	PUSH	IX
 	POP	HL
 	LD	(RTL_BASE_PTR),HL
 	OR	A
 	RET
+.ID_REJECT
+	POP	HL
+	JR	.SLP
 .SNONE
 	SCF
 	RET
+	ENDIF
+	ENDIF
 
 ; Standard NE2000 jumperless I/O bases (in ISA window
 ; 0xC000..0xFFFF).  Sentinel = DW 0.
+	IFNDEF RTL_DIAG_FIXED_BASE
+	IFNDEF RTL_NO_AUTOSCAN
 SCAN_TABLE
 	DW ISA_BASE_A + 0x200
 	DW ISA_BASE_A + 0x220
@@ -254,6 +417,8 @@ SCAN_TABLE
 	DW ISA_BASE_A + 0x3E0
 	DW 0
 	ENDIF
+	ENDIF
+	ENDIF
 
 
 ; ------------------------------------------------------
@@ -269,8 +434,13 @@ SCAN_TABLE
 ; defined in memmap.inc; safe to reference here without
 ; pulling in netenv_lib).
 ; ------------------------------------------------------
+	IFNDEF RTL_DIAG_FIXED_BASE
 TRY_ENV_OVERRIDE
 	LD	HL,N_RTL_HW
+	IFDEF UNET_DLL
+	CALL	@NETENV.GET_RAW
+	JR	C,.SILENT
+	ELSE
 	LD	DE,NETENV_VAL_BUF
 	LD	B,ENV_GET
 	LD	C,DSS_ENVIRON
@@ -281,6 +451,7 @@ TRY_ENV_OVERRIDE
 	LD	A,(HL)
 	OR	A
 	JR	Z,.SILENT		; "found" but value empty
+	ENDIF
 	CALL	PARSE_HW_VALUE		; A=slot, DE=addr on success
 	JR	C,.WARN			; malformed
 	; Configure ISA + RTL_BASE_PTR from parsed value.
@@ -342,6 +513,48 @@ PARSE_HW_VALUE
 	JR	NC,.BAD
 	LD	(.SLOT),A
 	INC	HL
+	IFDEF RTL_CANONICAL_HW_PARSER
+	; NETCFG/IFUP publish one canonical form, S/#HHH.  Keeping the DLL
+	; parser to that contract recovers scarce libman image bytes; stand-alone
+	; tools retain the permissive parser below for hand-written values.
+	LD	A,(HL)
+	CP	'/'
+	JR	NZ,.BAD
+	INC	HL
+	LD	A,(HL)
+	CP	'#'
+	JR	NZ,.BAD
+	INC	HL
+	LD	A,(HL)
+	SUB	'0'
+	CP	2
+	JR	C,.BAD
+	CP	4
+	JR	NC,.BAD
+	LD	D,A
+	INC	HL
+	LD	A,(HL)
+	CALL	@UTIL.PARSE_HEX_NIBBLE
+	JR	C,.BAD
+	BIT	0,A
+	JR	NZ,.BAD
+	RLCA
+	RLCA
+	RLCA
+	RLCA
+	LD	E,A
+	INC	HL
+	LD	A,(HL)
+	CP	'0'
+	JR	NZ,.BAD
+	INC	HL
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.BAD
+	LD	A,C
+	OR	A
+	RET
+	ELSE
 	LD	A,(HL)
 	CP	'/'
 	JR	NZ,.BAD
@@ -399,6 +612,7 @@ PARSE_HW_VALUE
 	LD	A,(.SLOT)
 	OR	A			; CF=0
 	RET
+	ENDIF
 .BAD
 	SCF
 	RET
@@ -488,6 +702,7 @@ WRITE_ENV_HW
 
 
 N_RTL_HW	DB "NET_RTL_HW",0
+	ENDIF
 
 	IFDEF	RTL_SOFT_RESET_SUPPORTED
 ; ------------------------------------------------------
@@ -519,6 +734,11 @@ READ_RESET_MODE
 	LD	A,RESET_MODE_DEFAULT
 	LD	(RTL_SOFT_RESET),A
 	LD	HL,N_RTL_RESET
+	IFDEF UNET_DLL
+	CALL	@NETENV.GET_RAW
+	RET	C
+	LD	A,(HL)
+	ELSE
 	LD	DE,NETENV_VAL_BUF
 	LD	B,ENV_GET
 	LD	C,DSS_ENVIRON
@@ -526,6 +746,7 @@ READ_RESET_MODE
 	OR	A			; A=0xFF found, 0 not
 	RET	Z			; not set -> keep the default
 	LD	A,(NETENV_VAL_BUF)
+	ENDIF
 	AND	0xDF			; crude upcase; 0 stays 0
 	RET	Z			; set but empty -> keep the default
 	; 'S' forces SOFT; anything else forces the board reset.  The
@@ -863,6 +1084,7 @@ ID1_RAW		DB 0
 ; ------------------------------------------------------
 ; SNAPSHOT_REGS: capture diagnostic registers in fixed order.
 ; ------------------------------------------------------
+	IFNDEF UNET_DLL
 SNAPSHOT_REGS
 	LD	IX,(RTL_BASE_PTR)
 	; Page 0 readable state.
@@ -902,6 +1124,7 @@ SNAPSHOT_REGS
 
 REG_SNAPSHOT	EQU RTL_REG_SNAPSHOT	; 10 bytes in runtime BSS
 REG_SNAPSHOT_LEN EQU 10
+	ENDIF
 
 	IFDEF USE_RTL_SNAPSHOT_TALLY
 ; ------------------------------------------------------
@@ -1112,7 +1335,7 @@ READ_PROM
 ; the only caller of this routine is the non-DLL SEND_FRAME body
 ; below, and nicram.asm.
 ; ------------------------------------------------------
-	IFNDEF	UNET_DLL
+	IFNDEF UNET_DLL
 DMA_WRITE
 	LD	IX,(RTL_BASE_PTR)
 	LD	(IX+RTL_CR_OFF),CR_PAGE0_START
@@ -1410,11 +1633,14 @@ INIT_NORMAL
 	; MAME but unstable on real DP8390/RTL8019AS hardware.
 	LD	(IX+RTL_RCR_OFF),RCR_MON
 	LD	(IX+RTL_TCR_OFF),TCR_LB_INTERNAL
-	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
-	LD	(IX+RTL_PSTART_OFF),RTL_PSTART_INIT
-	LD	(IX+RTL_PSTOP_OFF),RTL_PSTOP_INIT
-	LD	(IX+RTL_BNRY_OFF),RTL_BNRY_INIT
-	LD	A,RTL_BNRY_INIT
+	LD	A,(RTL_TPSR_PAGE)
+	LD	(IX+RTL_TPSR_OFF),A
+	LD	A,(RTL_PSTART_PAGE)
+	LD	(IX+RTL_PSTART_OFF),A
+	LD	A,(RTL_PSTOP_PAGE)
+	LD	(IX+RTL_PSTOP_OFF),A
+	LD	A,(RTL_PSTART_PAGE)
+	LD	(IX+RTL_BNRY_OFF),A
 	LD	(RTL_BNRY_SHADOW),A
 	LD	(IX+RTL_ISR_OFF),0xFF
 	LD	(IX+RTL_IMR_OFF),0
@@ -1434,15 +1660,16 @@ INIT_NORMAL
 	LD	D,A
 	LD	BC,6
 	LDIR
-	LD	(IX+RTL_CURR_OFF),RTL_CURR_INIT
-	LD	(IX+RTL_MAR0_OFF + 0),0
-	LD	(IX+RTL_MAR0_OFF + 1),0
-	LD	(IX+RTL_MAR0_OFF + 2),0
-	LD	(IX+RTL_MAR0_OFF + 3),0
-	LD	(IX+RTL_MAR0_OFF + 4),0
-	LD	(IX+RTL_MAR0_OFF + 5),0
-	LD	(IX+RTL_MAR0_OFF + 6),0
-	LD	(IX+RTL_MAR0_OFF + 7),0
+	LD	A,(RTL_PSTART_PAGE)
+	INC	A
+	LD	(IX+RTL_CURR_OFF),A
+	INC	DE			; LDIR left DE immediately after CURR
+	LD	B,8
+	XOR	A
+.CLR_MAR
+	LD	(DE),A
+	INC	DE
+	DJNZ	.CLR_MAR
 	LD	A,CR_PAGE0_START
 	CALL	SELECT_PAGE
 	LD	(IX+RTL_TCR_OFF),TCR_NORMAL
@@ -1471,11 +1698,14 @@ INIT_LOOPBACK
 	LD	(IX+RTL_RBCR1_OFF),0
 	LD	(IX+RTL_RCR_OFF),RCR_AB
 	LD	(IX+RTL_TCR_OFF),TCR_LB_INTERNAL
-	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
-	LD	(IX+RTL_PSTART_OFF),RTL_PSTART_INIT
-	LD	(IX+RTL_PSTOP_OFF),RTL_PSTOP_INIT
-	LD	(IX+RTL_BNRY_OFF),RTL_BNRY_INIT
-	LD	A,RTL_BNRY_INIT
+	LD	A,(RTL_TPSR_PAGE)
+	LD	(IX+RTL_TPSR_OFF),A
+	LD	A,(RTL_PSTART_PAGE)
+	LD	(IX+RTL_PSTART_OFF),A
+	LD	A,(RTL_PSTOP_PAGE)
+	LD	(IX+RTL_PSTOP_OFF),A
+	LD	A,(RTL_PSTART_PAGE)
+	LD	(IX+RTL_BNRY_OFF),A
 	LD	(RTL_BNRY_SHADOW),A
 	LD	(IX+RTL_ISR_OFF),0xFF
 	LD	(IX+RTL_IMR_OFF),0
@@ -1492,15 +1722,16 @@ INIT_LOOPBACK
 	LD	D,A
 	LD	BC,6
 	LDIR
-	LD	(IX+RTL_CURR_OFF),RTL_CURR_INIT
-	LD	(IX+RTL_MAR0_OFF + 0),0
-	LD	(IX+RTL_MAR0_OFF + 1),0
-	LD	(IX+RTL_MAR0_OFF + 2),0
-	LD	(IX+RTL_MAR0_OFF + 3),0
-	LD	(IX+RTL_MAR0_OFF + 4),0
-	LD	(IX+RTL_MAR0_OFF + 5),0
-	LD	(IX+RTL_MAR0_OFF + 6),0
-	LD	(IX+RTL_MAR0_OFF + 7),0
+	LD	A,(RTL_PSTART_PAGE)
+	INC	A
+	LD	(IX+RTL_CURR_OFF),A
+	INC	DE
+	LD	B,8
+	XOR	A
+.CLR_MAR
+	LD	(DE),A
+	INC	DE
+	DJNZ	.CLR_MAR
 	LD	A,CR_PAGE0_START
 	CALL	SELECT_PAGE
 	RET
@@ -1665,7 +1896,8 @@ SEND_FRAME_SG
 	LD	A,TX_DMA_TRIES
 	LD	(TX_RETRY_LEFT),A
 .DMA_ATTEMPT
-	LD	D,RTL_TPSR_INIT
+	LD	A,(RTL_TPSR_PAGE)
+	LD	D,A
 	LD	E,0
 	CALL	DMA_WRITE_SG
 	JR	C,.DMA_ERROR
@@ -1707,7 +1939,8 @@ SEND_FRAME_SG
 	; a single lost TPSR write at init would otherwise transmit the
 	; wrong packet-RAM page, with PTX reporting success, until the
 	; next INIT.
-	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
+	LD	A,(RTL_TPSR_PAGE)
+	LD	(IX+RTL_TPSR_OFF),A
 	; ISR is write-one-to-clear.  Clear BOTH terminal TX bits and
 	; read them back until clear.  The old code wrote PTX once and
 	; immediately polled it after TXP; a delayed or lost clear can let
@@ -1822,7 +2055,8 @@ SEND_FRAME
 	LD	(TX_RETRY_LEFT),A
 .DMA_ATTEMPT
 	LD	HL,(TX_SOURCE_PTR)
-	LD	D,RTL_TPSR_INIT
+	LD	A,(RTL_TPSR_PAGE)
+	LD	D,A
 	LD	E,0
 	LD	BC,(TX_LENGTH)
 	CALL	DMA_WRITE
@@ -1863,7 +2097,8 @@ SEND_FRAME
 	; a single lost TPSR write at init would otherwise transmit the
 	; wrong packet-RAM page, with PTX reporting success, until the
 	; next INIT.
-	LD	(IX+RTL_TPSR_OFF),RTL_TPSR_INIT
+	LD	A,(RTL_TPSR_PAGE)
+	LD	(IX+RTL_TPSR_OFF),A
 	; ISR is write-one-to-clear.  Clear BOTH terminal TX bits and
 	; read them back until clear.  The old code wrote PTX once and
 	; immediately polled it after TXP; a delayed or lost clear can let
@@ -1928,7 +2163,8 @@ VERIFY_TX_PREFIX
 	LD	(IX+RTL_RBCR0_OFF),C
 	LD	(IX+RTL_RBCR1_OFF),B
 	LD	(IX+RTL_RSAR0_OFF),0
-	LD	(IX+RTL_RSAR1_OFF),RTL_TPSR_INIT
+	LD	A,(RTL_TPSR_PAGE)
+	LD	(IX+RTL_RSAR1_OFF),A
 	LD	(IX+RTL_CR_OFF),CR_DMA_READ
 	CALL	DMA_SETTLE
 .COMPARE
@@ -2082,10 +2318,16 @@ RING_HAS_PACKET
 	; the wrong page (see RTL_BNRY_SHADOW in memmap.inc).
 	LD	A,(RTL_BNRY_SHADOW)
 	INC	A
-	CP	RTL_PSTOP_INIT
-	JR	C,.NW
-	LD	A,RTL_PSTART_INIT
-.NW
+	LD	D,A
+	LD	A,(RTL_PSTOP_PAGE)
+	CP	D
+	JR	C,.WRAP
+	JR	Z,.WRAP
+	LD	A,D
+	JR	.NW2
+.WRAP
+	LD	A,(RTL_PSTART_PAGE)
+.NW2
 	LD	B,A
 	; CURR lives on page 1.  Both page switches are read back: a lost
 	; switch to page 1 would return a page-0 register as CURR, a lost
@@ -2111,10 +2353,9 @@ RING_HAS_PACKET
 	; Validate CURR: on marginal silicon a register read can float to
 	; 0xFF (undriven ISA bus); an out-of-range CURR is such a glitch.
 	LD	A,C
-	CP	RTL_PSTART_INIT
+	CALL	VALID_RX_PAGE_A
 	JR	C,.GLITCH
-	CP	RTL_PSTOP_INIT
-	JR	NC,.GLITCH
+	LD	A,C
 	CP	B
 	RET	NZ			; frames queued -> drain before any recovery
 	; Ring empty.  If an overflow is latched the receive engine is
@@ -2256,10 +2497,16 @@ READ_PACKET_COMMON
 	; Compute hdr_addr = (BNRY+1)<<8 with PSTOP wrap.
 	LD	A,(RTL_BNRY_SHADOW)
 	INC	A
-	CP	RTL_PSTOP_INIT
-	JR	C,.NW
-	LD	A,RTL_PSTART_INIT
-.NW
+	LD	D,A
+	LD	A,(RTL_PSTOP_PAGE)
+	CP	D
+	JR	C,.WRAP
+	JR	Z,.WRAP
+	LD	A,D
+	JR	.NW2
+.WRAP
+	LD	A,(RTL_PSTART_PAGE)
+.NW2
 	LD	D,A
 	LD	E,0
 	LD	(.PKT_ADDR),DE
@@ -2325,7 +2572,9 @@ READ_PACKET_COMMON
 	INC	DE
 	LD	(.BODY_ADDR),DE
 	; remaining_in_ring = PSTOP*256 - body_addr.
-	LD	HL,RTL_PSTOP_INIT * 256
+	LD	A,(RTL_PSTOP_PAGE)
+	LD	H,A
+	LD	L,0
 	OR	A
 	SBC	HL,DE
 	LD	(.FIRST_LEN),HL
@@ -2365,7 +2614,9 @@ READ_PACKET_COMMON
 	LD	BC,(.FIRST_LEN)
 	ADD	HL,BC
 	POP	BC
-	LD	DE,RTL_PSTART_INIT * 256
+	LD	A,(RTL_PSTART_PAGE)
+	LD	D,A
+	LD	E,0
 	CALL	DMA_READ
 	RET	C
 .READ_DONE
@@ -2453,13 +2704,18 @@ COMMIT_PACKET
 
 ; VALID_RX_PAGE_A: CF=0 if A is in [PSTART, PSTOP), CF=1 otherwise.
 VALID_RX_PAGE_A
-	CP	RTL_PSTART_INIT
+	PUSH	HL
+	LD	HL,RTL_PSTART_PAGE
+	CP	(HL)
 	JR	C,.BAD
-	CP	RTL_PSTOP_INIT
+	INC	HL
+	CP	(HL)
 	JR	NC,.BAD
+	POP	HL
 	OR	A
 	RET
 .BAD
+	POP	HL
 	SCF
 	RET
 
@@ -2468,10 +2724,15 @@ VALID_RX_PAGE_A
 ; to RTL_BNRY_SHADOW.  Requires IX = base.
 SET_BNRY_FROM_NEXT_A
 	DEC	A
-	CP	RTL_PSTART_INIT
+	PUSH	HL
+	LD	HL,RTL_PSTART_PAGE
+	CP	(HL)
 	JR	NC,.OK
-	LD	A,RTL_PSTOP_INIT - 1
+	INC	HL
+	LD	A,(HL)
+	DEC	A
 .OK
+	POP	HL
 	LD	(RTL_BNRY_SHADOW),A
 	LD	(IX+RTL_BNRY_OFF),A
 	RET

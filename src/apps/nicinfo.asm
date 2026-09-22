@@ -82,6 +82,67 @@ START
 	CALL	@ISA.ISA_OPEN
 	CALL	@RTL.RESET
 	JP	C,RESET_OPEN_FAIL
+	CALL	@RTLDET.ENTER_PROBE_MODE
+	; NICINFO always performs the non-publishing RAM check.  This is the
+	; diagnostic exception to the normal rule that an explicit type is
+	; trusted: it lets the user detect a stale or wrong NET_RTL_TYPE.
+	CALL	@RTLDET.DETECT
+	JP	C,RESET_OPEN_FAIL
+	LD	(DET_RESULT),A
+	CALL	@ISA.ISA_CLOSE
+	PRINT MSG_TYPE
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_NE1000
+	JR	Z,.TYPE_NE2000
+	PRINT MSG_NE1000
+	JR	.TYPE_NAME_PRINTED
+.TYPE_NE2000
+	PRINT MSG_NE2000
+.TYPE_NAME_PRINTED
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_ENV
+	JR	Z,.TYPE_DEFAULT
+	PRINTLN MSG_TYPE_ENV
+	JR	.TYPE_PRINTED
+.TYPE_DEFAULT
+	PRINTLN MSG_TYPE_DEFAULT
+.TYPE_PRINTED
+	PRINT MSG_RAM
+	LD	A,(RTL_TPSR_PAGE)
+	CALL	@UTIL.PRINT_HEX_A
+	PRINT MSG_RAM_MID
+	LD	A,(RTL_PSTOP_PAGE)
+	DEC	A
+	CALL	@UTIL.PRINT_HEX_A
+	PRINTLN MSG_RAM_END
+	PRINT MSG_TYPE_PROBE
+	LD	A,(DET_RESULT)
+	CP	RTL_DET_NE1000
+	JR	Z,.PROBE_1000
+	CP	RTL_DET_NE2000
+	JR	Z,.PROBE_2000
+	CP	RTL_DET_AMBIGUOUS
+	JR	Z,.PROBE_AMBIG
+	PRINTLN MSG_UNKNOWN
+	JR	.NO_TYPE_PROBE
+.PROBE_1000
+	PRINTLN MSG_NE1000
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_NE1000
+	JR	NZ,.NO_TYPE_PROBE
+	PRINTLN MSG_W_TYPE
+	JR	.NO_TYPE_PROBE
+.PROBE_2000
+	PRINTLN MSG_NE2000
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_NE1000
+	JR	Z,.NO_TYPE_PROBE
+	PRINTLN MSG_W_TYPE
+	JR	.NO_TYPE_PROBE
+.PROBE_AMBIG
+	PRINTLN MSG_AMBIG
+.NO_TYPE_PROBE
+	CALL	@ISA.ISA_OPEN
 
 	; Mandatory: DCR=0x48 via the runtime base.
 	LD	IX,(RTL_BASE_PTR)
@@ -97,6 +158,8 @@ START
 	LD	HL,PROM_BUF
 	CALL	@RTL.READ_PROM
 	JP	C,PROM_OPEN_FAIL
+	CALL	@RTLDET.STOP_AND_CHECK
+	JP	C,RESET_OPEN_FAIL
 	CALL	@RTL.SNAPSHOT_REGS
 	CALL	CAPTURE_PAGE3
 	CALL	@ISA.ISA_CLOSE
@@ -243,10 +306,20 @@ SIG_WARN
 	DSS_RETURN EX_OK
 
 ID_BAD
+	; A classic NE1000 has no RTL8019 extension ID.  Once the RAM probe (or,
+	; for an inconclusive probe, the selected type) identifies NE1000, the
+	; missing Pp signature is expected and must not be reported as a fault.
+	CALL	TYPE_EVIDENCE_NE1000
+	JR	Z,.NE1000_ID
 	PRINTLN MSG_E_ID
 	CALL	VALIDATE_MAC
 	JR	C,NO_HW
 	PRINTLN MSG_W_NO_ID
+	PRINTLN MSG_RESULT_OK
+	DSS_RETURN EX_OK
+.NE1000_ID
+	CALL	VALIDATE_MAC
+	JR	C,NO_HW
 	PRINTLN MSG_RESULT_OK
 	DSS_RETURN EX_OK
 
@@ -265,6 +338,8 @@ PROM_FAIL
 	DSS_RETURN EX_NIC_ERR
 
 SCAN_FAIL
+	CP	RTL_INIT_BAD_TYPE
+	JR	Z,BAD_TYPE
 	; The default base 0x300 did not respond.  Either the card
 	; is missing entirely or it is jumpered to one of the
 	; alternates -- which one (if any) the user can read off the
@@ -273,6 +348,11 @@ SCAN_FAIL
 	PRINTLN MSG_E_SCAN
 	PRINTLN MSG_RESULT_FAIL
 	DSS_RETURN EX_NO_HW
+
+BAD_TYPE
+	PRINTLN MSG_E_BAD_TYPE
+	PRINTLN MSG_RESULT_FAIL
+	DSS_RETURN EX_CFG_ERR
 
 RESET_OPEN_FAIL
 	CALL	@ISA.ISA_CLOSE
@@ -522,37 +602,84 @@ PRINT_HEX_NIBBLE
 	JR	PUTCHAR
 
 ; ------------------------------------------------------
-; DETECT_LAYOUT: A = 0 direct, 1 doubled, 2 unknown.
+; DETECT_LAYOUT: A = 0 direct, 1 doubled, 2 unknown/ambiguous.
+; Check all 16 physical pairs.  When both byte interpretations remain
+; plausible, use an unambiguous RAM probe as the primary evidence and the
+; selected layout only as a fallback.  In particular, 00:00 OUIs are not
+; mistaken for a doubled PROM merely because the first pairs are equal.
 ; ------------------------------------------------------
 DETECT_LAYOUT
 	LD	HL,PROM_BUF
+	LD	B,16
+.PAIR
 	LD	A,(HL)
 	INC	HL
 	CP	(HL)
-	JR	NZ,.NOT_DOUBLED
+	JR	NZ,.DIRECT
 	INC	HL
-	LD	A,(HL)
-	INC	HL
-	CP	(HL)
-	JR	NZ,.NOT_DOUBLED
-	INC	HL
-	LD	A,(HL)
-	INC	HL
-	CP	(HL)
-	JR	NZ,.NOT_DOUBLED
+	DJNZ	.PAIR
+	; All physical pairs match.  Mark which logical signature sites are
+	; valid: bit 0 direct, bit 1 doubled.
+	XOR	A
+	LD	C,A
+	LD	A,(PROM_BUF+14)
+	LD	D,A
+	LD	A,(PROM_BUF+15)
+	CP	D
+	JR	NZ,.SIG_X
+	CP	0x57
+	JR	Z,.SET_D
+	CP	0x42
+	JR	NZ,.SIG_X
+.SET_D
+	SET	0,C
+.SIG_X
+	LD	A,(PROM_BUF+28)
+	LD	D,A
+	LD	A,(PROM_BUF+30)
+	CP	D
+	JR	NZ,.REDUCE
+	CP	0x57
+	JR	Z,.SET_X
+	CP	0x42
+	JR	NZ,.REDUCE
+.SET_X
+	SET	1,C
+.REDUCE
+	LD	A,C
+	CP	1
+	JR	Z,.DIRECT
+	CP	2
+	JR	NZ,.NO_UNIQUE_SIG
+	CALL	TYPE_EVIDENCE_NE1000
+	LD	A,2
+	RET	Z			; NE1000 contradicts doubled-only PROM
 	LD	A,1
 	RET
-.NOT_DOUBLED
-	LD	A,(PROM_BUF + 0x0E)
-	CP	0x57
-	JR	NZ,.UNK
-	LD	A,(PROM_BUF + 0x0F)
-	CP	0x57
-	JR	NZ,.UNK
+.NO_UNIQUE_SIG
+	CALL	TYPE_EVIDENCE_NE1000
+	LD	A,2
+	RET	NZ
+.DIRECT
 	XOR	A
 	RET
-.UNK
-	LD	A,2
+
+; Z means the best available type evidence says NE1000.  Prefer the
+; diagnostic probe when it was unambiguous, otherwise use selected layout.
+TYPE_EVIDENCE_NE1000
+	LD	A,(DET_RESULT)
+	CP	RTL_DET_NE1000
+	RET	Z
+	CP	RTL_DET_NE2000
+	JR	Z,.NO
+	LD	A,(RTL_CARD_FLAGS)
+	AND	RTL_LAYOUT_FLAG_NE1000
+	JR	Z,.NO
+	XOR	A
+	RET
+.NO
+	LD	A,1
+	OR	A
 	RET
 
 BUILD_DOUBLED_MAC
@@ -852,6 +979,17 @@ MSG_BANNER	DB "RTL8019AS NICINFO v",PACKAGE_VERSION,0
 MSG_N0		DB "[N0] Slot/Addr: ",0
 MSG_N0_SEP	DB "/#",0
 MSG_N1		DB "[N1] RESET ",0
+MSG_TYPE	DB "[N0T] CARD_TYPE=",0
+MSG_NE1000	DB "NE1000",0
+MSG_NE2000	DB "NE2000",0
+MSG_TYPE_ENV	DB " (env)",0
+MSG_TYPE_DEFAULT DB " (default, NET_RTL_TYPE not set)",0
+MSG_RAM	DB "[N0R] RAM=",0
+MSG_RAM_MID	DB "00..",0
+MSG_RAM_END	DB "FF",0
+MSG_TYPE_PROBE	DB "[N0P] TYPE_PROBE=",0
+MSG_AMBIG	DB "ambiguous",0
+MSG_E_BAD_TYPE	DB "[E] env var NET_RTL_TYPE missing or invalid; run NETCFG -i",0
 MSG_OK		DB "OK",0
 MSG_N2		DB "[N2] CR=",0
 MSG_ISR_EQ	DB " ISR=",0
@@ -907,6 +1045,7 @@ MSG_W_NO_ID	DB "[W02] ID mismatch but MAC plausible -- continuing",0
 MSG_W_FUDUP	DB "[W03] FUDUP=1: peer switch port must be forced 10M/full",0
 MSG_W_MEDIA	DB "[W04] selected medium is not UTP; check PL/link/cable",0
 MSG_W_PWRDN	DB "[W05] PWRDN=1: Ethernet transceiver is disabled",0
+MSG_W_TYPE	DB "[W06] NET_RTL_TYPE disagrees with RAM probe; run NETCFG -i",0
 MSG_SCAN_HDR	DB "Scan: ",0
 MSG_SCAN_INDENT	DB "      ",0
 MSG_SCAN_OK	DB "ok ",0
@@ -926,6 +1065,8 @@ LINE_END	DB 13,10,0
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
+	DEFINE USE_RTL_DETECT
+	INCLUDE "rtl_detect.asm"
 
 
 ; Root-scope marker at end of emitted image (size diagnostics only).
@@ -944,7 +1085,8 @@ MAC_BUF		EQU PROM_BUF + 32
 LAYOUT		EQU MAC_BUF + 6
 CR_RAW		EQU LAYOUT + 1
 ISR_RAW		EQU CR_RAW + 1
-P3_9346		EQU ISR_RAW + 1
+DET_RESULT	EQU ISR_RAW + 1
+P3_9346		EQU DET_RESULT + 1
 P3_CFG0		EQU P3_9346 + 1
 P3_CFG1		EQU P3_CFG0 + 1
 P3_CFG2		EQU P3_CFG1 + 1

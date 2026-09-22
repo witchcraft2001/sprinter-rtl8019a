@@ -91,6 +91,7 @@ LOAD_FILL	EQU NETCFG_LOAD_FILL
 LOAD_SKIP	EQU NETCFG_LOAD_SKIP
 OUR_RTL_HW	EQU NETCFG_OUR_RTL_HW
 OUR_RTL_RESET	EQU NETCFG_OUR_RTL_RESET
+OUR_RTL_TYPE	EQU NETCFG_OUR_RTL_TYPE
 PATH_BUF	EQU NETCFG_PATH_BUF
 
 
@@ -315,6 +316,8 @@ APPLY_DEFAULTS
 	; ID whether the board reset port at BASE+0x1F may be touched.
 	LD	A,RTL_RESET_AUTO
 	LD	(OUR_RTL_RESET),A
+	XOR	A
+	LD	(OUR_RTL_TYPE),A
 	RET
 
 ; Hardcoded defaults applied BEFORE NET.CFG parsing.  If NET.CFG
@@ -422,19 +425,22 @@ PARSE
 	JR	Z,.GATEWAY
 	LD	DE,.K_DNS1
 	CALL	@UTIL.STARTSWITH
-	JR	Z,.DNS1
+	JP	Z,.DNS1
 	LD	DE,.K_DNS2
 	CALL	@UTIL.STARTSWITH
-	JR	Z,.DNS2
+	JP	Z,.DNS2
 	LD	DE,.K_MAC
 	CALL	@UTIL.STARTSWITH
-	JR	Z,.MAC
+	JP	Z,.MAC
 	LD	DE,.K_HW
 	CALL	@UTIL.STARTSWITH
 	JP	Z,.HW
 	LD	DE,.K_RESET
 	CALL	@UTIL.STARTSWITH
 	JP	Z,.RESET
+	LD	DE,.K_TYPE
+	CALL	@UTIL.STARTSWITH
+	JP	Z,.TYPE
 	LD	DE,.K_TZ
 	CALL	@UTIL.STARTSWITH
 	JP	Z,.TZ
@@ -551,6 +557,16 @@ PARSE
 	LD	B,31
 	CALL	COPY_VALUE
 	JP	.LINE
+.TYPE
+	LD	BC,9			; len("RTL_TYPE=")
+	ADD	HL,BC
+	LD	DE,OUR_RTL_TYPE
+	LD	B,7
+	CALL	COPY_VALUE
+	PUSH	HL			; COPY_VALUE left the parser on the next line
+	CALL	NORMALIZE_RTL_TYPE
+	POP	HL
+	JP	.LINE
 
 .K_IP		DB "IP=",0
 .K_NETMASK	DB "NETMASK=",0
@@ -560,8 +576,71 @@ PARSE
 .K_MAC		DB "RTL_MAC=",0
 .K_HW		DB "RTL_HW=",0
 .K_RESET	DB "RTL_RESET=",0
+.K_TYPE		DB "RTL_TYPE=",0
 .K_TZ		DB "TZ=",0
 .K_NTP		DB "NTP=",0
+
+; NORMALIZE_RTL_TYPE: accept NE1000/NE2000 in any case and store the
+; canonical spelling.  Unknown values mean AUTO (empty field); INIT_BASE
+; therefore never silently selects a layout for a typo in NET.CFG.
+NORMALIZE_RTL_TYPE
+	LD	HL,OUR_RTL_TYPE
+	LD	DE,.T1000
+	CALL	.MATCH
+	JR	Z,.STORE1000
+	LD	HL,OUR_RTL_TYPE
+	LD	DE,.T2000
+	CALL	.MATCH
+	JR	Z,.STORE2000
+	; Preserve an unknown token so INIT_BASE can reject it explicitly;
+	; silently converting a typo to AUTO would hide a configuration error.
+	RET
+.STORE1000
+	LD	HL,.T1000
+	LD	DE,OUR_RTL_TYPE
+	LD	BC,7
+	LDIR
+	RET
+.STORE2000
+	LD	HL,.T2000
+	LD	DE,OUR_RTL_TYPE
+	LD	BC,7
+	LDIR
+	RET
+.MATCH
+	; DE points to a six-character canonical token plus NUL.
+	PUSH	HL
+	PUSH	DE
+	LD	B,6
+.MLP
+	LD	A,(HL)
+	CP	'a'
+	JR	C,.MCMP
+	CP	'z'+1
+	JR	NC,.MCMP
+	AND	0xDF
+.MCMP
+	LD	C,A
+	LD	A,(DE)
+	CP	C
+	JR	NZ,.MFAIL
+	INC	HL
+	INC	DE
+	DJNZ	.MLP
+	LD	A,(HL)
+	OR	A
+	JR	NZ,.MFAIL
+	XOR	A
+	POP	DE
+	POP	HL
+	RET
+.MFAIL
+	POP	DE
+	POP	HL
+	OR	1
+	RET
+.T1000	DB "NE1000",0
+.T2000	DB "NE2000",0
 
 
 ; ------------------------------------------------------

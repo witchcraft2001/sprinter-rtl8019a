@@ -9,6 +9,13 @@ Brings the network interface up.  Behaviour depends on
   REQUEST -> ACK), then `SETENV`s `NET_IP`, `NET_MASK`, `NET_GW`,
   `NET_DNS1`, `NET_DNS2`, `NET_DHCP_SRV`, `NET_LEASE_SEC`.
 
+If `NET_RTL_TYPE` is absent, IFUP first probes the `2000h` and `4000h`
+packet-RAM windows. An unambiguous result is published as `NE1000` or
+`NE2000`; ambiguous/unknown results use the NE2000 fallback without
+publishing a type. A remote-DMA failure is fatal: IFUP prints `[E07]` (or
+`[E08]` if the controller no longer responds), exits 3, and does not set
+`NET=RTL`.
+
 ## Usage
 
 ```
@@ -39,6 +46,6 @@ later iteration.
 | 0    | OK                                                   |
 | 1    | Usage                                                |
 | 2    | RTL8019AS not detected                               |
-| 3    | DHCP timeout / cancel                                |
+| 3    | NIC/DMA failure, DHCP timeout, or cancel             |
 | 4    | Config (`NET_MAC` missing, or `NET_IP` missing in    |
 |      | static mode)                                         |
