@@ -131,13 +131,12 @@ TCP_MSS		EQU 536			; SEND chunk size, hidden by the ABI
 ; Measured worst case: "RTL hw=0/#0300 st=NETINIT nerr=09 tcp=00
 ; res=00 tx=04/02/03/22" + NUL is 63 bytes (NETINIT/CONNECT/UDPOPEN/
 ; RESOLVE tie for the longest stage mnemonic at 7 chars; see ST_*
-; below).  72 keeps a real but tighter margin (image budget -- see
-; the BUILD_TCP_PORTS_SEQ dedup below for the same reason).  The
+; below). 64 holds every complete diagnostic including its NUL. The
 ; trailing " regs=..." CR/ISR/DCR/RCR/TCR/IMR/PSTART/PSTOP/BNRY/CURR
 ; dump this string used to carry was dropped for LISTEN's image
 ; budget (see CAPTURE_DIAG/BUILD_LASTERR); every EXE utility still
 ; prints that dump directly via its own @RTL.SNAPSHOT_REGS call.
-LASTERR_SIZE	EQU 72
+LASTERR_SIZE	EQU 64
 
 	ORG 0x0000			; the ONLY ORG; mkdll rewrites it
 DLL_IMAGE_ORIGIN	EQU $
@@ -178,61 +177,46 @@ DLL_IMAGE_ORIGIN	EQU $
 ; In-image BSS.  Placed immediately after the jump table so every
 ; symbol derived from it is a BACKWARD reference by the time
 ; memmap.inc and the libraries are assembled - no forward-referenced
-; EQU chains for mkdll's two-pass byte diff to trip over.
+;	EQU	chains for mkdll's two-pass byte diff to trip over.
 ;
-; Offsets are literals on purpose (see the layout notes above).  The
-; region sizes come from memmap.inc: LIBBSS_SIZE 0x17C, resolve 0x29,
-; tcp 0x35, udp 0x18, icmp 0x10.
-; ======================================================
-; TX_BUF/RX_BUF sizes below assume zero-copy TX (SEND_FRAME_SG in
-; rtl8019.asm, IFDEF UNET_DLL): UDP/TCP-data payloads stream straight
-; from the caller's own buffer and are never copied into TX_BUF, so
-; TX_BUF only needs to hold the largest frame still built whole.  With the
-; DLL's 128-byte host-name limit a DNS query is at most 188 bytes
-; (Ethernet+IPv4+UDP+DNS+encoded name); keep 192 bytes for alignment/margin.
-; RX_BUF grows to the standard IPv4 MTU (14+20+8+1472=1514) now that
-; TX_BUF's shrink pays for it inside the libman 0x38C7 image budget.
-; BSS_TCP grew 0x035->0x037 (TCP_ADV_WIN_HI/LO, see memmap.inc) --
-; every offset from BSS_UDP onward shifted +2 accordingly.  BSS_LASTERR
-; shrank 0x080->0x070 (LASTERR_SIZE 128->112, see its declaration) --
-; every offset from BSS_TX_BUF onward shifted a further -16.  BSS_TCP
-; grew AGAIN 0x037->0x039 (TCP_ATTEMPT_MS_LEFT, ASYNCSEND) -- every
-; offset from BSS_UDP onward shifted a further +2.  BSS_COLD_CTX was
-; then added after BSS_PEND_BUF (WIN0COLD.RUN's parameter block,
-; CCTX_SIZE bytes) and BSS_LASTERR shrank AGAIN 0x070->0x048
-; (LASTERR_SIZE 112->72: dropped the " regs=..." NIC-register dump,
-; see BUILD_LASTERR) -- every offset from BSS_TX_BUF onward shifted a
-; further -40.
-; BSS_CH_TCP is SELECT_CHANNEL's swap slot: TCP_STATE..+TCP_CTX_SIZE
-; plus TCP_ACK_WAIT_STATE..+TCP_SWAP_TAIL_SIZE = 38+15 = 53 (0x35).
-; It must track those two constants, NOT TCP_BSS_SIZE -- the tail of
-; the TCP BSS past TCP_ATTEMPT_MS_LEFT (TCP_ADV_WIN_HI/LO) is
-; session-global and stays out of the swap.  The ASSERT after
-; INCLUDE "memmap.inc" enforces the relationship; see the two
-; incidents it now covers in TCP_ADV_WIN_HI's memmap.inc comment.
-BSS_LIB		EQU 0x0000		; 0x17C util + rtl + netenv + rtl tx + SG desc
-BSS_RESOLVE	EQU 0x017C		; 0x029 resolve_lib
-BSS_TCP		EQU 0x01A5		; 0x039 tcp_lib
-BSS_UDP		EQU 0x01DE		; 0x018 udp_lib
-BSS_ICMP	EQU 0x01F6		; 0x010 icmp_lib
-BSS_OUR_IP	EQU 0x0206		; 4
-BSS_OUR_MAC	EQU 0x020A		; 6
-BSS_CANCELLED	EQU 0x0210		; 1
-BSS_LASTERR_FROZEN EQU 0x0211		; 1: LASTERR_BUF holds a failed call's frozen line
-BSS_LASTERR	EQU 0x0212		; 0x048 formatted diagnostic line
-BSS_TX_BUF	EQU 0x025A		; 0x0C0 192-byte whole-frame scratch
-BSS_RX_HDR	EQU 0x031A		; 4     NE2000 RX ring header
-BSS_RX_BUF	EQU 0x031E		; 0x5EA 1514 = 14+20+8+1472 (standard UDP MTU)
-BSS_CH_TCP	EQU 0x0908		; 0x35 inactive TCP context (salt + adv-win excluded)
-BSS_CH_UDP	EQU 0x093D		; 0x18 inactive-channel UDP context
-BSS_PEND_LEN	EQU 0x0955		; 2 words
-BSS_PEND_OFF	EQU 0x0959		; 2 words
-BSS_CLOSED	EQU 0x095D		; 2 bytes
-BSS_LOST	EQU 0x095F		; 2 bytes
-BSS_PEND_BUF	EQU 0x0961		; 2 * 536-byte TCP receive queues
-BSS_COLD_CTX	EQU 0x0D91		; CCTX_SIZE (18): WIN0COLD.RUN parameter block
-DLL_BSS_SIZE	EQU 0x0DA3		; 3491 total
-	ASSERT	BSS_TX_BUF + 0x0C0 <= BSS_RX_HDR
+; Offsets and sizes are literals for mkdll's relocation model.
+; Environment values borrow RX_BUF only outside live frame processing.
+; LIBBSS therefore holds util/driver scratch (104 bytes), not a private
+; 256-byte environment buffer. TCP data survives in the two 536-byte queues.
+; Zero-copy TX needs 60 bytes for persistent TCP/UDP/ARP headers.
+; DNS, the fixed 32-byte PING and INIT scratch may borrow adjacent RX
+; storage only before polling frames. DNS rebuilds every retry from the
+; original name/XID; a received frame never supplies retransmit storage.
+; RX remains 1514 bytes for a maximum UDP datagram. No additional page is allocated
+; for SEND/persist. CH_TCP holds both swap slices: 38 + 34 = 72 bytes;
+; the advertised local receive window stays global outside those slices.
+BSS_LIB	EQU 0x0000	; 104 bytes
+BSS_RESOLVE	EQU 0x0068	; 41 bytes
+BSS_TCP	EQU 0x0091	; 76 bytes
+BSS_UDP	EQU 0x00DD	; 24 bytes
+BSS_ICMP	EQU 0x00F5	; 16 bytes
+BSS_OUR_IP	EQU 0x0105	; 4 bytes
+BSS_OUR_MAC	EQU 0x0109	; 6 bytes
+BSS_CANCELLED	EQU 0x010F	; 1 bytes
+BSS_LASTERR_FROZEN	EQU 0x0110	; 1 bytes
+BSS_LASTERR	EQU 0x0111	; 64 bytes
+BSS_TX_BUF	EQU 0x0151	; 60 bytes
+BSS_RX_HDR	EQU 0x018D	; 4 bytes
+BSS_RX_BUF	EQU 0x0191	; 1514 bytes
+BSS_CH_TCP	EQU 0x077B	; 72 bytes
+BSS_CH_UDP	EQU 0x07C3	; 24 bytes
+BSS_PEND_LEN	EQU 0x07DB	; 4 bytes
+BSS_PEND_OFF	EQU 0x07DF	; 4 bytes
+BSS_CLOSED	EQU 0x07E3	; 2 bytes
+BSS_LOST	EQU 0x07E5	; 2 bytes
+BSS_PEND_BUF	EQU 0x07E7	; 1072 bytes
+BSS_COLD_CTX	EQU 0x0C17	; 18 bytes
+DLL_BSS_SIZE EQU 0x0C29
+	ASSERT BSS_TX_BUF + 60 == BSS_RX_HDR
+	ASSERT BSS_RX_HDR + 4 == BSS_RX_BUF
+	; PEND_CLEAR_A walks between these fields with fixed INC HL steps.
+	ASSERT BSS_PEND_OFF == BSS_PEND_LEN + 4
+	ASSERT BSS_LOST == BSS_CLOSED + 2
 
 DLL_BSS
 	DS	DLL_BSS_SIZE, 0
@@ -250,7 +234,8 @@ ICMP_BSS_BASE		EQU DLL_BSS + BSS_ICMP
 	; DNS query maximum: Ethernet/IP/UDP (42), DNS header (12), an
 	; encoded <=128-byte name (at most input+2), and QTYPE/QCLASS (4).
 DLL_DNS_FRAME_MAX	EQU 42 + 12 + MAX_HOST_LEN + 2 + 4
-	ASSERT	DLL_DNS_FRAME_MAX <= 0x0C0
+	ASSERT	DLL_DNS_FRAME_MAX <= 60 + 4 + 128
+	ASSERT 14 + 20 + 8 + 32 <= 60 + 4 + 128 ; PING builds before live RX
 	; CH_TCP_CTX must hold SELECT_CHANNEL's full two-slice swap or the
 	; second SWAP_BYTES call overruns into CH_UDP_CTX -- which the same
 	; call is swapping too, so both get corrupted on every channel
@@ -279,7 +264,7 @@ CH_TCP_CTX	EQU DLL_BSS + BSS_CH_TCP	; inactive channel swap slot
 CH_UDP_CTX	EQU DLL_BSS + BSS_CH_UDP	; inactive channel swap slot
 CH_PEND_LEN	EQU DLL_BSS + BSS_PEND_LEN
 CH_PEND_OFF	EQU DLL_BSS + BSS_PEND_OFF
-CH_CLOSED	EQU DLL_BSS + BSS_CLOSED
+CH_CLOSED	EQU DLL_BSS + BSS_CLOSED ; 0 live, 1 peer FIN, 2 terminal SEND failure
 CH_LOST		EQU DLL_BSS + BSS_LOST
 CH_PEND_BUF	EQU DLL_BSS + BSS_PEND_BUF
 CH_PEND_SIZE	EQU 536
@@ -371,6 +356,7 @@ INIT
 ; Function 1 - FINI (libman free hook).
 ; ------------------------------------------------------
 FINI
+	CALL	CANCEL_PENDING
 	; Unarm any active listener before tearing down both channels --
 	; otherwise RELEASE_OR_REARM would re-arm an accepted connection's
 	; listener right as the DLL is being unloaded.
@@ -391,8 +377,8 @@ F_GETCAPS
 
 ; ------------------------------------------------------
 ; Function 3 - NETINIT.  Bring the card up.
-; NERR_BUSY is never returned on this backend: there is no remote
-; firmware that can still be warming up.
+; NERR_BUSY protects a suspended SEND; there is no remote firmware
+; that can still be warming up.
 ; ------------------------------------------------------
 F_NETINIT
 	CALL	CHECK_ASYNC_PEND
@@ -463,15 +449,20 @@ F_NETINIT
 ; Function 8 - CLOSE / Function 4 - NETDONE (shared tail).
 ; ------------------------------------------------------
 F_CLOSE
-	CALL	CHECK_ASYNC_PEND
-	JP	C,RET_BUSY
 	CALL	CHECK_CHANNEL
 	JP	C,RET_PARAM
+	LD	A,(APEND_CH)
+	CP	0xFF
+	JR	Z,.close
+	LD	HL,ARG_CH
+	CP	(HL)
+	JP	NZ,RET_BUSY
+	CALL	CANCEL_PENDING
+.close
 	CALL	CLOSE_CHANNEL
 	JP	RET_A
 F_NETDONE
-	CALL	CHECK_ASYNC_PEND
-	JP	C,RET_BUSY
+	CALL	CANCEL_PENDING
 	; Unarm any active listener before tearing down both channels --
 	; otherwise RELEASE_OR_REARM would re-arm an accepted connection's
 	; listener right as the network is being taken down.
@@ -531,6 +522,7 @@ F_CONNECT
 	LD	(TCP_REMOTE_PORT_LO),A
 	XOR	A
 	LD	(TCP_STATE),A			; force CLOSED before OPEN
+	LD	(TCP_ABORTED),A
 	CALL	@ISA.ISA_OPEN
 	CALL	@TCP.OPEN
 	JR	C,.fail
@@ -606,12 +598,16 @@ F_SEND
 	JR	C,.fail
 	JR	.after_send
 .fresh_send
+	LD	A,(TCP_ABORTED)
+	OR	A
+	JP	NZ,SEND_CLOSED
 	LD	HL,(ARG_DE)
 	LD	BC,(ARG_IX)
 	CALL	CHECK_BUF_RANGE
 	JP	C,RET_PARAM
 	LD	HL,0
 	LD	(SEND_DONE),HL
+	CALL	@TCP.SEND.SLICE	; one budget for the complete public call
 	CALL	@ISA.ISA_OPEN
 .chunk
 	LD	HL,(ARG_IX)
@@ -653,6 +649,16 @@ F_SEND
 	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_AGAIN
 	JR	Z,.suspend
+	CP	@TCP.F_RST
+	JR	Z,.peer_end
+	; Includes an accepted FIN leaving a non-covering ACK: keep its queued
+	; response, but never let a fresh SEND overwrite the range still in flight.
+	LD	A,1
+	LD	(TCP_ABORTED),A
+	LD	A,(ARG_CH)
+	CALL	CLOSED_ADDR_A
+	LD	(HL),2
+.peer_end
 	CALL	SEND_PROGRESS
 	PUSH	DE
 	CALL	CAPTURE_AND_CLOSE
@@ -680,7 +686,7 @@ F_SEND
 	LD	A,NERR_AGAIN
 	JP	RET_A
 .udp
-	; One datagram; the cap is set by TX_BUF, not by the protocol.
+	; One MTU-bounded datagram; only its header uses TX scratch.
 	LD	HL,UDPLIB_MAX_PAYLOAD
 	LD	DE,(ARG_IX)
 	OR	A
@@ -704,19 +710,15 @@ F_SEND
 	LD	A,NERR_SEND
 	JP	RET_A
 
+SEND_CLOSED
+	LD	DE,0
+	LD	A,NERR_CLOSED
+	JP	RET_A
+
 ; Confirmed progress includes a partial ACK within the current MSS chunk.
 ; The subtraction is modulo 65536: each outstanding segment is <= 536 bytes.
 SEND_PROGRESS
-	LD	A,(TCP_SND_UNA+3)
-	LD	L,A
-	LD	A,(TCP_SND_UNA+2)
-	LD	H,A
-	LD	A,(TCP_SEND_SEQ+3)
-	LD	E,A
-	LD	A,(TCP_SEND_SEQ+2)
-	LD	D,A
-	OR	A
-	SBC	HL,DE
+	CALL	@TCP.SEND.PROGRESS
 	LD	DE,(SEND_DONE)
 	ADD	HL,DE
 	EX	DE,HL
@@ -755,10 +757,15 @@ RECV_IMPL
 	LD	A,(APEND_CH)
 	CP	0xFF
 	JR	Z,.not_suspended
-	; A SEND is suspended (on this channel or the other): the link
-	; belongs to it until it resumes.  Serve only already-buffered
-	; pending data, memory-only, and return immediately -- RECV must
-	; never touch the NIC while a send transaction is pending.
+	LD	HL,ARG_CH
+	CP	(HL)
+	JR	Z,.pending_only
+	CALL	GET_CH_STATE
+	CP	2
+	JR	Z,.not_suspended		; drain the other channel's UDP head
+.pending_only
+	; TCP ACKs belong to the suspended SEND and its byte-count result.
+	; Other TCP receives remain memory-only until that SEND resumes.
 	LD	HL,0
 	LD	(COPY_LEN),HL
 	CALL	COPY_PENDING_ARG
@@ -774,6 +781,21 @@ RECV_IMPL
 	CP	2
 	JP	Z,.udp
 	; -- TCP --
+	LD	A,(TCP_ABORTED)
+	OR	A
+	JR	Z,.live_tcp
+	LD	HL,0
+	LD	(COPY_LEN),HL
+	CALL	COPY_PENDING_ARG
+	LD	DE,(COPY_LEN)
+	LD	A,D
+	OR	E
+	LD	A,NERR_CLOSED
+	JP	Z,.zero_return
+	CALL	BUILD_RECV_FLAGS
+	LD	DE,(COPY_LEN)
+	JP	RET_OK
+.live_tcp
 	; A failed cumulative ACK from the preceding drain is retried before
 	; touching the pending data or the NIC.  The debt is per-channel because
 	; RECV_UNACKED is part of the swapped TCP context.
@@ -897,14 +919,11 @@ RECV_IMPL
 	LD	IX,0
 	JP	RET_A
 .reset_by_peer
-	LD	A,(ARG_CH)
-	CALL	CLOSED_ADDR_A
-	LD	(HL),1
-	LD	HL,(COPY_LEN)
-	LD	A,H
-	OR	L
-	JR	NZ,.return_drain
-	JR	.report_closed
+	CALL	RELEASE_WITH_PENDING
+	LD	DE,(COPY_LEN)		; bytes already copied remain visible with CLOSED
+	CALL	BUILD_RECV_FLAGS
+	LD	A,NERR_CLOSED
+	JP	RET_A
 .cancelled
 	XOR	A
 	LD	(@MAIN.CANCELLED),A
@@ -1078,6 +1097,9 @@ RECV_IMPL
 ; so the next public RECV can retry it.
 ; ------------------------------------------------------
 FLUSH_RECV_ACK
+	LD	A,(TCP_STATE)
+	OR	A
+	RET	Z				; peer reset: never advertise another receive window
 	LD	A,0xFF
 	LD	(RX_DIRECT_CH),A
 	LD	A,(ACTIVE_CH)
@@ -1286,6 +1308,13 @@ F_STATUS
 	LD	DE,UNET_ST_LISTEN
 .check_pending
 	LD	A,(ARG_CH)
+	CALL	CLOSED_ADDR_A
+	LD	A,(HL)
+	CP	2
+	JR	NZ,.connection_live
+	RES	1,E
+.connection_live
+	LD	A,(ARG_CH)
 	CALL	PEND_HAS_A
 	JR	Z,.status_done
 	LD	A,E
@@ -1491,7 +1520,7 @@ F_PING
 ; ------------------------------------------------------
 ; Functions 13 / 14 - RXPAUSE / RXRESUME.
 ;
-; Genuine no-ops: the card buffers receive in its own ~14.5 KB ring
+; Genuine no-ops: the card buffers receive in its own ~6.4 KB byte-mode ring
 ; and there is no flow-control state a consumer could get wrong.
 ; They return NERR_OK even before NETINIT - UNETESP returns
 ; NERR_STATE there because its UART base is not yet known, but
@@ -1796,7 +1825,7 @@ CHECK_CHANNEL
 
 ; ------------------------------------------------------
 ; CHECK_ASYNC_PEND: refuse every transmitting/state-changing call
-; except the resuming SEND itself while a SEND transaction is
+; except the resuming SEND and explicit cancellation while a SEND is
 ; suspended.  Completing the transaction from another call would
 ; lose its byte-count result, and a later SEND retry would duplicate
 ; stream bytes; see F_SEND's resume path.
@@ -1815,14 +1844,28 @@ CHECK_ASYNC_PEND
 	SCF
 	RET
 
+; CLOSE on the owner, or NETDONE, abandons the pending byte-count result.
+; Mark the transport aborted so teardown sends RST instead of FIN.
+CANCEL_PENDING
+	LD	A,(APEND_CH)
+	CP	0xFF
+	RET	Z
+	CALL	SELECT_CHANNEL
+	LD	A,1
+	LD	(TCP_ABORTED),A
+	LD	A,0xFF
+	LD	(APEND_CH),A
+	RET
+
 CH_STATE_ADDR
 	LD	A,(ARG_CH)
 	JR	CH_STATE_ADDR_A
 
 CH_STATE_ADDR_A
 	LD	HL,CH_STATE
-	ADD	A,L
-	LD	L,A
+	OR	A
+	RET	Z
+	INC	HL			; channel 1 may cross a 256-byte boundary
 	RET
 
 GET_CH_STATE
@@ -1889,17 +1932,19 @@ SWAP_BYTES
 	RET
 
 PEND_LEN_ADDR_A
-	ADD	A,A
 	LD	HL,@MAIN.CH_PEND_LEN
-	ADD	A,L
-	LD	L,A
+	OR	A
+	RET	Z
+	INC	HL
+	INC	HL
 	RET
 
 PEND_OFF_ADDR_A
-	ADD	A,A
 	LD	HL,@MAIN.CH_PEND_OFF
-	ADD	A,L
-	LD	L,A
+	OR	A
+	RET	Z
+	INC	HL
+	INC	HL
 	RET
 
 PEND_BUF_ADDR_A
@@ -1912,14 +1957,16 @@ PEND_BUF_ADDR_A
 
 CLOSED_ADDR_A
 	LD	HL,@MAIN.CH_CLOSED
-	ADD	A,L
-	LD	L,A
+	OR	A
+	RET	Z
+	INC	HL
 	RET
 
 LOST_ADDR_A
 	LD	HL,@MAIN.CH_LOST
-	ADD	A,L
-	LD	L,A
+	OR	A
+	RET	Z
+	INC	HL
 	RET
 
 PEND_CLEAR_A
@@ -1950,7 +1997,9 @@ PEND_CLEAR_A
 	LD	(FOREIGN_HINT),A
 	RET
 
-; Out: NZ if channel A has buffered bytes or a deferred peer close.
+; Out: NZ if channel A has buffered bytes, orderly EOF or a ring hint.
+; A terminal SEND failure (CH_CLOSED=2) reserves the slot until CLOSE,
+; but an empty aborted queue has no receive work left to advertise.
 ; MUST preserve DE: both callers hold a return value there across the
 ; call -- BUILD_RECV_FLAGS carries RECV's byte count, F_STATUS carries
 ; the status word it is still assembling.  The pend length used to be
@@ -1959,7 +2008,7 @@ PEND_CLEAR_A
 ; channel returned NERR_CLOSED with DE = the peer channel's pending
 ; length, so the app counted phantom bytes and read stale buffer), and
 ; STATUS lost UNET_ST_CONN.  Test the two length bytes through A
-; instead; same size, no scratch register.
+; instead, without using a scratch register pair.
 PEND_HAS_A
 	LD	C,A
 	CALL	PEND_LEN_ADDR_A
@@ -1970,7 +2019,8 @@ PEND_HAS_A
 	LD	A,C
 	CALL	CLOSED_ADDR_A
 	POP	AF
-	OR	(HL)
+	RET	NZ			; queued bytes, even on an aborted stream
+	BIT	0,(HL)			; orderly FIN only; terminal SEND is not pending RX
 	RET	NZ
 	LD	A,(FOREIGN_HINT)
 	CP	C
@@ -1987,6 +2037,8 @@ PEND_HAS_A
 PEER_CLOSED
 	LD	A,(ACTIVE_CH)
 	CALL	CLOSED_ADDR_A
+	BIT	1,(HL)			; a late FIN cannot undo terminal SEND failure
+	RET	NZ
 	LD	(HL),1
 	RET
 
@@ -2148,6 +2200,11 @@ HANDLE_FOREIGN_FRAME
 	JR	NZ,.check_udp
 	CALL	@TCP.IS_TCP_FROM_PEER
 	JP	NC,.restore_not_ours
+	; A suspended SEND must observe its own ACK/FIN/RST when resumed.
+	LD	A,(APEND_CH)
+	LD	HL,FOREIGN_OWNER
+	CP	(HL)
+	JR	Z,.restore_blocked
 	LD	A,1
 	LD	(FOREIGN_BUSY),A
 	LD	HL,1
@@ -2156,18 +2213,19 @@ HANDLE_FOREIGN_FRAME
 	JR	NC,.tcp_done
 	LD	A,(TCP_STATE)
 	CP	@TCP.ST_CLOSE_WAIT
-	JR	Z,.tcp_fin
+	JR	Z,.tcp_done		; PEER_CLOSED already latched the FIN
 	LD	A,(TCP_LAST_FAIL)
 	CP	@TCP.F_RST
 	JR	NZ,.tcp_done		; timeout/F_OTHER after a consumed pure ACK
 	LD	A,(FOREIGN_OWNER)
-	CALL	CH_STATE_ADDR_A
-	LD	(HL),0
-	JR	.tcp_done
-.tcp_fin
-	LD	A,(FOREIGN_OWNER)
-	CALL	CLOSED_ADDR_A
-	LD	(HL),1
+	LD	HL,ARG_CH
+	LD	C,(HL)
+	LD	(HL),A
+	PUSH	BC
+	CALL	RELEASE_WITH_PENDING
+	POP	BC
+	LD	A,C
+	LD	(ARG_CH),A
 .tcp_done
 	XOR	A
 	LD	(FOREIGN_BUSY),A
@@ -2199,6 +2257,16 @@ HANDLE_FOREIGN_FRAME
 	OR	A
 	RET
 
+; A blocking TCP operation cannot ask its caller to drain another channel.
+; Consume its protected UDP head, reporting the UDP loss on the next RECV.
+DROP_FOREIGN_UDP
+	LD	A,(FOREIGN_OWNER)
+	CALL	LOST_ADDR_A
+	LD	(HL),1
+	LD	A,0xFF
+	LD	(FOREIGN_HINT),A
+	JP	@TCP.COMMIT_RX
+
 ; Forget both contexts and their receive queues.  Used after NETINIT has
 ; closed the old links and reinitialised the card.
 RESET_CHANNEL_STATE
@@ -2211,14 +2279,14 @@ RESET_CHANNEL_STATE
 	; = DLL_BSS_SIZE - BSS_TCP - 1.  Literal, NOT a computed
 	; difference (relocation rule); recompute by hand and update
 	; this comment's numbers whenever DLL_BSS_SIZE or BSS_TCP moves.
-	; 0x0DA3 - 0x01A5 - 1 = 0x0BFD.
-	LD	BC,0x0BFD		; TCP BSS .. end of DLL BSS, minus first byte
+	; 0x0C29 - 0x0091 - 1 = 0x0B97.
+	LD	BC,0x0B97		; TCP BSS .. end of DLL BSS, minus first byte
 	LDIR
 	LD	A,0xFF			; 0xFF = no live context selected
 	LD	(ACTIVE_CH),A
 	LD	(FOREIGN_HINT),A
 	RET
-	ASSERT BSS_TCP + 1 + 0x0BFD == DLL_BSS_SIZE
+	ASSERT BSS_TCP + 1 + 0x0B97 == DLL_BSS_SIZE
 
 ; ------------------------------------------------------
 ; RELEASE_OR_REARM: close ARG_CH's channel slot, or -- if it is the
@@ -2301,12 +2369,16 @@ CLOSE_CHANNEL
 .udp
 	CALL	@UDP.CLOSE
 .clear
-	CALL	RELEASE_OR_REARM
-	LD	A,(ARG_CH)
-	CALL	PEND_CLEAR_A
+	CALL	RELEASE_WITH_PENDING
 	LD	A,0
 .err	EQU $-1
 	RET
+
+; Release ARG_CH and its queue consistently on close or peer reset.
+RELEASE_WITH_PENDING
+	CALL	RELEASE_OR_REARM
+	LD	A,(ARG_CH)
+	JP	PEND_CLEAR_A
 
 ; Close every channel; leave the NIC initialised.
 CLOSE_LINK
@@ -2502,7 +2574,7 @@ MAP_TCP_FAIL
 ; is already set by PEER_CLOSED, so this path only names the outcome --
 ; releasing the channel or clearing the queue here would destroy exactly
 ; the response the caller has to read.  RECV drains it and returns the
-; final NERR_CLOSED, which is what releases the channel.
+; final NERR_CLOSED; CLOSE/NETDONE releases this aborted channel.
 ; ------------------------------------------------------
 MAP_TCP_SEND_FAIL
 	LD	A,(TCP_LAST_FAIL)
@@ -2520,9 +2592,7 @@ MAP_TCP_SEND_FAIL
 	LD	A,NERR_CLOSED
 	JP	RET_A
 .closed
-	CALL	RELEASE_OR_REARM
-	LD	A,(ARG_CH)
-	CALL	PEND_CLEAR_A
+	CALL	RELEASE_WITH_PENDING
 	LD	A,NERR_CLOSED
 	JP	RET_A
 .hw

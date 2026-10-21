@@ -31,7 +31,8 @@ START
  CALL LIBMAN.l_load
  JP C,FAIL
  LD (HANDLE),HL
-${commands.map((c, i) => ` LD A,${c.a || 0}
+${commands.map((c, i) => `CALL_${i}
+${c.iff === undefined ? '' : (c.iff ? ' EI\n' : ' DI\n')} LD A,${c.a || 0}
  LD DE,${c.de || 0}
  LD IX,${c.ix || 0}
  LD IY,${c.iy || 0}
@@ -39,7 +40,7 @@ ${commands.map((c, i) => ` LD A,${c.a || 0}
  LD HL,(HANDLE)
  CALL LIBMAN.l_call
 PROBE_${i}
- NOP`).join('\n')}
+ NOP${c.untilSettled ? `\n CP 15\n JP Z,CALL_${i}` : ''}`).join('\n')}
  LD HL,(HANDLE)
  CALL LIBMAN.l_free
  LD B,0
@@ -72,7 +73,7 @@ BUFFER EQU 0xA100
     assemble(path.join(tmp, 'probe.asm'), path.join(tmp, 'probe.EXE'), path.join(tmp, 'probe.sym'));
     assemble(path.join(root, 'src/dll/unetrtl.asm'), path.join(tmp, 'dll.bin'), path.join(tmp, 'dll.sym'));
     const syms = symbols(path.join(tmp, 'probe.sym'));
-    const dll = symbols(path.join(tmp, 'dll.sym'));
+    const dll = symbols(scenario.dllSymbolFile || path.join(tmp, 'dll.sym'));
     const events = [], results = [], cpuProbes = {};
     const snapshot = (ctx, label) => {
       const byte = name => ctx.read(dll[name] + dllBase);
@@ -94,13 +95,19 @@ BUFFER EQU 0xA100
       };
     }
     cpuProbes[syms.START] = ({ card }) => setupPeer?.(card);
+    if (scenario.traceDllDelays) {
+      cpuProbes[dll['UTIL.DELAY_1MS'] + dllBase] = ctx => events.push({
+        label: 'delay', ms: ctx.logicalMs, page0: ctx.win[0], iff: ctx.state.iff1,
+        isaOpen: ctx.read(dll['ISA.IS_OPEN'] + dllBase),
+      });
+    }
     commands.forEach((command, i) => {
       cpuProbes[syms[`PROBE_${i}`]] = ctx => {
         const s = ctx.state;
-        const result = { a: s.a, de: s.d * 256 + s.e, ix: s.ix, data: Buffer.from(Array.from({ length: Math.min(s.d * 256 + s.e, 2048) }, (_, j) => ctx.read(syms.BUFFER + j))) };
+        const result = { a: s.a, iff1: s.iff1, iff2: s.iff2, de: s.d * 256 + s.e, ix: s.ix, data: Buffer.from(Array.from({ length: Math.min(s.d * 256 + s.e, 2048) }, (_, j) => ctx.read(syms.BUFFER + j))) };
         results.push(result);
         events.push({ label: `ABI ${command.fn} #${i}`, ms: ctx.logicalMs, a: result.a, de: result.de, ix: result.ix });
-        command.after?.(ctx, result);
+        command.after?.({ ...ctx, dll, dllBase, symbols: syms }, result);
       };
     });
     const r = runExe(path.join(tmp, 'probe.EXE'), '', { ...scenario, cpuProbes });

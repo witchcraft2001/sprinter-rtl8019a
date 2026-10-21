@@ -51,7 +51,6 @@ EXE_VERSION		EQU 1
 	DEFINE USE_RTL_INIT_NORMAL
 	DEFINE USE_RTL_SEND_FRAME
 	DEFINE USE_RTL_WAIT_PTX
-	DEFINE RTL_DIAG_FIXED_BASE
 
 ; -- test sizing --
 G1_REGS		EQU 14			; PAR0..5, CURR, MAR0..6 (MAR7 conditions)
@@ -80,16 +79,14 @@ TBL_ENTRY_SIZE	EQU 8			; offset, expected, mask, 5-char name
 
 	MODULE MAIN
 
-	; Small variant: no arguments beyond one short flag.  The stack
-	; lives at the top of our own WIN2 page, not at 0x8100, so it
-	; cannot run down into the command line that CMDL.PARSE
-	; tokenizes in place.
-	ORG 0x8080
+	; Full INIT_BASE (including configured slot/base and auto-scan) no
+	; longer fits below small-app BSS. Own WIN2 before touching it.
+	ORG 0x4100
 
 EXE_HEADER
 	DB "EXE"
 	DB EXE_VERSION
-	DW 0x0080
+	DW 0x0100
 	DW 0
 	DW 0
 	DW 0
@@ -97,12 +94,13 @@ EXE_HEADER
 	DW 0
 	DW START
 	DW START
-	DW RT_STACK_TOP
-	DS 106, 0
+	DW 0x8000
+	DS 234, 0
 
-	ORG 0x8100
+	ORG 0x4200
 
 START
+	CLAIM_RUNTIME_PAGE
 	LD	(CMDL_SOURCE_PTR),IX	; must precede every CALL/RST DSS
 	PRINTLN MSG_BANNER
 	CALL	@CMDL.PARSE
@@ -115,6 +113,12 @@ START
 	LD	A,1
 	LD	(OPT_TX),A
 .NO_T
+	LD	A,'v'
+	CALL	@CMDL.HAS_FLAG
+	JR	C,.NO_V
+	LD	A,1
+	LD	(OPT_VERBOSE),A
+.NO_V
 	LD	A,1
 	LD	(@ISA.ISA_SLOT),A
 	CALL	@RTL.INIT_BASE		; leaves ISA OPEN on success
@@ -296,8 +300,11 @@ WRITE_P0
 ;        C = expected target value (already masked),
 ;        B' = AND accumulator, C' = OR accumulator,
 ;        DE' = misread count; COND_EXP / TGT_MASK patched.
-; The conditioner read and the target read are one EX AF,AF'
-; apart -- nothing else touches the bus in between.  Global
+; Allow register-access recovery between the conditioner and target.
+; DP8390D section 13 requires >=4 BSCK between chip selects, otherwise
+; ACK may glitch. WAIT stretches an access, not the recovery after it.
+; Only instruction fetches intervene, so the conditioner remains the
+; last ISA data value. Global
 ; labels throughout: the two patch slots below would
 ; otherwise capture the local-label scope.
 ; ISA open, interrupts off; no DSS.
@@ -307,6 +314,9 @@ BURST
 BURST_LP
 	LD	A,(HL)			; conditioner: leaves a known value behind
 	EX	AF,AF'
+	DUP 8
+	NOP				; 32 T-states without another ISA cycle
+	EDUP
 	LD	A,(DE)			; target
 	EXX
 	LD	L,A
@@ -393,6 +403,7 @@ ACC_RESET
 ; [G1] read/write storage.
 ; ======================================================
 PHASE_G1
+	PRINTLN	MSG_G1			; announce BEFORE the first ISA access
 	XOR	A
 	LD	(PASS_PAT),A
 G1_PAT_LOOP
@@ -407,6 +418,7 @@ G1_RES_LOOP
 	XOR	A
 	LD	(REG_INDEX),A
 G1_REG_LOOP
+	CALL	G1_TRACE_READ
 	LD	A,(REG_INDEX)
 	INC	A			; PAR0 is offset 1
 	CALL	REG_ADDR
@@ -461,6 +473,7 @@ G1_LOAD
 	CALL	REG_ADDR
 	LD	A,C
 	CALL	G1_EXPECTED
+	CALL	G1_TRACE_WRITE
 	CALL	WR
 	INC	C
 	DJNZ	.LP
@@ -468,6 +481,7 @@ G1_LOAD
 	CALL	REG_ADDR
 	LD	(COND_ADDR),HL
 	LD	A,(PASS_RES)
+	CALL	G1_TRACE_WRITE
 	CALL	WR
 	LD	HL,(RTL_BASE_PTR)
 	LD	A,CR_PAGE0_STOP
@@ -475,6 +489,43 @@ G1_LOAD
 	LD	A,CR_PAGE1_STOP
 	LD	(CUR_PAGE_CR),A
 	JP	@ISA.ISA_CLOSE
+
+; Verbose localization for a WAIT-stalled bus cycle. No output inside
+; a measured burst. A CPU held in WAIT cannot run a software timeout.
+G1_TRACE_WRITE
+	PUSH	AF,BC,DE,HL,IX,IY
+	LD	A,(OPT_VERBOSE)
+	OR	A
+	JR	Z,.DONE
+	LD	A,L
+	AND	0x0F
+	LD	(TRACE_REG),A
+	CALL	@ISA.ISA_CLOSE
+	PRINT	MSG_G1_WRITE
+	LD	A,(TRACE_REG)
+	CALL	@UTIL.PRINT_HEX_A
+	CALL	PUT_CRLF
+	CALL	@ISA.ISA_OPEN
+.DONE
+	POP	IY,IX,HL,DE,BC,AF
+	RET
+
+G1_TRACE_READ
+	LD	A,(OPT_VERBOSE)
+	OR	A
+	RET	Z
+	PRINT	MSG_G1_READ
+	LD	A,(REG_INDEX)
+	LD	E,A
+	ADD	A,A
+	ADD	A,A
+	ADD	A,E
+	LD	E,A
+	LD	D,0
+	LD	HL,G1_NAMES
+	ADD	HL,DE
+	CALL	PUT_NAME5
+	JP	PUT_CRLF
 
 ; G1_FOLD: fold one (register, pass) result into the totals.
 G1_FOLD
@@ -553,7 +604,6 @@ G1_FOLD
 	RET
 
 G1_PRINT
-	PRINTLN	MSG_G1
 	PRINT	MSG_G1_00
 	LD	HL,(G1_TOT00)
 	CALL	@UTIL.PRINT_HEX_HL
@@ -2406,7 +2456,8 @@ G3_TABLE
 	DB 0x02, 0, 0, "CLDA1"
 	DB 0x04, 0, 0, "TSR  "
 	DB 0x05, 0, 0, "NCR  "
-	DB 0x06, 0, 0, "FIFO "
+	; FIFO is not a passive register: reading it outside a completed
+	; loopback can malfunction/stall a physical DP8390 (section 12).
 	DB 0x07, 0, 0, "ISR  "
 	DB 0x08, 0, 0, "CRDA0"
 	DB 0x09, 0, 0, "CRDA1"
@@ -2426,6 +2477,8 @@ MSG_G0_SEP	DB "/#",0
 MSG_CHIP_REALTEK DB " chip=Realtek",0
 MSG_CHIP_CLONE	DB " chip=clone",0
 MSG_G1		DB "[G1] RW STORAGE stopped, 14 regs x 2048 reads",0
+MSG_G1_WRITE	DB "[G1] load page1 +",0
+MSG_G1_READ	DB "[G1] read ",0
 MSG_G1_00	DB " bad after-00=",0
 MSG_G1_FF	DB " after-FF=",0
 MSG_COND	DB " cond=",0
@@ -2466,6 +2519,7 @@ MSG_HELP
 	DB "Usage:",13,10
 	DB "  NICREG        register read-stability test (no transmit)",13,10
 	DB "  NICREG -t     also send 3x20 test frames, type 88B5",13,10
+	DB "  NICREG -v     show G1 register before load/read",13,10
 	DB "  NICREG /?",13,10,13,10
 	DB "Each value is shown as and/or over 256 reads: equal = stable.",13,10
 	DB "A bit that is 0 after 00 and 1 after FF is not driven by the",13,10
@@ -2478,13 +2532,14 @@ LINE_END	DB 13,10,0
 	; cmdline_lib transitively DEFINEs the USE_UTIL_* helpers it
 	; needs, so it must come before util.asm.
 	INCLUDE "cmdline_lib.asm"
+	INCLUDE "win2page.asm"
 	INCLUDE "isa.asm"
 	INCLUDE "util.asm"
 	INCLUDE "rtl8019.asm"
 
 
 NICREG_IMAGE_END
-	ASSERT NICREG_IMAGE_END <= LIBBSS_BASE
+	ASSERT NICREG_IMAGE_END <= 0x7F80
 
 	MODULE MAIN
 
@@ -2541,6 +2596,8 @@ TXB_TSR_AND	EQU BSS_START + 57	; 1
 TXB_TSR_OR	EQU BSS_START + 58	; 1
 TXB_DONE	EQU BSS_START + 59	; 1
 TXC_DONE	EQU BSS_START + 60	; 1
+OPT_VERBOSE	EQU BSS_START + 61	; 1
+TRACE_REG	EQU BSS_START + 62	; 1
 G1_LOAD_BAD	EQU BSS_START + 63	; 1
 G1_BAD		EQU BSS_START + 64	; G1_REGS words
 G1_ERR		EQU BSS_START + 92	; G1_REGS bytes

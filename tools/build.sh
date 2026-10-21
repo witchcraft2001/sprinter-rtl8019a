@@ -115,7 +115,7 @@ if [ "${#BUILD_DLLS[@]}" -gt 0 ]; then
       "${mkdll_cmd[@]}" build "$src" \
         --format l1 --target 1.3 --assembler sjasmplus \
         -I "$repo_root/src/include" -I "$repo_root/src/lib" \
-        --name "$dll_name" --version "$dll_version" --no-compress -o "$out"
+        --name "$dll_name" --version "$dll_version" --date 2026-10-20 --no-compress -o "$out"
       "${mkdll_cmd[@]}" verify "$out" --target 1.3
       echo "Built $out"
 

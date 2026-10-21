@@ -207,16 +207,16 @@ INIT
 	RET
 ; INIT-time scratch overlays @MAIN.TX_BUF instead of occupying image
 ; bytes: INIT runs once, from F_NETINIT, before RTL.INIT_BASE and long
-; before the first frame is built, so TX_BUF (320 bytes) is guaranteed
-; dead for its whole lifetime; a repeated NETINIT returns on the READY
-; check before touching any of this.  Two reasons, both real:
+; before the first frame is built, so TX_BUF (60 bytes) and the following
+; RX scratch are dead for its whole lifetime; a repeated NETINIT returns
+; on the READY check before touching any of this. Two reasons, both real:
 ;   1. The libman image budget.  These 77 bytes are what pays for the
 ;      cold-call stack switch in RUN below.
 ;   2. .PATH used to be DS 65 in the image, but .OPEN_SELF may write
 ;      up to 63 bytes of APPINFO homedir + '\' + "UNETRTL.DLL",0 = 77
 ;      bytes into it -- a homedir >= 53 characters overflowed the old
-;      buffer straight into RUN's code.  In TX_BUF the buffer is 80
-;      bytes with dead scratch beyond it, so the worst case is safe.
+;      buffer straight into RUN's code. The overlaid path buffer spans
+;      80 bytes of TX/RX scratch with dead space beyond it, so it is safe.
 .FH		EQU @MAIN.TX_BUF + 0	; 1
 .SAVE_WIN3	EQU @MAIN.TX_BUF + 1	; 1
 .BLOBLEN	EQU @MAIN.TX_BUF + 2	; 2

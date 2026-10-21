@@ -496,7 +496,35 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.strictEqual(r.transmittedFrames.length, 0, 'NICREG must not transmit unless asked');
   // The diagnostic leaves the controller stopped, as it found it.
   assert.strictEqual(r.card.cr & 0x3f, 0x21);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
+}
+{ // Physical UMC board is in slot 0. NICREG 0.4.0 ignored this pin and
+  // probed only slot 1/#300, although FTP used the very same environment.
+  const r = run('NICREG', '', {
+    slot: 0, base: 0x320,
+    quirks: { variant: 'UM9003', hangOnResetPort: true, floatingBits: true },
+    environment: { NET_RTL_HW: '0/#320' },
+    traceChip: true,
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /\[G0\] Slot\/Addr: 0\/#320 chip=clone/);
+  assert.match(r.output, /RESULT OK/);
+  assert.ok(r.output.indexOf('[G1]') < r.output.indexOf('bad after-00='));
+  assert.doesNotMatch(r.output, /FIFO/);
+  // Check actual executed bus cycles, rather than the number of NOPs.
+  // Conditioned reads used to be only 11 T-states apart. Demand at least
+  // 43 now, with the conditioner still the immediately preceding ISA read.
+  let pairs = 0;
+  for (let i = 1; i < r.chipTrace.length; i++) {
+    const prev = r.chipTrace[i - 1], next = r.chipTrace[i];
+    if (prev.dir === 'read' && next.dir === 'read' &&
+        prev.address === 0xc32f && next.address >= 0xc321 && next.address <= 0xc32e) {
+      assert.ok(next.cycles - prev.cycles >= 43, 'conditioned reads need recovery time');
+      pairs++;
+    }
+  }
+  assert.ok(pairs >= 14 * 2048, 'all G1 conditioned reads must be exercised');
+  checkCleanupClaimedPage(r);
 }
 { // UM9003F-style read-back: reserved bits follow the bus.  That is NOT an
   // unstable read and must not fail the run: the value after a 00 conditioner
@@ -514,7 +542,20 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.match(r.output, /RESULT OK/);
   // A clone has no page 3, and its reset port may hang the machine.
   assert.strictEqual(r.card.stats.page3Reads, 0);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
+}
+{ // Verbose progress must run with ISA closed and leave the new WIN2
+  // allocation to DSS EXIT, just like the other large-image utilities.
+  const r = run('NICREG', '-v', {
+    slot: 0, quirks: { variant: 'UM9003', hangOnResetPort: true },
+    environment: { NET_RTL_HW: '0/#300' },
+  });
+  assert.strictEqual(r.exitCode, 0);
+  assert.match(r.output, /\[G1\] load page1 \+01/);
+  assert.match(r.output, /\[G1\] load page1 \+0F/);
+  assert.match(r.output, /\[G1\] read CURR/);
+  assert.match(r.output, /RESULT OK/);
+  checkCleanupClaimedPage(r);
 }
 { // genuine fault: a DRIVEN bit of a read/write register comes back wrong
   // now and then.  Counted, attributed to its bit, and fatal.
@@ -551,7 +592,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.strictEqual(rdLines.length, 3);
   for (const l of rdLines) assert.match(l, /^  rd( PAR[0-5]=[0-9A-F]{2}@[01][0-9A-F]){6}$/);
   assert.match(r.output, /RESULT FAIL/);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // register reads that collide with the chip's receive-buffer DMA (a host
   // that does not honour IOCHRDY): clean while the receiver is deaf, bad only
@@ -579,7 +620,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   // 6 PAR + 4 MAR read-backs, then PAR2 of the second sweep (0x19 ^ 0xFF)
   assert.match(r.output, /  rd PAR2=E6@01 /);
   assert.ok(r.card.stats.filteredRx > 0, 'the deaf row must have had traffic to ignore');
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // Writes a started chip never latches (seen on real hardware).  MAR0..3
   // keep the previous sweep's pattern: counted as LOST, not as misreads, and
@@ -595,7 +636,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.strictEqual(wrLines.length, 2);
   for (const l of wrLines) assert.match(l, /^  wr( MAR[0-3]=[0-9A-F]{2}>[0-9A-F]{2}){4}$/);
   assert.match(r.output, /RESULT FAIL/);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // The dangerous one: a dropped page switch.  Unverified, the ring drain's
   // BNRY/ISR writes would land in PAR2/CURR (this is what real hardware
@@ -611,7 +652,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.strictEqual(r.card.par, '028019112233', 'PAR must not be hit by a stray BNRY write');
   assert.strictEqual(r.card.curr, 0x47, 'CURR must not be hit by a stray ISR write');
   assert.match(r.output, /RESULT FAIL/);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 // --- the test must not manufacture its own evidence (code review, 0.3.24) ---
 { // FOUR page switches lost in a row defeat the retry loop.  0.3.23 carried on
@@ -626,7 +667,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.doesNotMatch(r.output, /^  (rd|wr) /m);
   assert.strictEqual(r.card.par, '028019112233');
   assert.strictEqual(r.card.curr, 0x47);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // The chip sits out bursts of 16 cycles, reads and writes alike, often
   // enough to hit page switches: whatever else is reported, no register may
@@ -636,7 +677,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.match(r.output, /  page lost=0004 setup retries=0000/);
   assert.strictEqual(r.card.par, '028019112233');
   assert.strictEqual(r.card.curr, 0x47);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // READS the chip does not answer, three cycles in a row; every write is
   // fine.  The unanswered read returns what the previous cycle left on the
@@ -652,7 +693,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
     assert.match(r.output, new RegExp(` ${row} 00[0-9A-F]{2}   [0-9A-F]{2}   0000    0000   [0-9A-F]{4}   [0-9A-F]{4}   0000 `));
   }
   assert.doesNotMatch(r.output, /^  wr /m);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // One bit flipped in the single write that loads PAR2 for the stop row.
   // Every later read returns the register's true content; 0.3.23 compared it
@@ -663,7 +704,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.match(r.output, / stop 0000   00   0000    0000   0000   0001   0000    0000     0000\r?\n  page lost=0000 setup retries=0001/);
   assert.match(r.output, new RegExp(` deaf ${G4_CLEAN}`));
   assert.doesNotMatch(r.output, /^  (rd|wr) /m);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // the same flip in a [G1] pattern load: 512 identical wrong reads are a
   // failed load, not 512 misreads
@@ -671,7 +712,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.strictEqual(r.exitCode, 3);
   assert.match(r.output, /bad after-00=0000 after-FF=0000 cond=0000 load=01/);
   assert.match(r.output, /PAR2  bad=0200 bits=01/);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // PAR2 changes behind the host's back in the middle of the deaf row.  One
   // event, one count: the content is proven wrong (the conditioner reads
@@ -683,7 +724,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.match(r.output, / deaf 0000   00   0000    0001   0000   0000   0000    0001     0000\r?\n  rd PAR2=46@[0-9A-F]{2}\r?\n  wr PAR2=19>46/);
   assert.match(r.output, new RegExp(` live ${G4_CLEAN}`));
   assert.strictEqual(r.card.par, '028019112233', 'the damage must be repaired');
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // [G6]: one corrupted READ of the remote-DMA data port.  Packet RAM is
   // untouched, so the second pass finds the byte intact -- the read lied.
@@ -694,7 +735,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   const [, want, got] = r.output.match(/^ {2}dma [0-9A-F]{2}=([0-9A-F]{2})>([0-9A-F]{2}) $/m);
   assert.strictEqual(parseInt(want, 16) ^ parseInt(got, 16), 0x01);
   assert.match(r.output, / live 0000   0000   0000    0000   0000   0000/);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // [G6]: one WRITE that never reached packet RAM.  Both read passes find the
   // same byte wrong, so the content is blamed and not the reads.
@@ -702,7 +743,7 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.strictEqual(r.exitCode, 3);
   assert.match(r.output, / deaf 0001   0000   0001    0000   0001   0000   0000/);
   assert.match(r.output, / live 0000   0000   0000    0000   0000   0000/);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // [G6]: the whole run is clean on a healthy chip, and the phase must not
   // touch the receive ring it shares the chip with.
@@ -711,14 +752,14 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   assert.match(r.output, /\[G6\] DMA DATA PORT, per row: 800 bursts x 128 bytes/);
   assert.match(r.output, / deaf 0000   0000   0000    0000   0000   0000   0000/);
   assert.doesNotMatch(r.output, /^ {2}dma /m);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // a misread page-2 DEFINED bit fails too (reserved ones never do)
   const r = run('NICREG', '', { quirks: { regReadGlitch: { page: 2, everyN: 501, xor: 0x04 } } });
   assert.strictEqual(r.exitCode, 3);
   assert.doesNotMatch(r.output, /\[G2\] PAGE2 CONFIG .* bad=0000/);
   assert.match(r.output, /RESULT FAIL/);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // -t: 3 x 20 tagged frames, in order, while live broadcast traffic is
   // drained so the ring cannot overflow under the test.
@@ -745,23 +786,23 @@ const G4_CLEAN = '0000   00   0000    0000   0000   0000   0000    0000     0000
   const expected = ['A', 'B', 'C'].flatMap((m) => Array.from({ length: 20 }, (_, i) => m + (i + 1)));
   assert.deepStrictEqual(marks, expected);
   assert.strictEqual(r.card.stats.overflowEvents, 0);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // a transmitter that does not complete is a failure of the -t phase
   const r = run('NICREG', '-t', { txError: true });
   assert.strictEqual(r.exitCode, 3);
   assert.match(r.output, / A poll  ptx=00 /);
   assert.match(r.output, /RESULT FAIL/);
-  checkCleanup(r);
+  checkCleanupClaimedPage(r);
 }
 { // help and "no card" paths
   const h = run('NICREG', '/?');
   assert.strictEqual(h.exitCode, 0);
   assert.match(h.output, /NICREG -t/);
-  checkCleanup(h);
+  checkCleanupClaimedPage(h);
   const n = run('NICREG', '', { cardPresent: false });
   assert.strictEqual(n.exitCode, 2);
-  checkCleanup(n);
+  checkCleanupClaimedPage(n);
 }
 
 // ---------------------------------------------------------------------
@@ -778,7 +819,8 @@ for (const app of ['NICRAM', 'NICLB', 'NICTX', 'NICREG']) {
   assert.strictEqual(r.exitCode, 0, `${app}: ${r.output}`);
   assert.match(r.output, /RESULT OK/);
   if (app === 'NICRAM') assert.match(r.output, /ADDR=3F00 LEN=0100 OK/);
-  checkCleanup(r);
+  if (app === 'NICREG') checkCleanupClaimedPage(r);
+  else checkCleanup(r);
   count();
 }
 

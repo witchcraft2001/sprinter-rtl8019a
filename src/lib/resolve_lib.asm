@@ -263,6 +263,13 @@ HOST
 	XOR	B
 	LD	(RESOLVE_XID_HI),A
 
+	IFDEF	UNET_DLL
+	LD	A,DNS_RETRIES
+	LD	(.DNS_LEFT),A
+.DNS_SEND
+	; RX processing may overwrite the shared TX tail. Rebuild every
+	; DLL attempt from the saved name and original XID before sending.
+	ENDIF
 	; Build full ETH+IP+UDP+DNS frame.  HL still on stack.
 	POP	HL				; HL = name
 	PUSH	HL
@@ -286,17 +293,18 @@ HOST
 	; DNS runs over UDP, so a single query with no retransmit turns any
 	; dropped request or reply into a hard "could not resolve host" --
 	; the ARP phase above already retries ARP_RETRIES times for exactly
-	; this reason.  Retransmit the frame that is still sitting in TX_BUF
-	; (RX_BUF starts at TX_BUF + RESOLVE_MAX_FRAME in every consumer, so
-	; the receive loop cannot overwrite it) and keep the same XID, which
+	; this reason. EXEs retain the frame in separate TX storage; the DLL
+	; rebuilds it because RX can overwrite its shared TX tail. Keep the XID,
 	; is what a resolver is supposed to do: a late reply to attempt 1
 	; still matches while attempt 2 is in flight.
 	;
 	; Only a reply TIMEOUT is retried.  NXDOMAIN / malformed reply (6)
 	; and user cancel (7) are answers, not losses, and give up at once.
+	IFNDEF	UNET_DLL
 	LD	A,DNS_RETRIES
 	LD	(.DNS_LEFT),A
 .DNS_SEND
+	ENDIF
 	LD	HL,@MAIN.TX_BUF
 	LD	BC,(RESOLVE_QFRAME_LEN)
 	CALL	@RTL.SEND_FRAME

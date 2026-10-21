@@ -99,7 +99,12 @@ RTL_TX_LAST_CR		EQU LIBBSS_BASE + 0x01F	; raw CR
 ; because real NET_* values are short.  Left as-is deliberately: moving
 ; CMDL_BSS_BASE would change the EXE map and break the byte-identity gate
 ; this parameterization is verified with.  The DLL pulls neither buffer.
+	IFDEF	UNET_DLL
+; Environment reads happen outside live RX processing; durable bytes are queued.
+NETENV_VAL_BUF		EQU @MAIN.RX_BUF
+	ELSE
 NETENV_VAL_BUF		EQU LIBBSS_BASE + 0x020
+	ENDIF
 NETENV_VAL_BUF_SIZE	EQU 256
 
 ; cmdline_lib: entry-time DSS command-line pointer + ARGC +
@@ -113,9 +118,14 @@ CMDL_SOURCE_PTR		EQU CMDL_BSS_BASE + 0x31	; 2 bytes
 
 ; rtl8019.asm: SEND_FRAME retry/read-back state.  Kept outside the
 ; executable image (rather than local DW/DB storage in the driver).
-RTL_TX_SOURCE_PTR	EQU LIBBSS_BASE + 0x134	; 2 bytes, caller's frame buffer
-RTL_TX_LENGTH		EQU LIBBSS_BASE + 0x136	; 2 bytes
-RTL_TX_RETRY_LEFT	EQU LIBBSS_BASE + 0x138	; 1 byte
+	IFDEF	UNET_DLL
+RTL_WORK_BASE	EQU	LIBBSS_BASE + 0x020
+	ELSE
+RTL_WORK_BASE	EQU	LIBBSS_BASE + 0x134
+	ENDIF
+RTL_TX_SOURCE_PTR	EQU RTL_WORK_BASE + 0x000	; 2 bytes, caller's frame buffer
+RTL_TX_LENGTH		EQU RTL_WORK_BASE + 0x002	; 2 bytes
+RTL_TX_RETRY_LEFT	EQU RTL_WORK_BASE + 0x004	; 1 byte
 ; RTL_SOFT_RESET: how RTL.RESET is allowed to reach the NE2000 board
 ; reset port at BASE+0x1F.  Some NE2000 clones stall the ISA cycle on
 ; that port, and a bus cycle that never completes cannot be timed out
@@ -129,7 +139,7 @@ RTL_TX_RETRY_LEFT	EQU LIBBSS_BASE + 0x138	; 1 byte
 ; runs once per session and apps can report which path was taken.
 ; Placed in the 0x139..0x13F gap so LIBBSS_SIZE -- and with it every
 ; literal BSS offset in src/dll/unetrtl.asm -- stays unchanged.
-RTL_SOFT_RESET	EQU LIBBSS_BASE + 0x139	; 1 byte
+RTL_SOFT_RESET	EQU RTL_WORK_BASE + 0x005	; 1 byte
 RTL_RESET_HARD	EQU 0
 RTL_RESET_SOFT	EQU 1
 RTL_RESET_AUTO	EQU 2
@@ -140,9 +150,9 @@ RTL_RESET_AUTO	EQU 2
 ; a UM9003 answers there with a copy of page 1 -- so the TX path's PHY
 ; capture is skipped on a clone.  Same 0x139..0x13F gap, so LIBBSS_SIZE
 ; and every literal BSS offset in src/dll/unetrtl.asm stay unchanged.
-RTL_CHIP_KIND	EQU LIBBSS_BASE + 0x13A	; 1 byte
-RTL_CHIP_UNKNOWN EQU 0			; not probed (UNETRTL.DLL: always)
-RTL_CHIP_REALTEK EQU 1			; page-0 8019ID0/ID1 read 'Pp'
+RTL_CHIP_KIND	EQU RTL_WORK_BASE + 0x006	; 1 byte
+RTL_CHIP_UNKNOWN	EQU	0			; not probed (UNETRTL.DLL: always)
+RTL_CHIP_REALTEK	EQU	1			; page-0 8019ID0/ID1 read 'Pp'
 RTL_CHIP_CLONE	EQU 2			; anything else: no page 3
 ; RTL_BNRY_SHADOW: the driver's own copy of BNRY.  The receive path
 ; reads the ring position from here, never from the chip: a missed
@@ -151,49 +161,53 @@ RTL_CHIP_CLONE	EQU 2			; anything else: no page 3
 ; READ_PACKET to the wrong page.  The chip register is still written
 ; on every commit -- it is what keeps the receive DMA off unread
 ; frames.  Same 0x139..0x13F gap, LIBBSS_SIZE unchanged.
-RTL_BNRY_SHADOW	EQU LIBBSS_BASE + 0x13B	; 1 byte
+RTL_BNRY_SHADOW	EQU RTL_WORK_BASE + 0x007	; 1 byte
 ; Runtime packet-RAM layout and remote-write policy.  These bytes occupy the
 ; historical gap and keep the DLL relocation map and LIBBSS_SIZE unchanged.
-RTL_CARD_FLAGS	EQU LIBBSS_BASE + 0x13C	; bit0=NE1000, bit7=env
-RTL_TPSR_PAGE	EQU LIBBSS_BASE + 0x13D
-RTL_PSTART_PAGE	EQU LIBBSS_BASE + 0x13E
-RTL_PSTOP_PAGE	EQU LIBBSS_BASE + 0x13F
-RTL_TX_VERIFY_BUF	EQU LIBBSS_BASE + 0x140	; 42 bytes read back from NIC packet RAM
+RTL_CARD_FLAGS	EQU RTL_WORK_BASE + 0x008	; bit0=NE1000, bit7=env
+RTL_TPSR_PAGE	EQU RTL_WORK_BASE + 0x009
+RTL_PSTART_PAGE	EQU RTL_WORK_BASE + 0x00A
+RTL_PSTOP_PAGE	EQU RTL_WORK_BASE + 0x00B
+RTL_TX_VERIFY_BUF	EQU RTL_WORK_BASE + 0x00C	; 42 bytes read back from NIC packet RAM
 RTL_TX_VERIFY_SIZE	EQU 42
-RTL_TX_LAST_CLDA	EQU LIBBSS_BASE + 0x16A	; 2 bytes, page-0 CLDA0/1 after TX
-RTL_RX_TO_TX_PENDING	EQU LIBBSS_BASE + 0x16C	; 1 byte, successful RX since last TX
-RTL_TX_CFG0_PRE	EQU LIBBSS_BASE + 0x16D	; page-3 CONFIG0 immediately before TXP
-RTL_TX_CFG3_PRE	EQU LIBBSS_BASE + 0x16E	; page-3 CONFIG3 immediately before TXP
-RTL_TX_CFG0_POST	EQU LIBBSS_BASE + 0x16F	; page-3 CONFIG0 after PTX/TXE
-RTL_TX_CFG3_POST	EQU LIBBSS_BASE + 0x170	; page-3 CONFIG3 after PTX/TXE
-RTL_TX_LAST_NCR	EQU LIBBSS_BASE + 0x171	; page-0 collision count for last TX
-RTL_TX_LAST_TPSR EQU LIBBSS_BASE + 0x172	; page-2 read-back of TX start page before TXP
+RTL_TX_LAST_CLDA	EQU RTL_WORK_BASE + 0x036	; 2 bytes, page-0 CLDA0/1 after TX
+RTL_RX_TO_TX_PENDING	EQU RTL_WORK_BASE + 0x038	; 1 byte, successful RX since last TX
+RTL_TX_CFG0_PRE	EQU RTL_WORK_BASE + 0x039	; page-3 CONFIG0 immediately before TXP
+RTL_TX_CFG3_PRE	EQU RTL_WORK_BASE + 0x03A	; page-3 CONFIG3 immediately before TXP
+RTL_TX_CFG0_POST	EQU RTL_WORK_BASE + 0x03B	; page-3 CONFIG0 after PTX/TXE
+RTL_TX_CFG3_POST	EQU RTL_WORK_BASE + 0x03C	; page-3 CONFIG3 after PTX/TXE
+RTL_TX_LAST_NCR	EQU RTL_WORK_BASE + 0x03D	; page-0 collision count for last TX
+RTL_TX_LAST_TPSR	EQU	RTL_WORK_BASE + 0x03E	; page-2 read-back of TX start page before TXP
 ; RX-ring overflow counter (saturating at 255).  A non-zero value
 ; tells a stalled transfer apart from a peer that simply went
 ; quiet.  Cleared by INIT_BASE.
-RTL_RX_OVW_COUNT EQU LIBBSS_BASE + 0x173	; 1 byte
+RTL_RX_OVW_COUNT	EQU	RTL_WORK_BASE + 0x03F	; 1 byte
 ; RCR value the app configured via INIT_NORMAL.  RECOVER_OVERFLOW
 ; must restore exactly this after its stop/restart (NICTX runs
 ; RCR=0, the TCP utilities RCR_AB).  INIT_BASE defaults it to
 ; RCR_AB for code paths that touch recovery before INIT_NORMAL.
-RTL_RCR_SHADOW	EQU LIBBSS_BASE + 0x174	; 1 byte
+RTL_RCR_SHADOW	EQU RTL_WORK_BASE + 0x040	; 1 byte
 ; SEND_FRAME/WAIT_PTX failure counter (saturating at 255).
 ; Printed by the app failure dumps next to ovw: separates a deaf
 ; receiver (tx=0, silence) from a dead transmitter (tx>0, our
 ; ACKs never leave).  Cleared by INIT_BASE.
-RTL_TX_FAIL_COUNT EQU LIBBSS_BASE + 0x175	; 1 byte
+RTL_TX_FAIL_COUNT	EQU	RTL_WORK_BASE + 0x041	; 1 byte
 
 ; SEND_FRAME_SG payload descriptor (IFDEF UNET_DLL only; harmless
 ; unused scratch in EXE builds, so it is not gated here).  TX_HDR_LEN
 ; separates the header region (built in TX_BUF) from the caller's own
 ; payload region so VERIFY_TX_PREFIX/DMA_WRITE_SG can treat them as
 ; two independently-retryable descriptors instead of one copied buffer.
-RTL_TX_HDR_LEN	EQU LIBBSS_BASE + 0x176	; 2 bytes
-RTL_TX_PAY_PTR	EQU LIBBSS_BASE + 0x178	; 2 bytes
-RTL_TX_PAY_LEN	EQU LIBBSS_BASE + 0x17A	; 2 bytes
+RTL_TX_HDR_LEN	EQU RTL_WORK_BASE + 0x042	; 2 bytes
+RTL_TX_PAY_PTR	EQU RTL_WORK_BASE + 0x044	; 2 bytes
+RTL_TX_PAY_LEN	EQU RTL_WORK_BASE + 0x046	; 2 bytes
 
 ; Total span of the LIBBSS_BASE region (util + rtl + netenv + rtl tx).
+	IFDEF	UNET_DLL
+LIBBSS_SIZE		EQU 0x068
+	ELSE
 LIBBSS_SIZE		EQU 0x17C
+	ENDIF
 
 ; netcfg_lib: parsed-field outputs + 1024-byte file read
 ; buffer.  Active only in NETCFG.EXE -- no other utility
@@ -367,14 +381,33 @@ TCP_ATTEMPT_MS_LEFT	EQU TCP_BSS_BASE + 0x35	; 2 bytes
 ; channel opened second inherit the zeroed slot's window 0, so its
 ; very first ACK advertised a closed window and the peer stalled after
 ; the in-flight bytes.)
+	IFDEF	UNET_DLL
+TCP_PEER_WIN	EQU	TCP_BSS_BASE + 0x37 ; host order, from last fresh ACK
+TCP_WL1	EQU	TCP_BSS_BASE + 0x39 ; network-order sequence
+TCP_WL2	EQU	TCP_BSS_BASE + 0x3D ; network-order ACK
+TCP_FLIGHT_END	EQU	TCP_BSS_BASE + 0x41 ; current wire segment end
+TCP_PERSIST_INTERVAL	EQU	TCP_BSS_BASE + 0x45 ; 1000, 2000, 4000 ms
+TCP_PERSIST	EQU	TCP_BSS_BASE + 0x47
+TCP_PROBE_LIVE	EQU	TCP_BSS_BASE + 0x48
+TCP_ABORTED	EQU	TCP_BSS_BASE + 0x49
+TCP_ADV_WIN_HI		EQU TCP_BSS_BASE + 0x4A
+	ELSE
 TCP_ADV_WIN_HI		EQU TCP_BSS_BASE + 0x37	; 1 byte
 TCP_ADV_WIN_LO		EQU TCP_BSS_BASE + 0x38	; 1 byte
+	ENDIF
+	IFDEF	UNET_DLL
+TCP_ADV_WIN_LO	EQU	TCP_BSS_BASE + 0x4B
+	ENDIF
 
-; Length of SELECT_CHANNEL's second swap slice: TCP_ACK_WAIT_STATE
-; (0x28) .. TCP_ATTEMPT_MS_LEFT+1 (0x36) inclusive.  Deliberately NOT
-; TCP_BSS_SIZE-0x28: everything appended after TCP_ATTEMPT_MS_LEFT is
-; session-global and must stay out of the per-channel swap.
+; SELECT_CHANNEL swaps the reliable-send tail up to (but excluding)
+; TCP_ADV_WIN_HI/LO. DLL tail includes peer window, WL1/WL2, persist and
+; abort state; ordinary EXE maps keep their historical 15-byte slice.
+	IFDEF	UNET_DLL
+TCP_SWAP_TAIL_SIZE	EQU	34
+	ELSE
 TCP_SWAP_TAIL_SIZE	EQU 15		; 0x28..0x36
+
+	ENDIF
 
 ; Total per-session TCP state size; copied wholesale by
 ; TCP.SAVE_CTX / TCP.RESTORE_CTX so apps can multiplex
@@ -385,7 +418,12 @@ TCP_CTX_SIZE		EQU 38		; 0x26: TCP_STATE .. TCP_RX_DATA_LEN+1
 
 ; Entire tcp_lib BSS span including non-context scratch above.
 ; Literal for relocatable DLL builds; never derive this from addresses.
+	IFDEF	UNET_DLL
+TCP_BSS_SIZE	EQU	76
+	ELSE
 TCP_BSS_SIZE		EQU 57		; 0x39 bytes
+
+	ENDIF
 
 ; tcp_lib max outgoing Ethernet frame: 14 + 20 + 20 + 536-byte send chunk
 ; = 590 bytes.  Apps that pull tcp_lib must size TX_BUF

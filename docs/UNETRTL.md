@@ -183,20 +183,64 @@ which card it got.  None of them changes the calling convention.
 
 ## Bounded TCP retransmission
 
-`UNETRTL.DLL` splits outbound TCP payloads into 536-byte chunks and sends them
-stop-and-wait: each segment must receive its cumulative ACK before the
-next segment is sent.  A missing data segment or ACK is retried with the
-same TCP sequence number, up to four transmissions with a one-second ACK
-wait per attempt.  Exhaustion returns `NERR_SEND`; `DE` still reports the
-bytes confirmed, including a partial ACK of the failing chunk.
+Since 0.4.2, TCP SEND respects the peer's advertised window as well as the
+536-byte outbound MSS. Partial ACKs move the next transmission to the first
+unconfirmed byte. `DE` always counts the confirmed prefix of the original
+call, from zero through the requested length, including across `NERR_AGAIN`.
+Window advertisements use per-channel SND.WL1/WL2 freshness checks and
+modulo-32 sequence arithmetic. Acceptable empty ACKs create no ACK reply or
+receive-ACK debt; data, FIN, duplicates and probes still receive ACKs.
 
-A NIC transmit error returns `NERR_HW` at once.  Since 0.3.12 it also keeps
-the sequence state honest about what it proves: only a **first** attempt that
-failed to leave the NIC rewinds the stream to the unacknowledged byte.  A
-failed *retransmission* says nothing about the earlier copy -- it may well
-have reached the peer -- so the segment stays outstanding and the next
-`CLOSE` aborts with the dual RST described below instead of sending a FIN at
-a sequence number the peer may already be past.  This matches `UNET509B`.
+A missing segment or ACK permits four transmissions with approximately one
+second of polling per attempt. Exhaustion returns `NERR_SEND`; NIC transmit
+failure returns `NERR_HW`, and cancellation returns `NERR_CANCEL`.
+
+A closed peer window instead starts persist: one-byte probes after roughly
+1, 2, then 4 seconds, with subsequent intervals capped at 4 seconds. Replies
+keep the connection alive without consuming the ordinary data retry budget;
+four consecutive unanswered probes fail the operation. An opening window
+resumes the unconfirmed suffix, including when its original update was lost.
+See [RFC 9293 section 3.8.6.1](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.6.1).
+These intervals count poll iterations; conversion to system timers is separate
+work. On the 2026-10-20 Battleship/MAME stand, a 50-tick SEND slice took
+up to 71 ms, and the 2/4-second probe budgets took about 2.70/5.37 seconds
+(roughly 1.35 times nominal). These are stand measurements, not a portable
+wall-clock guarantee; CPU speed, packets and consumer IRQ handlers affect it. `SENDSLICE` budgets also include ACK/window-update processing rather than
+restarting on each packet. With `SENDSLICE=0`, a living peer may keep SEND
+blocked in persist indefinitely; each internal wait is bounded and the
+existing `CANCELKEYS` mechanism can interrupt it. With a nonzero slice,
+resume `NERR_AGAIN` using the same channel, pointer and length. In RTL,
+`NERR_AGAIN` with a nonzero SENDSLICE also means the slice was spent
+processing ACKs/window updates, or another channel's UDP datagram needs
+draining; it does not imply silence. With SENDSLICE=0, SEND never returns
+AGAIN: it discards a foreign UDP head and continues the TCP wait. The next
+RECV on that UDP channel reports `UNET_RXF_LOST`. CLOSE also discards a blocking foreign UDP head and leaves LOST on the
+UDP channel if it stays open. NETDONE tears both channels down. Neither
+abandons the FIN wait because of that UDP head.
+The frozen `unet.inc` comments retain the original ESP silence wording.
+This section specifies the RTL behavior without changing the shared ABI.
+
+After a final SEND timeout, NIC transmit error or cancellation, the channel
+stays occupied until `CLOSE` or `NETDONE`. Further SENDs return
+`NERR_CLOSED`, `DE=0`, without transmitting. RECV drains already queued data
+and then returns `NERR_CLOSED`; STATUS clears `UNET_ST_CONN`. CLOSE sends
+RST and frees the slot, or rearms its listener. This also applies when the
+first attempted transmission failed. Orderly peer FIN/RST keep the separate
+handling below. A late peer FIN processed while receiving on the other
+channel cannot restore CONN or turn a terminal SEND failure into a half-close.
+
+Since 0.4.6, an aborted channel with no queued bytes does not assert
+`RXPEND` or cause `XCHAN` on the other channel. A partial drain retains both
+hints while bytes remain. The slot itself is still reserved: after a final
+SEND timeout, NIC error, cancellation or non-covering FIN, the client
+must call CLOSE (or NETDONE) to release it or rearm LISTEN. Repeated RECV
+returns CLOSED/DE=0 and does not perform that cleanup. A deferred orderly
+peer FIN still requests receive service until RECV reports EOF. The peer-RST
+release/rearm path described below is unchanged.
+An aborted outbound TCP channel with no queued bytes, not yet explicitly
+closed, has STATUS=0, just like a free slot; CONNECT and LISTEN on it return
+`NERR_STATE` until CLOSE. Do not use STATUS alone to decide that such a
+slot can be reused.
 
 Since 0.3.8, a peer FIN that arrives during that ACK wait **and leaves the
 current chunk unacknowledged** is reported as `NERR_CLOSED`, not `NERR_SEND`.
@@ -205,13 +249,21 @@ an HTTP `4xx` refusing a WebDAV `PUT`, for example -- and then close.  Those
 response bytes are already saved by the receive sink, so `SEND` only names
 the outcome: it does not release the channel or clear the queue.  `DE` is the
 acknowledged prefix, the following `RECV` calls return the response, and the
-`RECV` after the last byte returns `NERR_CLOSED` and releases the channel.
+`RECV` after the last byte returns `NERR_CLOSED`. Since 0.4.5 this failed
+SEND also marks the stream aborted: subsequent SENDs return `NERR_CLOSED`,
+`DE=0`, without reusing the unacknowledged sequence range. STATUS clears
+CONN; CLOSE/NETDONE releases or rearms the channel after sending abort resets.
 
 A FIN whose ACK *does* cover the whole chunk is not an error at all: that
 `SEND` succeeds with its full length, the remaining chunks of the same call
-are still sent to the half-closed peer, and the close surfaces on the next
-`RECV` exactly as it always has.  A peer RST keeps its old mapping, which
-does discard the queue.
+are still sent to the half-closed peer, including across `NERR_AGAIN` resumes.
+Further SENDs are allowed while that peer can still read. STATUS retains
+`UNET_ST_CONN` until RECV drains the saved response and releases the channel. A peer RST discards the remaining queue, releases or rearms the channel,
+and prohibits further SEND on that stream (`NERR_STATE` on the released or
+rearmed slot). Bytes already copied by public
+RECV remain visible with `NERR_CLOSED` and their actual DE count. A foreign
+RST performs the same queue cleanup and listener rearm; STATUS cannot retain
+a stale RXPEND on a released slot.
 
 `LASTERR` reports `tcp=08` for the FIN case (`F_CLOSED`); before 0.3.8 the
 FIN left no reason at all, so the pair read `nerr=05 tcp=00` and no consumer
@@ -222,12 +274,15 @@ could tell a refusal from a dead peer.
 Since 0.3.10, `CLOSE` tells the peer the connection is over in a way it can
 actually act on, and reports whether it managed to.
 
-When the send stream is fully acknowledged, `CLOSE` sends `FIN+ACK` and waits
-for the peer to acknowledge it, retransmitting the FIN up to three times with
-a 500 ms wait each.  On a healthy link the acknowledgement arrives in about a
+When the send stream is fully acknowledged and has not been aborted, `CLOSE` sends `FIN+ACK` and waits
+for the peer to acknowledge it, transmitting the FIN at most three times
+(two retransmissions) with
+a 500-poll-tick wait each. Non-covering ACKs consume the same attempt
+budget; they neither prove the FIN arrived nor restart the wait. Unread
+incoming data instead causes the abort described below. Only a cumulative ACK covering the FIN or a peer RST completes it.  On a healthy link the acknowledgement arrives in about a
 millisecond and the close costs nothing measurable; a peer that has gone away
-caps the call at 1.5 s.  The wait runs through the normal receive path, so a
-segment for the OTHER channel arriving mid-close is queued, not discarded --
+caps the wait at 1500 polling ticks (see the timing caveat above).  The wait runs through the normal receive path, so a
+segment for the OTHER TCP channel arriving mid-close is queued --
 the case that made the pre-0.3.8 blind drain unusable (FTP's `226 Transfer
 complete` on the control connection while the data connection was closing).
 
@@ -244,12 +299,17 @@ connection per RFC 1122 4.2.2.13, sending `RST+ACK` at both candidate
 sequence numbers, since an RFC 5961 peer honours a reset only at exactly its
 `RCV.NXT`.
 
+A close with unread received bytes also aborts through RST. If data arrives
+during the FIN wait, the receive path may ACK it, but CLOSE follows with RST
+to tell the peer those bytes were not read by the application. This includes
+a data-bearing ACK that covers our FIN.
+
 `CLOSE` reports what the peer can be known to have learned:
 
 | Return | Meaning |
 | --- | --- |
-| `NERR_OK` | the peer acknowledged the FIN, answered it, or reset us |
-| `NERR_TIMEOUT` | the FIN went out (up to three times) and was met with silence |
+| `NERR_OK` | FIN cumulatively acknowledged, peer RST received, or local abort resets transmitted |
+| `NERR_TIMEOUT` | FIN remained unacknowledged after three bounded attempts, even if other traffic arrived |
 | `NERR_CANCEL` | the user ended the wait before any answer arrived |
 | `NERR_HW` | a FIN or RST never reached the wire at all |
 
@@ -269,8 +329,12 @@ the one that would have been honoured.
 released locally in every case -- there is no state left to retry from -- but
 a consumer that must know the peer was told can now see that it was not, and
 `LASTERR` carries the underlying TCP reason.  `CLOSE` stays idempotent, and a
-close against an unreachable peer costs the full 1.5 s before reporting
+close against an unreachable peer spends the full 1500 polling ticks before reporting
 `NERR_TIMEOUT`.
+
+The released channel does not retain a TIME_WAIT receiver. A peer FIN
+arriving after the ACK of our FIN and local release is still ignored; this
+release does not claim to fix that older limitation.
 
 Since 0.3.1, every received TCP payload is saved BEFORE advancing the receive
 sequence or sending its ACK. During public `RECV`, bytes go to the caller
@@ -344,35 +408,48 @@ reports `NERR_HW`.
 
 ## Non-blocking SEND
 
-By default `SEND` blocks like any stop-and-wait TCP client: up to four
-1-second ACK-wait attempts (see "Bounded TCP retransmission" above)
-before it gives up. `SETOPT UNET_OPT_SENDSLICE` (option value in
+By default `SEND` blocks through ordinary ACK retries and through persist
+while a peer answers zero-window probes (see "Bounded TCP retransmission"
+above). `SETOPT UNET_OPT_SENDSLICE` (option value in
 `DE`) trades that block for a bounded one: `DE=0` restores the
-default blocking behavior; any other value is the maximum number of
-milliseconds one `SEND` call may wait before returning, clamped to a
-50 ms minimum (1..49 are raised to 50; values from 256 upward pass
-through unclamped since the low byte alone cannot express them).
+default blocking behavior; any other value sets a nominal millisecond
+poll budget for one `SEND` call, clamped to at least 50 ticks (1..49 are
+raised to 50; values from 256 upward pass through unclamped). This is not
+a wall-clock bound; see the measured timing factor above.
 
 While a slice expires with the current attempt's ACK still
 outstanding, `SEND` returns `NERR_AGAIN` and `DE` reports the bytes
-already confirmed by earlier chunks of the same call -- the
-in-flight chunk is neither dropped nor retransmitted yet, so the
-consumer's own retransmit timer keeps counting down across repeated
-`NERR_AGAIN` calls. The very next `SEND` call on that channel must
+already confirmed, including a partial ACK of the current chunk. The
+unconfirmed suffix remains pending and the DLL's retry/persist budget
+continues across repeated `NERR_AGAIN` calls. The very next `SEND` call on that channel must
 pass the *same* buffer pointer and length as the original call (a
 resume, not a new send); calling `SEND` with different arguments, or
 on a different channel, while a send is suspended returns
-`NERR_STATE`. Once the whole four-attempt/four-second budget is
-exhausted with no ACK, `SEND` finally reports `NERR_SEND` as usual.
+`NERR_STATE`. Four ordinary unanswered transmissions, or four consecutive
+unanswered persist probes, finally return `NERR_SEND`. A living peer with
+a closed window has no overall four-second limit.
 
-While a `SEND` is suspended, `RECV` on the same channel serves only
-data already queued from the pending-payload slot (see "Bounded TCP
-retransmission") -- it does not touch the NIC, and a connection that
+While a `SEND` is suspended, TCP `RECV` on either channel serves only
+data already queued from its pending-payload slot (see "Bounded TCP
+retransmission"). A listening channel does not advance accept. These calls
+do not touch the NIC, and a connection that
 the peer closed while the send was suspended is not reported as
 `NERR_CLOSED` until the send resume completes. `CONNECT`, `UDPOPEN`,
-`CLOSE`, `NETDONE`, `NETINIT`, `LISTEN`, `UNLISTEN`, `PING` and
-`RESOLVE` all return `NERR_BUSY` while any channel has a suspended
-send.
+`NETINIT`, `LISTEN`, `UNLISTEN`, `PING` and `RESOLVE` return `NERR_BUSY`
+while any channel has a suspended SEND. Since 0.4.3, CLOSE on its owner
+explicitly cancels that SEND, sends abort resets and frees/rearms the channel.
+The abandoned SEND has no further byte-count result and must not be resumed.
+CLOSE on the other channel returns `NERR_BUSY`; NETDONE cancels the pending
+SEND and tears down both channels. FINI (the libman free hook) also cancels
+a suspended SEND before teardown, including a zero-window wait before any
+byte was transmitted; unloading cannot present a truncated stream as EOF.
+UDP RECV on the other channel may drain a datagram only when it is at the
+head of the NIC ring, then the consumer resumes the original TCP SEND. An
+ACK/FIN/RST for the suspended TCP channel at that head blocks UDP RECV:
+it returns no data with XCHAN until SEND resumes. This
+UDP RECV honors its own IY budget and may wait for that entire budget. UDP
+SEND on the other channel is also allowed while TCP SEND is suspended. TCP
+ACK/FIN/RST for a pending SEND stay reserved for that resume.
 
 Developer test:
 
@@ -447,8 +524,10 @@ Channel arguments 0 and 1 have independent TCP/UDP tuples, sequence state,
 timeouts, close state and pending TCP data.  When a frame for the other TCP
 channel reaches the head of the RTL receive ring, the DLL processes and ACKs
 it under that channel's context, saving its payload before ACKing and continuing the
-original wait.  A foreign UDP datagram remains protected at the ring head
-until its owner is read.  `STATUS` reports `UNET_ST_RXPEND`, and `RECV` flag
+original wait. A foreign UDP datagram remains protected at the ring head
+until its owner is read during RECV or a sliced SEND. Blocking SEND and
+CLOSE may instead discard that UDP head with a LOST notification, as
+described above.  `STATUS` reports `UNET_ST_RXPEND`, and `RECV` flag
 bit 3 reports `UNET_RXF_XCHAN`, when the other channel needs service.
 
 There is one 536-byte deferred TCP queue per channel. A larger incoming segment
@@ -457,6 +536,11 @@ suffix is not acknowledged and is recovered by overlap-aware retransmission.
 Applications should follow the normal UNET rule: service `RXPEND`/`XCHAN`
 promptly and do not issue more work on a channel whose receive queue is
 already pending.
+
+For a terminal SEND failure, drain any saved response and then call CLOSE.
+An empty aborted channel has no further receive work, so its error state
+alone does not keep `RXPEND`/`XCHAN` set. Receiving CLOSED does not release
+that slot; CLOSE/NETDONE is required even after the hints have cleared.
 
 Developer test:
 
@@ -526,3 +610,52 @@ same suite keeps the foreign-channel capacity checks, failed-ACK cases,
 payload/FIN ordering, retransmission, and WIN1/WIN2 relocation coverage. A
 dedicated transmit fault on the opening ACK must return `NERR_HW` with
 preserved `LASTERR` state and a closed ISA window.
+
+## Reproducing release 0.4.6
+
+Use sjasmplus 1.22.0 and sprinter-mkdll from libman 1.3, then run
+`make test-host package image`. `tools/build.sh` fixes the L1 header date to
+`2026-10-20`, uses the tag from `src/include/version.inc`, disables compression,
+and appends the assembled cold overlay. Run `make build` again and compare
+`shasum -a 256 UNETRTL.DLL`; identical inputs reproduce the DLL byte for byte.
+The TCP fix lives in the main L1 image and needs no additional code page.
+Existing receive queues and the 1472-byte UDP payload limit are retained.
+
+Since 0.4.5, a duplicate or out-of-order FIN is acknowledged at the current
+RCV.NXT but cannot report EOF or terminate SEND. Only a newly accepted FIN
+can do so; a later ordinary ACK in CLOSE_WAIT still advances SEND. Host
+regressions cover missing data before FIN, a duplicate FIN after half-close,
+and a fresh SEND after a non-covering accepted FIN, in WIN1/WIN2 with
+blocking and sliced SEND.
+The channel-state address helper also increments the full HL pointer, so
+moving CH_STATE across a 256-byte boundary cannot corrupt adjacent code.
+Since 0.4.6 the pending-length/offset, closed and lost helpers also advance
+the full HL pointer. The unreachable repeated ACK_WAIT_ACTIVE check in the
+DLL receive-return path was removed; the sender and persist logic are unchanged.
+
+The frozen `unet.inc` mirror still has obsolete backend-specific capability
+comments. Use GETCAPS: UNETRTL returns `0x023F`, including MULTICHAN, LISTEN
+and ASYNCSEND. Updating those shared comments requires updating the canonical
+contract in sprinter_wifi first; this release keeps the mirror unchanged.
+
+For this build's verification record, see `docs/evidence/UNETRTL_046/README.md`.
+Earlier Battleship n3 acceptance summaries are in
+`docs/evidence/UNETRTL_044/README.md`. The runner uses a private stand copy
+and a 60-second caller deadline so a 30-second persist wait retains its
+original SEND buffer.
+Raw logs, captures and machine-readable reports are local outputs under
+`build/evidence/unetrtl` by default; they are not stored in Git.
+
+
+Since 0.4.4, DNS rebuilds each retransmission from the original hostname and
+transaction ID. Long queries borrow temporary RX scratch, which unrelated
+broadcast traffic may overwrite while waiting; that scratch is never reused
+as the next query. The retry limit and XID stay unchanged. Tests lose one or
+two requests, receive broadcast frames, and compare every retransmitted byte
+for both short and maximum-length names in WIN1/WIN2.
+
+The intermittent CBL refill gaps reported for both RTL and UNET509B have
+been traced by the stand maintainer to MAME's shared Z84C015 IRQ0 input:
+internal-device CLEAR can overwrite an asserted external interrupt request.
+No IRQ behavior was changed in this DLL. Emulator audio gaps alone do not
+establish an ISA/IFF regression; real hardware remains the final check.

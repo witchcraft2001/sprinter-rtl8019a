@@ -33,6 +33,7 @@ a diagnosis of why.
 ```
 NICREG
 NICREG -t
+NICREG -v
 NICREG /?
 ```
 
@@ -40,6 +41,7 @@ NICREG /?
 |--------|----------------------------------------------------------------|
 | (none) | Register tests only.  Nothing is transmitted.                  |
 | `-t`   | Also send 3 x 20 test frames, to be counted on another host.   |
+| `-v`   | Print each G1 register before loading/reading it, for hang localization. |
 
 The card is located the way every other utility locates it: `NET_RTL_HW`
 from the environment if set (see `NETCFG.TXT`), otherwise an auto-scan.
@@ -53,8 +55,38 @@ G3 accepts the documented DP8390 read-back where STA can remain set after
 STP; that state is not counted as an unstable CR read.
 
 The run takes about 15 seconds in turbo mode and about three times as long
-at 7 MHz.  **Run it in both modes** (F12+Ctrl+Shift toggles turbo): a fault
-that disappears at 7 MHz is a bus-timing fault.
+at 7 MHz. **Run it in both modes** (F12+Ctrl+Shift toggles turbo). A change
+with CPU speed suggests a timing dependency, but does not identify the
+failing signal. A WAIT handshake fault can also get worse at 7 MHz.
+
+### 0.4.1 hardware diagnostic fix
+
+Version 0.4.0 accidentally pinned NICREG to slot 1, base #300, ignoring
+`NET_RTL_HW`. This caused "not detected" on a slot-0 card even when FTP
+worked. Version 0.4.1 restores the common configured-location/auto-scan path.
+The larger image now claims its own WIN2 page for BSS and stack.
+
+The `[G1]` heading now prints before testing, rather than after all reads.
+Use `NICREG -v` if it still stops: the last `load page1 +NN` or `read NAME`
+line identifies the next operation. All such output runs with ISA closed,
+outside the measurement bursts. `load` logs the register write; `read`
+logs a burst setup and conditioned reads, not one single electrical cycle.
+The conditioner/target pair adds 32 CPU T-states of recovery without another
+ISA access; its read-cycle spacing grows from 11 to 43 T-states. DP8390D
+section 13 requires at least four BSCK clocks between chip selects and warns
+of ACK glitches otherwise. Connecting IOCHRDY to CPU WAIT does not provide
+the recovery interval between cycles. This is a conservative timing change;
+a photograph stopping after `[G0]` alone cannot prove an electrical cause.
+
+Page-0 FIFO (`+06`) is no longer read by `[G3]`. It is not passive storage:
+DP8390D section 12 permits reading it only during loopback diagnostics.
+An access held indefinitely by WAIT cannot be cancelled by a software
+timeout, because the CPU cannot execute its next instruction.
+
+After changing the WAIT connection, repeat the new version with cable in/out
+and turbo on/off. A complete run is still required for hardware acceptance.
+Reference: TI/National DP8390D, SNLS377A, sections 12 and 13:
+https://media.digikey.com/pdf/Data%20Sheets/Texas%20Instruments%20PDFs/DP8390D,NS32490D.pdf
 
 ## Output
 
@@ -325,14 +357,16 @@ not answer (the bus then still holds the previous byte) shows up.
 |-----------|--------------------------------------------------------------|
 | `bytes`   | Bytes that came back wrong, over the whole row.               |
 | `rd-bad`  | Of those, the ones a second read pass found intact: the first read lied, packet RAM is fine. |
-| `mem-bad` | The second pass found as many wrong again: what sits in packet RAM is wrong, so a **write** cycle was lost. |
+| `mem-bad` | The second pass found the same number of wrong bytes. A repeatable read fault and incorrect RAM contents both fit this observation. |
 | `unsure`  | The second pass agreed with neither, or could not be run.     |
 | `bursts`  | Bursts with at least one bad byte or a failed transfer.       |
 | `rdc-to`  | Transfers that could not be armed, or that never reported completion. |
 | `rxpages` | Buffer pages the receiver filled meanwhile, as in `[G4]`.     |
 
-The two passes are counted, not matched offset by offset, so "as many
-again" is a strong hint and not a proof.
+The two passes are counted, not matched offset by offset. Even identical
+wrong bytes on two reads would not distinguish incorrect RAM contents from
+a repeatable data-port read fault. This counter does not prove a lost write
+or defective packet RAM.
 
 There is no stopped row.  Every remote-DMA command carries `STA`, so a
 burst starts the chip by definition; the control is `[G4]`'s stop row,

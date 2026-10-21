@@ -343,14 +343,14 @@ for (const mss of [536, 1460]) {
 
 // Deterministic packet geometry and public ABI failure paths.
 const { probe, BIGPAY_LEN } = require('./exe-harness/unet-probe');
-const { parseTcpSegment, buildTcpSegment, respond } = require('./exe-harness/net-builders');
+const { parseTcpSegment, buildTcpSegment, buildUdpReply, udpDatagram, buildDnsResponse, buildArpRequest, respond } = require('./exe-harness/net-builders');
 const init = { fn: 3 };
 const connect = (a = 0) => ({ fn: 5, a, de: 'HOST', ix: a ? 'PORT2' : 'PORT' });
 const send = (a = 0) => ({ fn: 6, a, de: 'PAYLOAD', ix: 7 });
 const recv = (size = 1513, a = 0) => ({ fn: 7, a, de: 'BUFFER', ix: size, iy: 10 });
 const close = a => ({ fn: 8, a });
 const payload = Buffer.from(Array.from({ length: 1460 }, (_, i) => i & 255));
-function peer(onData) {
+function peer(onData, options = {}) {
   return card => {
     const sessions = {};
     card.onTransmit = frame => {
@@ -360,8 +360,8 @@ function peer(onData) {
       if (seg.flags === 2) {
         t = sessions[seg.srcPort] = { clientMac: seg.sourceMac, clientIp: seg.sourceIp, clientPort: seg.srcPort,
           serverMac: seg.destMac, serverIp: seg.destIp, serverPort: seg.dstPort,
-          serverSeq: 0x12345679, clientNext: (seg.seq + 1) >>> 0 };
-        card.schedule(1, buildTcpSegment(t, { flags: 18, seq: t.serverSeq - 1, ack: t.clientNext }));
+          serverSeq: options.serverSeq ?? 0x12345679, clientNext: (seg.seq + 1) >>> 0 };
+        card.schedule(1, buildTcpSegment(t, { flags: 18, seq: (t.serverSeq - 1) >>> 0, ack: t.clientNext, window: typeof options.window === 'function' ? options.window(seg) : (options.window ?? 2680) }));
       } else if (t) {
         if (seg.payload.length) t.clientNext = (seg.seq + seg.payload.length) >>> 0;
         onData({ card, seg, t, sessions, emit: (opts, delay = 1) => card.schedule(delay,
@@ -982,8 +982,8 @@ const expectAbortAt = (r, closeIx, seq0, msg) => {
   const sent = tcpOf(r);
   assert.ok(!sent.some(v => v.payload.length === 7), 'the failed first transmit reached the peer');
   assert.strictEqual(r.results[2].a, 1, 'SEND should have reported NERR_HW');
-  assert.ok(!sent.some(v => v.flags & 4), 'an unsent segment was aborted with RST');
-  assert.strictEqual(fins, 1, 'expected exactly one orderly FIN');
+  assert.ok(sent.some(v => v.flags & 4), 'failed SEND was not aborted with RST');
+  assert.strictEqual(fins, 0, 'an aborted channel sent an orderly FIN');
   assert.strictEqual(r.results[3].a, 0, 'an orderly close after an unsent segment reported a failure');
   checkProbe(r);
 }
@@ -1047,14 +1047,13 @@ const expectAbortAt = (r, closeIx, seq0, msg) => {
   // retry from locally -- but reporting success would tell the consumer the
   // peer had been informed when it had not.
   const txError = { attempts: [] };
-  let sent = false, armed = false;
   const r = probe([init, connect(), send(), close(0)], dllScenario({ txError }),
     peer(({ card, seg, emit }) => {
-      if (seg.payload.length) { sent = true; emit({ flags: 16 }); return; }
-      // Once the send is confirmed the client flushes its cumulative ACK;
-      // the FIN is the very next transmit, so arm the failure on that one.
-      // (The handshake ACK looks identical, hence the `sent` guard.)
-      if (sent && seg.flags === 0x10 && !armed) { armed = true; txError.attempts.push(card.txAttempts + 1); }
+      if (seg.payload.length) {
+        emit({ flags: 16 });
+        // Pure ACKs create no outgoing ACK. The next transmit is CLOSE's FIN.
+        txError.attempts.push(card.txAttempts + 1);
+      }
     }));
   assert.strictEqual(r.results[2].a, 0, 'SEND should have succeeded');
   assert.strictEqual(r.results[3].a, 1, 'CLOSE reported success for a FIN that never went out');
@@ -1105,5 +1104,817 @@ const expectAbortAt = (r, closeIx, seq0, msg) => {
     'the other channel lost a segment that arrived during the close');
   checkProbe(r);
 }
+
+
+// A persist wait with SENDSLICE=0 remains blocking while a peer answers.
+for (const dllWindow of [1, 2]) {
+  let opens = 0, base;
+  const r = probe([init, connect(), windowSendBlocking(), close(0)], dllScenario(),
+    peer(({ card, seg, emit }) => {
+      if (!opens) opens = card.currentMs + 15000;
+      if (seg.flags & 1) { emit({ flags: 16, ack: (seg.seq + 1) >>> 0 }); return; }
+      if (!seg.payload.length) return;
+      base ??= seg.seq;
+      if (card.currentMs < opens) {
+        assert.strictEqual(seg.payload.length, 1);
+        emit({ flags: 16, ack: base, window: 0 });
+      } else emit({ flags: 16, window: 536 });
+    }, { window: 0 }), dllWindow);
+  assert.strictEqual(r.results[2].a, 0);
+  assert.strictEqual(r.results[2].de, 244);
+  const start = r.events.find(x => x.label === 'UNET.F_SEND');
+  const end = r.events.find(x => x.label === 'UNET.F_SEND:return');
+  assert.ok(end.ms - start.ms >= 15000);
+  checkProbe(r);
+}
+function windowSendBlocking() { return { fn: 6, de: 'BIGPAY', ix: 244 }; }
+
+// Window-aware SEND: execute the real relocated DLL, including all resumes.
+const windowSend = (extra = {}) => ({ fn: 6, de: 'BIGPAY', ix: 244, ...extra });
+for (const dllWindow of [1, 2]) {
+  for (const pause of [0, 6000, 15000, 30000]) {
+    for (const lostUpdate of (pause ? [false, true] : [false])) {
+      let base, accepted = 0, opens = 0, probes = 0;
+      const blocks = [], bursts = [];
+      const r = probe([init, connect(), sendslice(50), windowSend({ untilSettled: true }), close(0)],
+        dllScenario(), peer(({ card, seg, t, emit }) => {
+          if (seg.flags & 1) { emit({ flags: 16, ack: (seg.seq + 1) >>> 0 }); return; }
+          if (!seg.payload.length) return;
+          base ??= seg.seq;
+          const offset = (seg.seq - base) >>> 0;
+          bursts.push({ offset, length: seg.payload.length, ms: card.currentMs });
+          if (!accepted) {
+            assert.strictEqual(seg.payload.length, 163, 'SYN window was ignored');
+            blocks.push(Buffer.from(seg.payload)); accepted = 163;
+            opens = card.currentMs + pause;
+            emit({ flags: 16, ack: (base + accepted) >>> 0, window: pause ? 0 : 163 });
+            if (pause && !lostUpdate) emit({ flags: 16, ack: (base + accepted) >>> 0, window: 163 }, pause);
+          } else if (card.currentMs < opens) {
+            assert.strictEqual(seg.payload.length, 1, 'full data retransmit in closed window');
+            probes++;
+            emit({ flags: 16, ack: (base + accepted) >>> 0, window: 0 });
+          } else {
+            assert.strictEqual(offset, accepted, 'SEND left a sequence hole or repeated acknowledged bytes');
+            blocks.push(Buffer.from(seg.payload)); accepted += seg.payload.length;
+            emit({ flags: 16, ack: (base + accepted) >>> 0, window: 163 });
+          }
+        }, { window: 163 }), dllWindow);
+      const sends = r.results.slice(3, -1);
+      assert.strictEqual(sends.at(-1).a, 0);
+      assert.strictEqual(sends.at(-1).de, 244);
+      assert.ok(sends.every(x => x.de >= 0 && x.de <= 244));
+      assert.ok(sends.slice(0, -1).every(x => x.a === 15 && x.de >= 163));
+      assert.strictEqual(accepted, 244);
+      const expected = Buffer.from(Array.from({ length: 244 }, (_, i) => (r.symbols.BIGPAY + i) & 255));
+      assert.deepStrictEqual(Buffer.concat(blocks), expected);
+      if (pause) assert.ok(probes > 0);
+      const enters = r.events.filter(x => x.label === 'UNET.F_SEND');
+      const exits = r.events.filter(x => x.label === 'UNET.F_SEND:return');
+      assert.ok(exits.every((x, i) => x.ms - enters[i].ms <= 50), 'ACK/window updates restarted the slice');
+      // Only SYN's final ACK is sent: empty data ACKs must not be ACKed back.
+      assert.strictEqual(tcpOf(r).filter(x => x.flags === 16).length, 1);
+      checkProbe(r);
+    }
+  }
+  { // Peer vanishes after closing its window. Four unanswered byte probes,
+    // then the stream stays occupied/aborted and queued data is still readable.
+    let base, first = true;
+    const reply = Buffer.from('saved before abort');
+    const r = probe([init, connect(), sendslice(50), windowSend({ untilSettled: true }),
+      windowSend(), { fn: 9 }, recv(), recv(), windowSend(), connect(), close(0)],
+      dllScenario(), peer(({ seg, emit }) => {
+        if (seg.payload.length && first) {
+          first = false; base = seg.seq;
+          emit({ ack: (base + 163) >>> 0, window: 0, payload: reply });
+        }
+      }, { window: 163 }), dllWindow);
+    const done = r.results.findIndex((x, i) => i >= 3 && x.a !== 15);
+    assert.strictEqual(r.results[done].a, 5);
+    assert.strictEqual(r.results[done].de, 163);
+    assert.strictEqual(r.results[done + 1].a, 7);
+    assert.strictEqual(r.results[done + 1].de, 0);
+    assert.strictEqual(r.results[done + 2].de & 2, 0);
+    assert.deepStrictEqual(r.results[done + 3].data, reply);
+    assert.strictEqual(r.results[done + 4].a, 7);
+    assert.strictEqual(r.results[done + 4].ix, 0, 'CLOSED RECV leaked input capacity as flags');
+    assert.strictEqual(r.results[done + 5].a, 7);
+    assert.strictEqual(r.results[done + 6].a, 11, 'aborted channel became available without CLOSE');
+    const data = tcpOf(r).filter(x => x.payload.length);
+    assert.deepStrictEqual(data.map(x => x.payload.length), [163, 1, 1, 1, 1]);
+    assert.ok(data.slice(1).every(x => x.seq === (base + 163) >>> 0));
+    assert.ok(tcpOf(r).some(x => x.flags & 4), 'CLOSE did not abort');
+    checkProbe(r);
+  }
+  { // Sequence wrap and WL1/WL2 freshness: ancient/future ACKs cannot
+    // reopen the window; an old SEG.SEQ cannot replace a fresh advertisement.
+    let first = true, next = 0xfffffff0, firstAt, reopenedAt;
+    const c = connect();
+    c.after = ({ write, dll, dllBase }) => {
+      for (const name of ['TCP_SND_NXT', 'TCP_SND_UNA'])
+        for (let i = 0; i < 4; i++) write(dllBase + dll[name] + i, (next >>> (24 - i * 8)) & 255);
+    };
+    const r = probe([init, c, sendslice(50), windowSend({ untilSettled: true }), close(0)],
+      dllScenario(), peer(({ card, seg, emit }) => {
+        if (seg.flags & 1) { emit({ flags: 16, seq: 0, ack: (seg.seq + 1) >>> 0 }); return; }
+        if (!seg.payload.length) return;
+        if (first) {
+          first = false; firstAt = card.currentMs;
+          next = (seg.seq + 100) >>> 0;
+          emit({ flags: 16, ack: next, window: 0, payload: [42] });
+          emit({ flags: 16, ack: (next - 1) >>> 0, window: 500 }, 2); // old ACK
+          emit({ flags: 16, ack: (seg.seq + 245) >>> 0, window: 500 }, 3); // future ACK
+          emit({ flags: 16, seq: 0xfffffffe, ack: next, window: 500 }, 4); // old WL1
+          emit({ flags: 16, seq: 0, ack: next, window: 0 }, 5); // new WL1 across wrap
+          emit({ flags: 16, seq: 0xffffffff, ack: next, window: 500 }, 6); // stale WL1 across wrap
+          reopenedAt = card.currentMs + 100;
+          emit({ flags: 16, seq: 0, ack: next, window: 200 }, 100);
+        } else {
+          assert.ok(card.currentMs >= reopenedAt, 'stale window reopened the stream');
+          assert.strictEqual(seg.seq, next);
+          next = (next + seg.payload.length) >>> 0;
+          emit({ flags: 16, seq: 0, ack: next, window: 200 });
+        }
+      }, { window: 163, serverSeq: 0xffffffff }), dllWindow);
+    assert.strictEqual(r.results.at(-2).a, 0);
+    assert.strictEqual(r.results.at(-2).de, 244);
+    assert.ok(reopenedAt > firstAt);
+    checkProbe(r);
+  }
+}
+
+for (const dllWindow of [1, 2]) {
+  { // Continuous duplicate ACKs must spend, rather than restart, the slice.
+    let base, first = true;
+    const r = probe([init, connect(), sendslice(50), windowSend({ untilSettled: true }), close(0)],
+      dllScenario(), peer(({ seg, emit }) => {
+        if (seg.flags & 1) { emit({ flags: 16, ack: (seg.seq + 1) >>> 0 }); return; }
+        if (!seg.payload.length) return;
+        if (first) {
+          first = false; base = seg.seq;
+          for (let i = 1; i < 500; i++) emit({ flags: 16, ack: (base + 163) >>> 0, window: 0 }, i);
+          emit({ flags: 16, ack: (base + 163) >>> 0, window: 163 }, 500);
+        } else emit({ flags: 16, window: 163 });
+      }, { window: 163 }), dllWindow);
+    const starts = r.events.filter(x => x.label === 'UNET.F_SEND');
+    const ends = r.events.filter(x => x.label === 'UNET.F_SEND:return');
+    assert.ok(starts.length > 2, 'ACK stream hid slice expirations');
+    assert.ok(ends.every((x, i) => x.ms - starts[i].ms <= 50));
+    assert.strictEqual(r.results.at(-2).de, 244);
+    assert.strictEqual(tcpOf(r).filter(x => x.flags === 16).length, 1);
+    checkProbe(r);
+  }
+  { // Distinct peer windows must follow each swapped channel.
+    const sizes = { 8080: [], 8081: [] };
+    const r = probe([init, connect(), connect(1), send(), send(1), send(), close(0), close(1)],
+      dllScenario(), peer(({ seg, emit }) => {
+        if (seg.flags & 1) emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+        if (seg.payload.length) { sizes[seg.dstPort].push(seg.payload.length); emit({ flags: 16, window: seg.dstPort === 8080 ? 3 : 6 }); }
+      }, { window: seg => seg.dstPort === 8080 ? 3 : 6 }), dllWindow);
+    assert.deepStrictEqual(sizes[8080], [3, 3, 1, 3, 3, 1]);
+    assert.deepStrictEqual(sizes[8081], [6, 1]);
+    checkProbe(r);
+  }
+  { // Cancellation makes the channel unavailable for further application data.
+    const r = probe([init, connect(), { fn: 17, a: 1, de: 1 }, send(), send(), { fn: 9 }, close(0)],
+      dllScenario({ keys: ['escape'] }), peer(() => {}), dllWindow);
+    assert.strictEqual(r.results[3].a, 8);
+    assert.strictEqual(r.results[4].a, 7);
+    assert.strictEqual(r.results[4].de, 0);
+    assert.strictEqual(r.results[5].de & 2, 0);
+    assert.strictEqual(tcpOf(r).filter(x => x.payload.length).length, 1);
+    assert.ok(tcpOf(r).some(x => x.flags & 4));
+    checkProbe(r);
+  }
+}
+
+// Passive handshake/window state must work without the optional cold page,
+// with either caller IFF and at either DLL relocation base.
+for (const dllWindow of [1, 2]) {
+  for (const iff of [0, 1]) {
+    const t = { clientMac: Buffer.from('028019112233', 'hex'), clientIp: Buffer.from([192, 168, 7, 2]), clientPort: 9000,
+      serverMac: Buffer.from('aabbccddee01', 'hex'), serverIp: Buffer.from([192, 168, 7, 1]), serverPort: 54321,
+      serverSeq: 0xfffffff0, clientNext: 0 };
+    const listen = { fn: 18, de: 9000, after: ({ card }) => {
+      card.schedule(1, buildTcpSegment(t, { flags: 2, seq: t.serverSeq, ack: 0, window: 3 }));
+    } };
+    const cmds = [init, { fn: 11, de: 'HOST', ix: 'BUFFER' }, listen, recv(), send(), close(0), { fn: 9 }, { fn: 19 }];
+    const sizes = [];
+    const scenario = dllScenario({ files: { 'UNETRTL.DLL': Buffer.concat([dllBytes.subarray(0, dllBytes.readUInt16LE(2)), Buffer.alloc(2)]) } });
+    const r = probe(cmds.map(x => ({ ...x, iff })), scenario, card => {
+      card.onTransmit = frame => {
+        const seg = parseTcpSegment(frame);
+        if (!seg) return;
+        if (seg.flags === 18) {
+          t.clientNext = (seg.seq + 1) >>> 0;
+          card.schedule(1, buildTcpSegment(t, { flags: 16, seq: (t.serverSeq + 1) >>> 0, ack: t.clientNext, window: 3 }));
+        } else if (seg.payload.length || (seg.flags & 1)) {
+          if (seg.payload.length) sizes.push(seg.payload.length);
+          t.clientNext = (seg.seq + seg.payload.length + ((seg.flags & 1) ? 1 : 0)) >>> 0;
+          card.schedule(1, buildTcpSegment(t, { flags: 16, seq: (t.serverSeq + 1) >>> 0, ack: t.clientNext, window: 3 }));
+        }
+      };
+    }, dllWindow);
+    assert.strictEqual(r.results[0].a, 0);
+    assert.strictEqual(r.results[1].a, 10, 'cold overlay unexpectedly available');
+    assert.strictEqual(r.results[2].a, 0);
+    assert.strictEqual(r.results[3].a, 0);
+    assert.strictEqual(r.results[4].a, 0);
+    assert.strictEqual(r.results[4].de, 7);
+    assert.deepStrictEqual(sizes, [3, 3, 1]);
+    assert.strictEqual(r.results[5].a, 0);
+    assert.strictEqual(r.results[6].de & 3, 1, 'CLOSE did not rearm LISTEN');
+    assert.ok(r.results.every(x => x.iff1 === iff && x.iff2 === iff), 'DLL changed caller IFF');
+    checkProbe(r);
+  }
+}
+
+for (const dllWindow of [1, 2]) {
+  // Several fully ACKed chunks must spend the same public-call slice too.
+  const r = probe([init, connect(), sendslice(50), { fn: 6, de: 'BIGPAY', ix: 1200, untilSettled: true }, close(0)],
+    dllScenario(), peer(({ seg, emit }) => {
+      if (seg.payload.length) emit({ flags: 16 }, 30);
+      else if (seg.flags & 1) emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+    }), dllWindow);
+  const starts = r.events.filter(x => x.label === 'UNET.F_SEND');
+  const ends = r.events.filter(x => x.label === 'UNET.F_SEND:return');
+  assert.ok(starts.length > 1, 'each MSS chunk restarted SENDSLICE');
+  assert.ok(ends.every((x, i) => x.ms - starts[i].ms <= 50));
+  assert.strictEqual(r.results.at(-2).de, 1200);
+  checkProbe(r);
+}
+
+// 0.4.3: peer half-close must not strand a suspended public SEND.
+for (const dllWindow of [1, 2]) {
+  let chunks = 0, nextPeer;
+  const response = Buffer.from('half-close response');
+  const r = probe([init, connect(), sendslice(50),
+    { fn: 6, de: 'BIGPAY', ix: 1200, untilSettled: true }, { fn: 9 }, send(), recv(), close(0), { fn: 4 }],
+    dllScenario(), peer(({ seg, t, emit }) => {
+      if (seg.payload.length) {
+        if (++chunks === 1) {
+          nextPeer = (t.serverSeq + response.length + 1) >>> 0;
+          emit({ flags: 25, payload: response });
+        } else emit({ flags: 16, seq: nextPeer }, chunks === 2 ? 80 : 1);
+      } else if (seg.flags & 1) emit({ flags: 16, seq: nextPeer, ack: (seg.seq + 1) >>> 0 });
+    }), dllWindow);
+  const completed = r.results.findIndex((x, i) => i >= 3 && x.a !== 15);
+  assert.ok(completed > 3, 'half-close vector did not suspend');
+  assert.ok(r.results.slice(3, completed).every(x => x.a === 15 && x.de >= 536));
+  assert.strictEqual(r.results[completed].a, 0, 'FIN blocked the matching SEND resume');
+  assert.strictEqual(r.results[completed].de, 1200);
+  assert.strictEqual(r.results[completed + 1].de & 2, 2, 'half-close cleared CONN before queue drain');
+  assert.strictEqual(r.results[completed + 2].a, 0, 'half-closed peer can still read a fresh SEND');
+  assert.strictEqual(r.results[completed + 2].de, 7);
+  assert.deepStrictEqual(r.results[completed + 3].data, response);
+  assert.strictEqual(r.results[completed + 4].a, 0, 'CLOSE remained BUSY after resume');
+  assert.strictEqual(r.results[completed + 5].a, 0, 'NETDONE remained BUSY after resume');
+  checkProbe(r);
+}
+
+for (const dllWindow of [1, 2]) {
+  for (const failSeed of [0, 2]) {
+    for (const mode of ['silent-fin', 'late-fin-ack', 'echo-during-close']) {
+      const times = [];
+      let fins = 0;
+      const sending = send();
+      sending.after = ({ dll, dllBase, write }) => write(dllBase + dll.TCP_LAST_FAIL, failSeed);
+      const r = probe([init, connect(), sending, close(0)], dllScenario(), peer(({ card, seg, t, emit }) => {
+        if (seg.payload.length) { emit({ flags: 16, window: 0 }); return; }
+        if (seg.flags & 1) {
+          times.push(card.currentMs); fins++;
+          if (mode !== 'silent-fin' && fins >= 2) {
+            emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+          } else if (mode === 'echo-during-close') {
+            emit({ flags: 24, ack: seg.seq, payload: [42] });
+            for (let i = 2; i < 20; i++) emit({ flags: 16, seq: (t.serverSeq + 1) >>> 0, ack: seg.seq }, i);
+          } else emit({ flags: 16, ack: seg.seq, window: 0 });
+        }
+      }), dllWindow);
+      assert.strictEqual(r.results[3].a, mode === 'silent-fin' ? 12 : 0,
+        `CLOSE ${mode} stale LAST_FAIL=${failSeed}`);
+      assert.strictEqual(fins, mode === 'silent-fin' ? 3 : mode === 'echo-during-close' ? 1 : 2);
+      if (mode === 'echo-during-close') assert.strictEqual(tcpOf(r).filter(x => x.flags & 4).length, 2);
+      assert.ok(times.slice(1).every((t, i) => t - times[i] >= 480), 'non-covering ACKs burned FIN attempts early');
+      checkProbe(r);
+    }
+  }
+}
+
+// Explicit teardown cancels a pending persist SEND, including on channel 1.
+for (const dllWindow of [1, 2]) {
+  for (const owner of [0, 1]) {
+    for (const netdone of [false, true]) {
+      const r = probe([init, connect(owner), sendslice(50), send(owner), close(owner ^ 1),
+        netdone ? { fn: 4 } : close(owner), connect(owner), close(owner)],
+      dllScenario(), peer(({ seg, emit }) => {
+        if (seg.flags & 1) emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+      }, { window: 0 }), dllWindow);
+      assert.strictEqual(r.results[3].a, 15, 'zero-window SEND did not suspend');
+      assert.strictEqual(r.results[4].a, 13, 'another channel cancelled the pending SEND');
+      assert.strictEqual(r.results[5].a, 0, 'explicit teardown remained BUSY');
+      assert.strictEqual(r.results[6].a, 0, 'cancelled channel could not reconnect');
+      assert.ok(tcpOf(r).some(x => x.flags & 4), 'cancelled SEND closed without RST');
+      checkProbe(r);
+    }
+  }
+}
+
+// A UDP head must yield TCP SEND without poisoning the connection. The
+// consumer can drain UDP, then resume the identical TCP invocation.
+for (const dllWindow of [1, 2]) {
+  for (const reset of [false, true]) {
+    for (const owner of [0, 1]) {
+      const bytes = Buffer.from('foreign UDP');
+      const udp = owner ^ 1;
+      const open = { fn: 10, a: udp, de: 'HOST', ix: udp ? 'PORT2' : 'PORT' };
+      const r = probe([init, connect(owner), open, sendslice(50), send(owner), recv(1513, udp),
+        { ...send(owner), untilSettled: true }, { fn: 9 }, close(owner), close(udp), { fn: 4 }],
+      dllScenario(), peer(({ seg, t, card, emit }) => {
+        if (seg.payload.length) {
+          card.schedule(1, buildUdpReply({ sourceIp: t.clientIp, sourceMac: t.clientMac,
+            sourcePort: 0xc400 + udp, destPort: 8080 + udp, destIp: t.serverIp }, bytes));
+          emit(reset ? { flags: 20, ack: seg.seq } : { flags: 16 }, 2);
+        } else if (seg.flags & 1) emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+      }), dllWindow);
+      assert.strictEqual(r.results[4].a, 15, 'foreign UDP aborted TCP SEND');
+      assert.deepStrictEqual(r.results[5].data, bytes);
+      const settled = r.results.findIndex((x, i) => i >= 6 && x.a !== 15);
+      assert.strictEqual(r.results[settled].a, reset ? 7 : 0);
+      if (!reset) assert.strictEqual(r.results[settled].de, 7);
+      assert.strictEqual(r.results.at(-1).a, 0, 'pending SEND left teardown BUSY');
+      checkProbe(r);
+    }
+  }
+}
+
+// Cancelling an accepted listener's persist SEND must rearm LISTEN,
+// including when the optional cold overlay was not available at NETINIT.
+for (const dllWindow of [1, 2]) {
+  const t = { clientMac: Buffer.from('028019112233', 'hex'), clientIp: Buffer.from([192, 168, 7, 2]), clientPort: 9000,
+    serverMac: Buffer.from('aabbccddee01', 'hex'), serverIp: Buffer.from([192, 168, 7, 1]), serverPort: 54321,
+    serverSeq: 0x12345678, clientNext: 0 };
+  const listen = { fn: 18, de: 9000, after: ({ card }) => {
+    card.schedule(1, buildTcpSegment(t, { flags: 2, seq: t.serverSeq, ack: 0, window: 0 }));
+  } };
+  const scenario = dllScenario({ files: { 'UNETRTL.DLL': Buffer.concat([
+    dllBytes.subarray(0, dllBytes.readUInt16LE(2)), Buffer.alloc(2)]) } });
+  const r = probe([init, listen, recv(), sendslice(50), send(), close(0), { fn: 9 }, { fn: 19 }, { fn: 4 }],
+    scenario, card => {
+      card.onTransmit = frame => {
+        const seg = parseTcpSegment(frame);
+        if (seg?.flags === 18) {
+          t.clientNext = (seg.seq + 1) >>> 0;
+          card.schedule(1, buildTcpSegment(t, { flags: 16, seq: t.serverSeq + 1, ack: t.clientNext, window: 0 }));
+        }
+      };
+    }, dllWindow);
+  assert.strictEqual(r.results[4].a, 15);
+  assert.strictEqual(r.results[5].a, 0);
+  assert.strictEqual(r.results[6].de & 3, 1, 'cancelled listener did not rearm');
+  assert.strictEqual(r.results[7].a, 0);
+  assert.strictEqual(r.results[8].a, 0);
+  assert.ok(tcpOf(r).some(x => x.flags & 4));
+  checkProbe(r);
+}
+
+// A late peer FIN processed while receiving UDP must not turn a terminal
+// SEND failure back into an orderly half-close or restore STATUS.CONN.
+for (const dllWindow of [1, 2]) {
+  for (const owner of [0, 1]) {
+    let failedPeer;
+    const udp = owner ^ 1, response = Buffer.from('late FIN');
+    const failing = { ...send(owner), after: ({ card }) => {
+      card.schedule(1, buildTcpSegment(failedPeer, { flags: 25, seq: failedPeer.serverSeq,
+        ack: failedPeer.clientNext, payload: response }));
+    } };
+    const r = probe([init, connect(owner), { fn: 10, a: udp, de: 'HOST', ix: udp ? 'PORT2' : 'PORT' },
+      failing, recv(1513, udp), { fn: 9, a: owner }, send(owner), recv(1513, owner), recv(1513, owner),
+      close(owner), close(udp)], dllScenario(), peer(({ seg, t }) => {
+        if (seg.payload.length) failedPeer = t; // no ACK: terminal timeout
+      }), dllWindow);
+    assert.strictEqual(r.results[3].a, 5);
+    assert.strictEqual(r.results[5].de & 2, 0, 'late FIN restored terminal STATUS.CONN');
+    assert.strictEqual(r.results[6].a, 7);
+    assert.strictEqual(r.results[6].de, 0);
+    assert.deepStrictEqual(r.results[7].data, response);
+    assert.strictEqual(r.results[8].a, 7);
+    assert.strictEqual(r.results[9].a, 0);
+    checkProbe(r);
+  }
+}
+
+// Check IFF inside polling, beyond the existing public-return IFF checks.
+// ARP traffic during PING forces cold code to transmit through the hot NIC.
+for (const dllWindow of [1, 2]) {
+  for (const iff of [0, 1]) {
+    const r = probe([init, { fn: 12, de: 'HOST', iy: 100 }, connect(), recv(), close(0)]
+      .map(x => ({ ...x, iff })), dllScenario({ traceDllDelays: true, timerInterrupt: true,
+        responders: { arp: arpToServer, icmp: { afterMs: 30, probeAfterMs: 3 }, tcp: {} },
+      }), undefined, dllWindow);
+    assert.strictEqual(r.results[1].a, 0, 'PING cold callback failed');
+    const delays = r.events.filter(x => x.label === 'delay');
+    assert.ok(delays.some(x => x.page0 === 0), 'vector did not delay in hot code');
+    assert.ok(delays.every(x => !x.isaOpen), 'delay with ISA open');
+    assert.ok(delays.every(x => x.iff === (x.page0 === 0 ? iff : 0)),
+      'cold callback lost the outer ISA interrupt state');
+    assert.ok(r.results.every(x => x.iff1 === iff && x.iff2 === iff));
+    checkProbe(r);
+  }
+}
+
+// Longest accepted DNS name builds past the 96-byte hot TX scratch into
+// dead RX scratch, then must receive and parse its response intact.
+for (const dllWindow of [1, 2]) {
+  const host = `${'a'.repeat(63)}.${'b'.repeat(63)}`;
+  const scenario = dllScenario({ responders: { arp: arpToServer, dns: { ip: [192, 168, 7, 1] } } });
+  scenario.environment.NET_DNS1 = '192.168.7.1';
+  const initWithHost = { ...init, after: ({ symbols, write }) => {
+    for (const [i, byte] of Buffer.from(host + '\0').entries()) write(symbols.BIGPAY + i, byte);
+  } };
+  const r = probe([initWithHost, { fn: 11, de: 'BIGPAY', ix: 'BUFFER' }], scenario, undefined, dllWindow);
+  assert.strictEqual(r.results[1].a, 0);
+  assert.deepStrictEqual(r.results[1].data.subarray(0, 12), Buffer.from('192.168.7.1\0'));
+  checkProbe(r);
+}
+
+// 0.4.4 review regressions. Collect failures so one broken path does not
+// hide independent review findings on the baseline DLL.
+const reviewFailures = [];
+function reviewCase(name, fn) {
+  try { fn(); } catch (e) { reviewFailures.push(`${name}: ${e.message}`); }
+}
+for (const dllWindow of [1, 2]) {
+  reviewCase(`WIN${dllWindow} blocking SEND/UDP`, () => {
+    const r = probe([init, connect(), { fn: 10, a: 1, de: 'HOST', ix: 'PORT2' }, send(),
+      recv(1513, 1), { fn: 9 }, send(), close(0), close(1)], dllScenario(), peer(({ seg, t, card, emit }) => {
+      if (seg.payload.length) {
+        card.schedule(1, buildUdpReply({ sourceIp: t.clientIp, sourceMac: t.clientMac,
+          sourcePort: 0xc401, destPort: 8081, destIp: t.serverIp }, [1, 2, 3]));
+        emit({ flags: 16 }, 2);
+      } else if (seg.flags & 1) emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+    }), dllWindow);
+    assert.strictEqual(r.results[3].a, 0, 'blocking SEND returned AGAIN');
+    assert.strictEqual(r.results[3].de, 7);
+    assert.strictEqual(r.results[4].de, 0, 'blocking discard must not invent UDP bytes');
+    assert.strictEqual(r.results[4].ix & 4, 4, 'discarded UDP did not report LOST');
+    assert.strictEqual(r.results[5].de & 2, 2);
+    assert.strictEqual(r.results[6].a, 0, 'blocking SEND left a suspended transaction');
+    assert.strictEqual(r.exitCode, 0);
+    assert.ok(r.cleanup.isaClosed && r.cleanup.filesClosed);
+    count();
+  });
+  for (const lost of [1, 2]) {
+    for (const host of ['short.test', `${'a'.repeat(63)}.${'b'.repeat(63)}`]) {
+      reviewCase(`WIN${dllWindow} DNS ${host.length} chars/drop ${lost}`, () => {
+        let first, queries = 0;
+        const scenario = dllScenario(); scenario.environment.NET_DNS1 = '192.168.7.1';
+        const initHost = { ...init, after: ({ symbols, write }) => {
+          for (const [i, byte] of Buffer.from(host + '\0').entries()) write(symbols.BIGPAY + i, byte);
+        } };
+        const r = probe([initHost, { fn: 11, de: 'BIGPAY', ix: 'BUFFER' }], scenario, card => {
+          card.onTransmit = frame => {
+            const udp = udpDatagram(frame);
+            if (!udp || udp.destPort !== 53) { respond(frame, card, { responders: { arp: arpToServer } }); return; }
+            first ??= Buffer.from(frame);
+            assert.deepStrictEqual(Buffer.from(frame), first, 'DNS retry changed after receiving broadcast');
+            if (++queries <= lost) card.schedule(1, buildArpRequest([192, 168, 7, 99]));
+            else card.schedule(1, buildDnsResponse(udp, { ip: [192, 168, 7, 1] }));
+          };
+        }, dllWindow);
+        assert.strictEqual(r.results[1].a, 0);
+        assert.strictEqual(queries, lost + 1);
+        assert.deepStrictEqual(r.results[1].data.subarray(0, 12), Buffer.from('192.168.7.1\0'));
+        checkProbe(r);
+      });
+    }
+  }
+  for (const slice of [0, 50]) {
+    for (const smallWindow of [false, true]) {
+      reviewCase(`WIN${dllWindow} half-close/window slice=${slice} small=${smallWindow}`, () => {
+        let accepted = 0, closedAt, seqBase, peerNext;
+        const got = [];
+        const r = probe([init, connect(), sendslice(slice), { fn: 6, de: 'BIGPAY', ix: 1200, untilSettled: true }, close(0)],
+          dllScenario(), peer(({ seg, t, card, emit }) => {
+            if (seg.flags & 1) { emit({ flags: 16, seq: peerNext, ack: (seg.seq + 1) >>> 0 }); return; }
+            if (!seg.payload.length) return;
+            seqBase ??= seg.seq;
+            if (!accepted) {
+              got.push(Buffer.from(seg.payload)); accepted = seg.payload.length; peerNext = (t.serverSeq + 1) >>> 0;
+              emit({ flags: 17, ack: (seqBase + accepted) >>> 0, window: smallWindow ? 163 : 536 });
+            } else if (closedAt === undefined) {
+              got.push(Buffer.from(seg.payload.slice(0, 163))); accepted += 163; closedAt = card.currentMs;
+              emit({ flags: 16, seq: peerNext, ack: (seqBase + accepted) >>> 0, window: 0 });
+            } else if (card.currentMs - closedAt < 2500) {
+              assert.strictEqual(seg.payload.length, 1, 'full data in half-closed zero window');
+              emit({ flags: 16, seq: peerNext, ack: (seqBase + accepted) >>> 0, window: 0 });
+            } else {
+              assert.strictEqual((seg.seq - seqBase) >>> 0, accepted, 'half-close skipped the unconfirmed tail');
+              got.push(Buffer.from(seg.payload)); accepted += seg.payload.length;
+              emit({ flags: 16, seq: peerNext, ack: (seqBase + accepted) >>> 0, window: 536 });
+            }
+          }), dllWindow);
+        assert.strictEqual(r.results.at(-2).a, 0, 'old FIN terminated an incomplete ACK');
+        assert.strictEqual(r.results.at(-2).de, 1200);
+        assert.deepStrictEqual(Buffer.concat(got), expectedBig(r, 1));
+        if (!slice) assert.ok(r.results.every(x => x.a !== 15));
+        checkProbe(r);
+      });
+    }
+  }
+  for (const owner of [0, 1]) {
+    reviewCase(`WIN${dllWindow} FINI cancels channel ${owner}`, () => {
+      const r = probe([init, connect(owner), sendslice(50), send(owner)], dllScenario(), peer(({ seg, emit }) => {
+        if (seg.flags & 1) emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+      }, { window: 0 }), dllWindow);
+      assert.strictEqual(r.results.at(-1).a, 15);
+      assert.ok(tcpOf(r).some(x => x.flags & 4), 'FINI sent an orderly truncated stream');
+      assert.ok(!tcpOf(r).some(x => x.flags & 1));
+      checkProbe(r);
+    });
+  }
+  reviewCase(`WIN${dllWindow} public RST after copied data`, () => {
+    let session;
+    const response = Buffer.from('before reset');
+    const receiving = { ...recv(), after: undefined };
+    const sending = { ...send(), after: ({ card }) => {
+      card.schedule(1, buildTcpSegment(session, { flags: 20, seq: session.serverSeq + response.length, ack: session.clientNext }));
+    } };
+    const r = probe([init, connect(), sending, receiving, { fn: 9 }, send(), close(0)], dllScenario(), peer(({ seg, t, emit }) => {
+      if (seg.payload.length) { session = t; emit({ payload: response }); }
+    }), dllWindow);
+    assert.strictEqual(r.results[3].a, 7);
+    assert.deepStrictEqual(r.results[3].data, response);
+    assert.strictEqual(r.results[4].de & 6, 0, 'RST left CONN/RXPEND');
+    assert.notStrictEqual(r.results[5].a, 0, 'SEND accepted a reset stream');
+    assert.strictEqual(tcpOf(r).filter(x => x.payload.length).length, 1);
+    checkProbe(r);
+  });
+  for (const buffered of [false, true]) {
+    reviewCase(`WIN${dllWindow} foreign RST rearm buffered=${buffered}`, () => {
+      const t = { clientMac: Buffer.from('028019112233', 'hex'), clientIp: Buffer.from([192, 168, 7, 2]), clientPort: 9000,
+        serverMac: Buffer.from('aabbccddee01', 'hex'), serverIp: Buffer.from([192, 168, 7, 1]), serverPort: 54321,
+        serverSeq: 0x12345678, clientNext: 0 };
+      const listen = { fn: 18, de: 9000, after: ({ card }) => card.schedule(1, buildTcpSegment(t, { flags: 2, seq: t.serverSeq, ack: 0 })) };
+      const accepting = { ...recv(), after: ({ card }) => {
+        if (buffered) card.schedule(1, buildTcpSegment(t, { flags: 24, seq: t.serverSeq + 1, ack: t.clientNext, payload: [1, 2, 3] }));
+        card.schedule(2, buildTcpSegment(t, { flags: 20, seq: t.serverSeq + (buffered ? 4 : 1), ack: t.clientNext }));
+      } };
+      const r = probe([init, { fn: 10, a: 1, de: 'HOST', ix: 'PORT2' }, listen, accepting,
+        recv(1513, 1), { fn: 9 }, { fn: 19 }, { fn: 4 }], dllScenario(), card => {
+          card.onTransmit = frame => {
+            const seg = parseTcpSegment(frame);
+            if (seg?.flags === 18) {
+              t.clientNext = (seg.seq + 1) >>> 0;
+              card.schedule(1, buildTcpSegment(t, { flags: 16, seq: t.serverSeq + 1, ack: t.clientNext }));
+            } else respond(frame, card, { responders: { arp: arpToServer } });
+          };
+        }, dllWindow);
+      assert.strictEqual(r.results[5].de & 7, 1, 'foreign RST lost LISTEN or left an inaccessible queue');
+      assert.strictEqual(r.results[6].a, 0);
+      checkProbe(r);
+    });
+  }
+  reviewCase(`WIN${dllWindow} CLOSE bypasses foreign UDP`, () => {
+    let session, fins = 0;
+    const leaving = { ...send(), after: ({ card }) => card.schedule(1,
+      buildUdpReply({ sourceIp: session.clientIp, sourceMac: session.clientMac, sourcePort: 0xc401,
+        destPort: 8081, destIp: session.serverIp }, [1, 2, 3])) };
+    const r = probe([init, connect(), { fn: 10, a: 1, de: 'HOST', ix: 'PORT2' }, leaving, close(0), recv(1513, 1), close(1)],
+      dllScenario(), peer(({ seg, t, emit }) => {
+        if (seg.payload.length) { session = t; emit({ flags: 16 }); }
+        else if (seg.flags & 1) { fins++; emit({ flags: 16, ack: (seg.seq + 1) >>> 0 }); }
+      }), dllWindow);
+    assert.strictEqual(r.results[4].a, 0, 'UDP made CLOSE time out immediately');
+    assert.strictEqual(fins, 1);
+    assert.strictEqual(r.results[5].ix & 4, 4);
+    assert.strictEqual(r.exitCode, 0);
+    assert.ok(r.cleanup.isaClosed && r.cleanup.filesClosed);
+    count();
+  });
+  reviewCase(`WIN${dllWindow} unread data while acknowledging FIN`, () => {
+    let peerNext;
+    const r = probe([init, connect(), send(), close(0)], dllScenario(), peer(({ seg, t, emit }) => {
+      if (seg.payload.length) emit({ flags: 16 });
+      else if (seg.flags & 1) { peerNext = t.serverSeq + 3; emit({ flags: 25, ack: (seg.seq + 1) >>> 0, payload: [1, 2] }); }
+    }), dllWindow);
+    assert.strictEqual(r.results[3].a, 0);
+    assert.ok(tcpOf(r).some(x => x.flags & 4), 'unread close data was silently acknowledged/discarded');
+    checkProbe(r);
+  });
+}
+for (const dllWindow of [1, 2]) {
+  reviewCase(`WIN${dllWindow} UDP SEND and timed RECV during TCP suspension`, () => {
+    const r = probe([init, connect(), { fn: 10, a: 1, de: 'HOST', ix: 'PORT2' }, sendslice(50), send(),
+      send(1), recv(1513, 1), { ...recv(1513, 1), iy: 17 }, { ...send(), untilSettled: true }, close(0), close(1)],
+    dllScenario(), card => {
+      peer(({ seg, emit }) => {
+        if (seg.payload.length) emit({ flags: 16 }, 80);
+        else if (seg.flags & 1) emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+      })(card);
+      const tcpTx = card.onTransmit;
+      card.onTransmit = frame => {
+        const datagram = udpDatagram(frame);
+        if (datagram) card.schedule(1, buildUdpReply(datagram, datagram.payload));
+        else tcpTx(frame);
+      };
+    }, dllWindow);
+    assert.strictEqual(r.results[4].a, 15);
+    assert.strictEqual(r.results[5].a, 0);
+    assert.strictEqual(r.results[5].de, 7);
+    assert.deepStrictEqual(r.results[6].data, Buffer.from('request'));
+    const starts = r.events.filter(x => x.label === 'UNET.F_RECV');
+    const ends = r.events.filter(x => x.label === 'UNET.F_RECV:return');
+    assert.ok(ends[1].ms - starts[1].ms >= 16, 'UDP RECV must honor its own IY budget');
+    assert.strictEqual(r.results.at(-3).a, 0);
+    assert.strictEqual(r.results.at(-3).de, 7);
+    checkProbe(r);
+  });
+  reviewCase(`WIN${dllWindow} CLOSE with an unread queued response`, () => {
+    const r = probe([init, connect(), send(), close(0)], dllScenario(), peer(({ seg, emit }) => {
+      if (seg.payload.length) emit({ payload: [10, 20, 30] });
+    }), dllWindow);
+    assert.strictEqual(r.results[2].a, 0);
+    assert.strictEqual(r.results[3].a, 0);
+    assert.ok(tcpOf(r).some(x => x.flags & 4), 'unread queued data closed through EOF');
+    assert.ok(!tcpOf(r).some(x => x.flags & 1));
+    checkProbe(r);
+  });
+  reviewCase(`WIN${dllWindow} longest diagnostic fits before TX`, () => {
+    let intact;
+    const prepare = { ...init, after: ({ write, dll, dllBase }) => {
+      write(dllBase + dll['UNET.STAGE'], 1); // NETINIT: longest seven-character stage
+      write(dllBase + dll['UNET.LASTERR_FROZEN'], 0);
+      write(dllBase + dll['MAIN.TX_BUF'], 0xa7);
+    } };
+    const diagnostic = { fn: 16, de: 'BUFFER', ix: 72, after: ({ read, dll, dllBase }) => {
+      intact = read(dllBase + dll['MAIN.TX_BUF']) === 0xa7;
+    } };
+    const r = probe([prepare, diagnostic], dllScenario(), undefined, dllWindow);
+    assert.strictEqual(r.results[1].a, 0);
+    assert.strictEqual(r.results[1].data.indexOf(0), 62);
+    assert.ok(intact, 'diagnostic overflowed its 64-byte buffer');
+    checkProbe(r);
+  });
+}
+
+// 0.4.5: only a newly accepted, sequential FIN may terminate SEND/RECV.
+for (const dllWindow of [1, 2]) {
+  reviewCase(`WIN${dllWindow} future FIN after queued RECV prefix`, () => {
+    const prefix = Buffer.from('already queued '), tail = Buffer.from('recovered tail');
+    let injected = false, session;
+    const sending = { ...send(), after: ({ card }) => {
+      card.schedule(1, buildTcpSegment(session, { flags: 17,
+        seq: session.serverSeq + prefix.length + tail.length, ack: session.clientNext }));
+      card.schedule(2, buildTcpSegment(session, { flags: 25,
+        seq: session.serverSeq + prefix.length, ack: session.clientNext, payload: tail }));
+    } };
+    const r = probe([init, connect(), sending, recv(), recv(), recv(), close(0)], dllScenario(),
+      peer(({ seg, t, emit }) => {
+        if (seg.payload.length && !injected) { injected = true; session = t; emit({ payload: prefix }); }
+      }), dllWindow);
+    assert.strictEqual(r.results[3].a, 0, 'unaccepted FIN failed public RECV');
+    assert.ok([0, 7].includes(r.results[4].a));
+    assert.deepStrictEqual(Buffer.concat(r.results.slice(3, 5).map(x => x.data)),
+      Buffer.concat([prefix, tail]), 'RECV lost its queued prefix or recovered tail');
+    assert.strictEqual(r.results[5].a, 7);
+    assert.strictEqual(r.results[5].de, 0);
+    const acks = tcpOf(r).filter(x => x.flags === 16);
+    assert.ok(acks.some(x => x.ack === session.serverSeq + prefix.length), 'missing duplicate ACK at the hole');
+    assert.ok(acks.some(x => x.ack === session.serverSeq + prefix.length + tail.length + 1));
+    checkProbe(r);
+  });
+  for (const slice of [0, 50]) {
+    for (const duplicate of [false, true]) {
+      reviewCase(`WIN${dllWindow} ${duplicate ? 'duplicate' : 'future'} FIN during SEND slice=${slice}`, () => {
+        const response = Buffer.from('response');
+        let writes = 0, peerNext;
+        const r = probe([init, connect(), sendslice(slice), { ...bigSend(), untilSettled: true },
+          send(), recv(), recv(), close(0)], dllScenario(), peer(({ seg, t, emit }) => {
+          if (seg.flags & 1) { emit({ flags: 16, seq: peerNext, ack: (seg.seq + 1) >>> 0 }); return; }
+          if (!seg.payload.length) return;
+          if (++writes === 1) {
+            // A covering FIN establishes CLOSE_WAIT for the duplicate case.
+            // The future case leaves a response-sized hole while ACKing only
+            // part of SEND; neither rejected FIN may end the next ACK wait.
+            peerNext = t.serverSeq + response.length + 1;
+            if (duplicate) emit({ flags: 25, payload: response });
+            else emit({ flags: 17, seq: peerNext - 1, ack: seg.seq + 3 });
+          } else if (duplicate && writes === 2) {
+            emit({ flags: 25, payload: response, ack: seg.seq + 3 });
+            emit({ flags: 16, seq: peerNext }, 80);
+          } else emit({ flags: 16, seq: duplicate ? peerNext : t.serverSeq });
+        }), dllWindow);
+        const completed = r.results.findIndex((x, i) => i >= 3 && x.a !== 15);
+        assert.strictEqual(r.results[completed].a, 0, 'rejected FIN terminated SEND');
+        assert.strictEqual(r.results[completed].de, BIGPAY_LEN);
+        assert.strictEqual(r.results[completed + 1].a, 0, 'rejected FIN poisoned the next SEND');
+        assert.strictEqual(r.results[completed + 1].de, 7);
+        if (duplicate) {
+          assert.deepStrictEqual(r.results[completed + 2].data, response);
+          assert.strictEqual(r.results[completed + 3].a, 7);
+        }
+        if (!slice) assert.ok(r.results.every(x => x.a !== 15));
+        assert.deepStrictEqual(sentStream(r).subarray(0, BIGPAY_LEN), expectedBig(r, 1));
+        checkProbe(r);
+      });
+    }
+  }
+  reviewCase(`WIN${dllWindow} fresh SEND after non-covering accepted FIN`, () => {
+    const response = Buffer.from('refused body');
+    let once = false;
+    const r = probe([init, connect(), send(), bigSend(), { fn: 9 }, recv(), recv(), close(0)],
+      dllScenario(), peer(({ seg, emit }) => {
+        if (seg.payload.length && !once) {
+          once = true; emit({ flags: 25, ack: seg.seq + 3, payload: response });
+        }
+      }), dllWindow);
+    assert.strictEqual(r.results[2].a, 7);
+    assert.strictEqual(r.results[2].de, 3);
+    assert.strictEqual(r.results[3].a, 7, 'fresh SEND reused unacknowledged sequence numbers');
+    assert.strictEqual(r.results[3].de, 0);
+    assert.strictEqual(tcpOf(r).filter(x => x.payload.length).length, 1, 'fresh bytes were sent on an ambiguous stream');
+    assert.strictEqual(r.results[4].de & 2, 0, 'terminal SEND retained CONN');
+    assert.deepStrictEqual(r.results[5].data, response);
+    assert.strictEqual(r.results[6].a, 7);
+    checkProbe(r);
+  });
+}
+
+// 0.4.6: a terminal SEND keeps the slot reserved, but an empty aborted
+// stream must not keep asking the consumer to drain it through RXPEND/XCHAN.
+for (const dllWindow of [1, 2]) {
+  for (const owner of [0, 1]) {
+    for (const mode of ['timeout', 'fin-error', 'eof']) {
+      for (const buffered of [false, true]) {
+        reviewCase(`WIN${dllWindow} channel ${owner} ${mode} pending=${buffered}`, () => {
+          const other = owner ^ 1, reply = Buffer.from('saved response');
+          const commands = [], index = {};
+          let payloads = 0, payloadsBefore;
+          const add = (name, cmd) => { index[name] = commands.length; commands.push(cmd); };
+          add('init', init);
+          add('owner', connect(owner));
+          add('other', mode === 'timeout' ? { fn: 10, a: other, de: 'HOST', ix: other ? 'PORT2' : 'PORT' } : connect(other));
+          add('send', send(owner));
+          add('before', { fn: 9, a: owner });
+          add('hintBefore', recv(1513, other));
+          add('prefix', recv(5, owner));
+          add('middle', { fn: 9, a: owner });
+          add('hintMiddle', recv(1513, other));
+          add('tail', recv(1513, owner));
+          add('closed', recv(1513, owner));
+          add('after', { fn: 9, a: owner });
+          add('hintAfter', recv(1513, other));
+          add('hintAgain', { ...recv(1513, other), after: () => { payloadsBefore = payloads; } });
+          add('sendAgain', { ...send(owner), after: () => assert.strictEqual(payloads, payloadsBefore,
+            'fresh SEND transmitted on the terminated stream') });
+          add('connectBeforeClose', connect(owner));
+          add('close', close(owner));
+          add('reconnect', connect(owner));
+          add('cleanupOwner', close(owner));
+          add('cleanupOther', close(other));
+          let first = true;
+          const r = probe(commands, dllScenario(), peer(({ seg, t, emit }) => {
+            if (seg.flags & 1) { emit({ flags: 16, ack: (seg.seq + 1) >>> 0 }); return; }
+            if (seg.payload.length) payloads++;
+            if (seg.payload.length && t.serverPort === 8080 + owner && first) {
+              first = false;
+              emit({ flags: mode === 'timeout' ? 24 : 25,
+                ack: mode === 'eof' ? t.clientNext : seg.seq + 3,
+                payload: buffered ? reply : [] });
+            }
+          }), dllWindow);
+          const result = name => r.results[index[name]];
+          assert.strictEqual(result('send').a, mode === 'timeout' ? 5 : mode === 'fin-error' ? 7 : 0);
+          assert.strictEqual(result('before').de & 4, buffered || mode === 'eof' ? 4 : 0,
+            'empty aborted stream retained RXPEND');
+          assert.strictEqual(result('hintBefore').ix & 8, buffered || mode === 'eof' ? 8 : 0,
+            'empty aborted stream retained XCHAN');
+          if (buffered) {
+            assert.strictEqual(result('prefix').a, 0);
+            assert.deepStrictEqual(result('prefix').data, reply.subarray(0, 5));
+            assert.strictEqual(result('middle').de & 4, 4, 'partial drain lost RXPEND');
+            assert.strictEqual(result('hintMiddle').ix & 8, 8, 'partial drain lost XCHAN');
+            assert.strictEqual(result('tail').a, 0);
+            assert.deepStrictEqual(result('tail').data, reply.subarray(5));
+          } else assert.strictEqual(result('prefix').a, 7);
+          assert.strictEqual(result('closed').a, mode === 'eof' && !buffered ? 11 : 7);
+          if (result('closed').a === 7) assert.strictEqual(result('closed').de, 0);
+          assert.strictEqual(result('after').de & 6, 0, 'drained stream retained CONN/RXPEND');
+          assert.strictEqual(result('hintAfter').ix & 8, 0, 'drained stream retained XCHAN');
+          assert.strictEqual(result('hintAgain').ix & 8, 0, 'XCHAN returned after another drain');
+          assert.strictEqual(result('sendAgain').a, mode === 'eof' ? 11 : 7);
+          if (mode !== 'eof') assert.strictEqual(result('sendAgain').de, 0);
+          assert.strictEqual(result('connectBeforeClose').a, mode === 'eof' ? 0 : 11,
+            'terminal SEND must reserve its slot until explicit CLOSE');
+          assert.strictEqual(result('close').a, 0);
+          assert.strictEqual(result('reconnect').a, 0);
+          checkProbe(r);
+        });
+      }
+    }
+  }
+}
+
+assert.deepStrictEqual(reviewFailures, [], reviewFailures.join('\n'));
 
 console.log(`Actual DSS EXE DLL harness: ${caseCount()} UNETTEST checks passed`);

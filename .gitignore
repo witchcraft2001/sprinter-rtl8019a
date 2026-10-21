@@ -6,8 +6,19 @@ distr/
 *.o
 *.bin
 .DS_Store
+__pycache__/
 
 # Local-only config; ship only NET.CFG.sample.
 NET.CFG
 config/NET.CFG
 .claude/
+
+# Keep curated Markdown acceptance reports, not raw run outputs.
+# New stand runs write these under build/evidence/ by default.
+/docs/evidence/**/*.json
+/docs/evidence/**/*.jsonl
+/docs/evidence/**/*.txt
+/docs/evidence/**/*.log
+/docs/evidence/**/*.pcap
+/docs/evidence/**/*.pcapng
+/docs/evidence/**/*.sym

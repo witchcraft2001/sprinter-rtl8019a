@@ -111,7 +111,8 @@ packet RAM occupies pages `20h..3Fh`.  `RTL_TYPE=NE2000` selects pages
 windows.  A card without the Realtek `Pp` ID must also have a pinned
 `RTL_HW=S/#HHH`, because the broad ISA scan deliberately rejects an
 unidentified/floating bus.  NE1000 support is covered by the host model;
-MAME and physical-card acceptance records remain in `docs/evidence/`.
+MAME and physical-card acceptance summaries remain in `docs/evidence/`;
+raw logs and captures belong in ignored `build/evidence/`.
 
 **Never select page 3 on a chip that did not answer the Realtek ID
 probe, least of all next to a transmit.** Page 3 is a Realtek
@@ -463,7 +464,7 @@ src/apps/         utility entry points
 config/           NETSMPL.CFG configuration template
 docs/             user docs (shipped) and developer docs (not shipped)
 docs/img/         card photos for this README (not shipped)
-docs/evidence/    dated hardware / MAME acceptance records
+docs/evidence/    curated hardware / MAME acceptance summaries
 examples/         DSS batch files and host-side helpers
 tools/            build / package / image scripts and dev helpers
 tools/exe-harness/  host-side Z80 / DSS / RTL8019AS test harness
