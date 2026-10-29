@@ -27,15 +27,29 @@ SEND
 	LD	(TCP_ATTEMPT_MS_LEFT),HL
 	RET
 .SLICE
+	LD	A,1
+	LD	(.WORK_LEFT+1),A
+	RET
+; One wire send OR one bounded receive step per asynchronous public call.
+; Save the CALL address, so resume consumes its own fresh work quantum.
+.STEP
 	LD	HL,(@UNET.OPT_SLICE)
 	LD	A,H
 	OR	L
-	JR	NZ,.SLICE_READY
-	DEC	HL                         ; blocking: bounded internal waits
-.SLICE_READY
-	LD	(.SLICE_LEFT),HL
-	RET
+	RET	Z
+.WORK_LEFT
+	LD	A,1
+	DEC	A
+	LD	(.WORK_LEFT+1),A
+	RET	Z
+	POP	HL
+	DEC	HL
+	DEC	HL
+	DEC	HL
+	LD	(.NEXT+1),HL
+	JP	.AGAIN
 .TRANSMIT
+	CALL	.STEP
 	CALL	ACK_TARGET_MATCH
 	JP	Z,.OK
 	LD	HL,(TCP_PEER_WIN)
@@ -72,6 +86,7 @@ SEND
 	CALL	.NEW_ATTEMPT
 	JP	.WAIT
 .PROBE
+	CALL	.STEP
 	; One octet at SND.UNA elicits the lost window update. It may be
 	; accepted when the window opens; normal cumulative ACK accounts for it.
 	CALL	.PROGRESS
@@ -109,29 +124,28 @@ SEND
 	CALL	@RTL.SEND_FRAME_SG
 	JP	C,FAIL_SEND
 .WAIT
-	LD	HL,(.SLICE_LEFT)
-	LD	A,H
-	OR	L
-	JP	Z,.YIELD
+	CALL	.STEP
 	LD	A,ACK_WAIT_ACTIVE
 	LD	(TCP_ACK_WAIT_STATE),A
-	LD	HL,(TCP_ATTEMPT_MS_LEFT)
-	LD	DE,(.SLICE_LEFT)
-	OR	A
-	SBC	HL,DE
-	JR	C,.USE_ATTEMPT
-	EX DE,HL
+	LD	HL,(@UNET.OPT_SLICE)
+	LD	A,H
+	OR	L
+	JR	Z,.BLOCK_WAIT
+	; One paced tick plus one ring poll. No loop over foreign traffic.
+	CALL	@MAIN.TICK_AND_CHECK_KEY
+	JP	C,RECV.CANCEL
+	LD	HL,1
 	JR	.QUANTUM_READY
-.USE_ATTEMPT
-	ADD	HL,DE
+.BLOCK_WAIT
+	LD	HL,(TCP_ATTEMPT_MS_LEFT)
 .QUANTUM_READY
 	LD	(.QUANTUM),HL
 	LD	(RECV_TIMEOUT),HL
 	CALL	RECV
 	PUSH	AF
-	; Every received ACK/data event consumes this SAME public slice.
+	; Charge protocol time independently of the public work quantum.
 	; RECV exposes its unused poll budget. Charge at least one tick
-	; so a ring full of immediate ACKs cannot restart or extend the slice.
+	; so immediate events cannot freeze the retry/persist budget.
 	LD	HL,(.QUANTUM)
 	LD	DE,(TCP_TIMEOUT_LEFT)
 	OR	A
@@ -146,10 +160,6 @@ SEND
 	OR	A
 	SBC	HL,DE
 	LD	(TCP_ATTEMPT_MS_LEFT),HL
-	LD	HL,(.SLICE_LEFT)
-	OR	A
-	SBC	HL,DE
-	LD	(.SLICE_LEFT),HL
 	POP	AF
 	JR	NC,.EVENT
 	CALL	ACK_TARGET_MATCH
@@ -160,7 +170,7 @@ SEND
 	LD	HL,(@UNET.OPT_SLICE)
 	LD	A,H
 	OR	L
-	JP	NZ,.AGAIN		; sliced caller can drain the foreign UDP head
+	JP	NZ,.WAIT		; yield with the receive continuation parked
 	CALL	@UNET.DROP_FOREIGN_UDP	; blocking calls never return AGAIN
 	JR	.EVENT
 .WAIT_ERROR
@@ -174,10 +184,6 @@ SEND
 	LD	A,H
 	OR	L
 	JR	Z,.EXPIRED
-	LD	HL,(.SLICE_LEFT)
-	LD	A,H
-	OR	L
-	JP	Z,.YIELD
 	LD	HL,(TCP_PEER_WIN)
 	LD	A,H
 	OR	L
@@ -228,18 +234,9 @@ SEND
 	OR	A
 	JP	NZ,.PROBE
 	JP	.TRANSMIT
-.YIELD
-	LD	HL,(@UNET.OPT_SLICE)
-	LD	A,H
-	OR	L
-	JR	NZ,.AGAIN
-	CALL	.SLICE
-	JP	.EVENT
 .AGAIN
 	LD	A,F_AGAIN
 	JP	FAIL_A
-.CONTINUE
-	JP	.EVENT
 .TIMEOUT
 	LD	A,F_TIMEOUT
 	JP	FAIL_A
@@ -270,9 +267,11 @@ SEND
 .SAVE_DATA	DW	0
 .BEFORE	DW	0
 .QUANTUM	DW	0
-.SLICE_LEFT	DW	0
+; Only one public TCP SEND may be pending, independent of channel swaps.
+.NEXT	LD	HL,0
+	JP	(HL)
 SEND_RESUME
 	LD	(SEND.CALL_LEN),BC
 	LD	(SEND.CALL_DATA),HL
 	CALL	SEND.SLICE
-	JP	SEND.CONTINUE
+	JP	SEND.NEXT

@@ -79,7 +79,7 @@ BUFFER EQU 0xA100
       const byte = name => ctx.read(dll[name] + dllBase);
       const word = name => byte(name) | (ctx.read(dll[name] + dllBase + 1) << 8);
       const seq = name => Array.from({ length: 4 }, (_, i) => ctx.read(dll[name] + dllBase + i)).reduce((n, v) => (n * 256 + v) >>> 0, 0);
-      events.push({ label, ms: ctx.logicalMs, channel: byte('UNET.ACTIVE_CH'),
+      events.push({ label, ms: ctx.logicalMs, cycles: ctx.cycles, channel: byte('UNET.ACTIVE_CH'),
         seq: seq('TCP_RCV_NXT'), ack: seq('TCP_SND_UNA'), window: byte('TCP_ADV_WIN_HI') * 256 + byte('TCP_ADV_WIN_LO'),
         ackWait: byte('TCP_ACK_WAIT_STATE'), rxLength: word('TCP_RX_DATA_LEN'),
         pending: [word('MAIN.CH_PEND_LEN'), ctx.read(dll['MAIN.CH_PEND_LEN'] + dllBase + 2) | ctx.read(dll['MAIN.CH_PEND_LEN'] + dllBase + 3) << 8],

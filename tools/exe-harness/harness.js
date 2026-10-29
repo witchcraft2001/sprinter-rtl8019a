@@ -702,7 +702,7 @@ function runExe(exePath, args = '', inputScenario = {}) {
         pcSamples.set(key, (pcSamples.get(key) || 0) + 1);
       }
       // Test-only observation/injection at actual assembled instruction boundaries.
-      scenario.cpuProbes?.[st0.pc]?.({ state: st0, read: rd, write: wr, card, win, logicalMs });
+      scenario.cpuProbes?.[st0.pc]?.({ state: st0, read: rd, write: wr, card, win, logicalMs, cycles });
       minimumSp = Math.min(minimumSp, st0.sp);
       if (scenario.stopPc !== undefined && st0.pc === scenario.stopPc &&
           (scenario.stopWin0 === undefined || win[0] === scenario.stopWin0) &&

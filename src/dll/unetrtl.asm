@@ -666,7 +666,7 @@ F_SEND
 	POP	DE
 	RET
 .suspend
-	; Silence for one UNET_OPT_SENDSLICE quantum; the overall
+	; Independent work quantum exhausted; the overall
 	; SEND_ATTEMPTS budget is not exhausted.  Not an error: close the
 	; window WITHOUT a diagnostic capture (CAPTURE_DIAG would smash
 	; the DIAG_TX overlay of SEND_DONE) and park the resume-contract

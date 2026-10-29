@@ -659,3 +659,23 @@ been traced by the stand maintainer to MAME's shared Z84C015 IRQ0 input:
 internal-device CLEAR can overwrite an asserted external interrupt request.
 No IRQ behavior was changed in this DLL. Emulator audio gaps alone do not
 establish an ISA/IFF regression; real hardware remains the final check.
+
+## Independent SEND work quantum (0.4.7)
+
+With nonzero SENDSLICE, TCP SEND yields between individual wire-send and
+receive steps, even when the peer responds immediately. This independent
+work limit applies to the first call, resumes and transitions between MSS
+chunks. SENDSLICE keeps its option number, stored value and minimum of 50;
+zero still selects blocking SEND. No new option or capability is required.
+NERR_AGAIN can therefore occur before any ACK has been processed (DE=0).
+Always resume with the original channel, pointer, length and unchanged bytes.
+RECV/STATUS may be serviced between continuations. The confirmed prefix and
+retry/persist state survive those calls. The work limit does not reset retry
+timeouts or count a yield as a retransmission.
+
+The implementation parks the next instruction inside the DLL; it does not
+use the consumer's CTC or allocate another page. Driver TX/DMA error waits
+and RX overflow recovery retain their existing independent bounds. The
+10 ms target concerns a functioning NIC and requires inclusive dispatcher
+plus DLL timing in MAME; model CPU cycles alone cannot establish that bound
+or physical-input-to-PRESENT latency. Hardware timing is separate acceptance.

@@ -154,15 +154,14 @@ const dllScenario = (extra = {}) => ({
   count();
 }
 { // -a: SETOPT SENDSLICE + CONNECT + 1200-byte SEND. The scripted peer
-  // ACKs instantly, so the transfer settles with zero NERR_AGAIN resumes;
-  // a forced resume needs a stalling peer (scenario E).
+  // ACKs instantly; the independent work quantum still yields between steps.
   const r = run('UNETTEST', '-a 192.168.7.1 8080', dllScenario({
     responders: { arp: arpToServer, tcp: {} },
   }));
   assert.strictEqual(r.exitCode, 0);
   assert.match(r.output, /connect 192\.168\.7\.1:8080/);
   assert.match(r.output, /request sent/);
-  assert.match(r.output, /resumes needed: 0/);
+  assert.match(r.output, /resumes needed: [1-9]/);
   count();
 }
 { // -a against a refusing peer: CONNECT fails, LASTERR prints, exit 3
@@ -430,19 +429,19 @@ function checkProbe(r) {
   assert.deepStrictEqual(r.results[4].data, payload.subarray(0,536));
   checkProbe(r);
 }
-{ // Payload with a stale ACK is saved immediately, survives AGAIN, and is
-  // readable while SEND remains suspended. Resume settles on a duplicate-
-  // sequence pure ACK. Its ACK field is independent of receive capacity.
+{ // Save early payload during a receive quantum, then resume with identical args.
   const bytes = Buffer.from('early data before outgoing ACK');
-  const r = probe([init, connect(), {fn: 17, a: 3, de: 25}, send(), recv(), send(), send(), send(), close(0)], dllScenario(), peer(({seg, emit}) => {
+  const r = probe([init, connect(), {fn: 17, a: 3, de: 25}, send(), send(), recv(),
+    { ...send(), untilSettled: true }, close(0)], dllScenario(), peer(({seg, emit}) => {
     if (seg.payload.length) {
       emit({ ack: seg.seq, payload: bytes });
       emit({ flags: 16 }, 70);
     }
   }));
-  assert.strictEqual(r.results[3].a, 15); // NERR_AGAIN
-  assert.deepStrictEqual(r.results[4].data, bytes);
-  assert.ok(r.results.slice(5,8).some(v => v.a === 0 && v.de === 7));
+  assert.strictEqual(r.results[3].a, 15);
+  assert.strictEqual(r.results[4].a, 15);
+  assert.deepStrictEqual(r.results[5].data, bytes);
+  assert.ok(r.results.slice(6,-1).some(v => v.a === 0 && v.de === 7));
   checkProbe(r);
 }
 { // Two channels: process a 1460-byte foreign segment while waiting for
@@ -798,7 +797,7 @@ for (const dllWindow of [1, 2]) { // SNC loads the DLL into WIN2.
     // retransmission cannot count twice; the closing reply goes out once.
     let base = null, received = 0, answered = false;
     const r = probe([init, connect(), sendslice(25),
-      ...Array.from({ length: BLOCKS }, () => bigSend()), recv(), recv(), close(0)],
+      ...Array.from({ length: BLOCKS }, () => ({ ...bigSend(), untilSettled: true })), recv(), recv(), close(0)],
     dllScenario(), peer(({ seg, emit }) => {
       if (!seg.payload.length) return;
       if (base === null) base = seg.seq;
@@ -806,6 +805,7 @@ for (const dllWindow of [1, 2]) { // SNC loads the DLL into WIN2.
       if (received < BLOCKS * BIGPAY_LEN) emit({ flags: 16 });
       else if (!answered) { answered = true; emit({ flags: 25, payload: reply }); }
     }), dllWindow);
+    r.results = r.results.filter(v => v.a !== 15); // inspect completed transactions below
     assert.strictEqual(r.results[2].a, 0, 'SETOPT SENDSLICE refused: the slice never armed');
     const sends = r.results.slice(3, 3 + BLOCKS);
     assert.ok(sends.every(v => v.a === 0 && v.de === BIGPAY_LEN),
@@ -955,12 +955,13 @@ const expectAbortAt = (r, closeIx, seq0, msg) => {
   // copy went out.
   const txError = { attempts: [] };
   let payloads = 0;
-  const r = probe([init, connect(), sendslice(500), send(), send(), close(0)], dllScenario({ txError }),
+  const r = probe([init, connect(), sendslice(500), send(), { ...send(), untilSettled: true }, close(0)], dllScenario({ txError }),
     peer(({ card, seg }) => {
       if (seg.payload.length && ++payloads === 1) txError.attempts.push(card.txAttempts + 1);
     }));
   const data = tcpOf(r).find(v => v.payload.length === 7);
   assert.strictEqual(r.results[3].a, 15, 'the sliced SEND did not suspend (NERR_AGAIN expected)');
+  r.results.splice(4, r.results.length - 6); // retain first suspension and final result
   assert.strictEqual(r.results[4].a, 1, 'the resumed SEND should have reported NERR_HW');
   assert.strictEqual(payloads, 1, 'the failed retransmit reached the peer');
   expectAbortAt(r, 5, data.seq, 'retransmit TX error after resume');
@@ -1163,7 +1164,7 @@ for (const dllWindow of [1, 2]) {
       assert.strictEqual(sends.at(-1).a, 0);
       assert.strictEqual(sends.at(-1).de, 244);
       assert.ok(sends.every(x => x.de >= 0 && x.de <= 244));
-      assert.ok(sends.slice(0, -1).every(x => x.a === 15 && x.de >= 163));
+      assert.ok(sends.slice(0, -1).every(x => x.a === 15 && x.de >= 0));
       assert.strictEqual(accepted, 244);
       const expected = Buffer.from(Array.from({ length: 244 }, (_, i) => (r.symbols.BIGPAY + i) & 255));
       assert.deepStrictEqual(Buffer.concat(blocks), expected);
@@ -1348,7 +1349,7 @@ for (const dllWindow of [1, 2]) {
   let chunks = 0, nextPeer;
   const response = Buffer.from('half-close response');
   const r = probe([init, connect(), sendslice(50),
-    { fn: 6, de: 'BIGPAY', ix: 1200, untilSettled: true }, { fn: 9 }, send(), recv(), close(0), { fn: 4 }],
+    { fn: 6, de: 'BIGPAY', ix: 1200, untilSettled: true }, { fn: 9 }, { ...send(), untilSettled: true }, recv(), close(0), { fn: 4 }],
     dllScenario(), peer(({ seg, t, emit }) => {
       if (seg.payload.length) {
         if (++chunks === 1) {
@@ -1359,10 +1360,11 @@ for (const dllWindow of [1, 2]) {
     }), dllWindow);
   const completed = r.results.findIndex((x, i) => i >= 3 && x.a !== 15);
   assert.ok(completed > 3, 'half-close vector did not suspend');
-  assert.ok(r.results.slice(3, completed).every(x => x.a === 15 && x.de >= 536));
+  assert.ok(r.results.slice(3, completed).every(x => x.a === 15 && x.de >= 0));
   assert.strictEqual(r.results[completed].a, 0, 'FIN blocked the matching SEND resume');
   assert.strictEqual(r.results[completed].de, 1200);
   assert.strictEqual(r.results[completed + 1].de & 2, 2, 'half-close cleared CONN before queue drain');
+  r.results.splice(completed + 2, r.results.length - completed - 6);
   assert.strictEqual(r.results[completed + 2].a, 0, 'half-closed peer can still read a fresh SEND');
   assert.strictEqual(r.results[completed + 2].de, 7);
   assert.deepStrictEqual(r.results[completed + 3].data, response);
@@ -1789,7 +1791,7 @@ for (const dllWindow of [1, 2]) {
         const response = Buffer.from('response');
         let writes = 0, peerNext;
         const r = probe([init, connect(), sendslice(slice), { ...bigSend(), untilSettled: true },
-          send(), recv(), recv(), close(0)], dllScenario(), peer(({ seg, t, emit }) => {
+          { ...send(), untilSettled: true }, recv(), recv(), close(0)], dllScenario(), peer(({ seg, t, emit }) => {
           if (seg.flags & 1) { emit({ flags: 16, seq: peerNext, ack: (seg.seq + 1) >>> 0 }); return; }
           if (!seg.payload.length) return;
           if (++writes === 1) {
@@ -1804,6 +1806,8 @@ for (const dllWindow of [1, 2]) {
             emit({ flags: 16, seq: peerNext }, 80);
           } else emit({ flags: 16, seq: duplicate ? peerNext : t.serverSeq });
         }), dllWindow);
+        if (!slice) assert.ok(r.results.every(x => x.a !== 15));
+        r.results = r.results.filter(x => x.a !== 15);
         const completed = r.results.findIndex((x, i) => i >= 3 && x.a !== 15);
         assert.strictEqual(r.results[completed].a, 0, 'rejected FIN terminated SEND');
         assert.strictEqual(r.results[completed].de, BIGPAY_LEN);
@@ -1813,7 +1817,6 @@ for (const dllWindow of [1, 2]) {
           assert.deepStrictEqual(r.results[completed + 2].data, response);
           assert.strictEqual(r.results[completed + 3].a, 7);
         }
-        if (!slice) assert.ok(r.results.every(x => x.a !== 15));
         assert.deepStrictEqual(sentStream(r).subarray(0, BIGPAY_LEN), expectedBig(r, 1));
         checkProbe(r);
       });
@@ -1916,5 +1919,28 @@ for (const dllWindow of [1, 2]) {
 }
 
 assert.deepStrictEqual(reviewFailures, [], reviewFailures.join('\n'));
+
+
+
+// Independent work quantum: first TX yields even with an immediate peer ACK.
+// RECV/STATUS between calls must preserve the transaction in either window.
+for (const dllWindow of [1, 2]) for (const owner of [0, 1]) {
+  const r = probe([init, connect(owner), sendslice(50), send(owner), recv(512, owner),
+    { fn: 9, a: owner }, { ...send(owner), untilSettled: true }, close(owner)],
+    dllScenario(), peer(({ seg, emit }) => {
+      if (seg.payload.length) emit({ flags: 16 });
+      else if (seg.flags & 1) emit({ flags: 16, ack: (seg.seq + 1) >>> 0 });
+    }), dllWindow);
+  assert.strictEqual(r.results[3].a, 15);
+  assert.strictEqual(r.results[3].de, 0);
+  assert.strictEqual(r.results[4].de, 0);
+  assert.strictEqual(r.results[6].a, 0);
+  assert.strictEqual(r.results[6].de, 7);
+  const starts = r.events.filter(x => x.label === 'UNET.F_SEND');
+  const ends = r.events.filter(x => x.label === 'UNET.F_SEND:return');
+  assert.ok(ends.every((x, i) => x.cycles - starts[i].cycles < 210000),
+    'SEND exceeded 10 ms of model CPU work at 21 MHz');
+  checkProbe(r);
+}
 
 console.log(`Actual DSS EXE DLL harness: ${caseCount()} UNETTEST checks passed`);
